@@ -890,28 +890,84 @@ def _before_deadline(frozen: Frozen, monkeypatch) -> dict:
     return released
 
 
-def _render(record, frozen: Frozen) -> str:
-    """What ``workflow run``/``resume`` prints for this invocation."""
+def _render(record, frozen: Frozen, capsys, released: dict) -> tuple[str, list[str]]:
+    """What ``workflow run``/``resume`` prints for this invocation: its error,
+    or its ``[syncmill]`` lines.
+
+    Judged by the invocation's own execution, appended after the released
+    history, never by the row's state: rendering the same record with the
+    state flipped must print the same outcome."""
     import click
 
     from syncmill.cli import _render_workflow_completion
 
-    try:
-        _render_workflow_completion(record, str(frozen.repo))
-    except click.ClickException as exc:
-        return f"Error: {exc.message}"
-    return ""
+    execution = record.invocation()
+    assert execution is not None and execution == record.manifest["executions"][-1]
+    assert execution["execution_id"] not in {
+        e["execution_id"] for e in released.get("executions") or []
+    }
+    assert execution["status"] == record.state
+    flipped = record.model_copy(
+        update={"state": "failed" if record.state == "completed" else "completed"}
+    )
+    shown = []
+    for candidate in (record, flipped):
+        try:
+            _render_workflow_completion(candidate, str(frozen.repo))
+            error = ""
+        except click.ClickException as exc:
+            error = f"Error: {exc.message}"
+        lines = _lines(capsys.readouterr().out, "[syncmill] ")
+        shown.append((error, lines))
+    assert shown[0] == shown[1]
+    return shown[0]
 
 
 def _approved_final(coordinator, record, final_agent) -> dict:
+    """The approved final artifact, bound to the final node's bundle by
+    digests recomputed here from the stored bytes."""
     from syncmill.artifacts import workflow_approved
-    from syncmill.workflow import workflow_final_run_id
+    from syncmill.workflow import bundle_digest, patch_digest, workflow_final_run_id
 
     assert record.final_run_id == workflow_final_run_id(record.workflow_id)
     manifest = coordinator.artifacts.load(record.final_run_id).manifest
     assert workflow_approved(manifest)
-    assert manifest["plan"].get("final_agent") == final_agent
+    plan = manifest["plan"]
+    assert plan.get("final_agent") == final_agent
+    node = record.manifest["nodes"][record.spec.final_node]
+    base = coordinator.store.workflow_dir(record.workflow_id)
+    result_bytes = (base / node["output_path"]).read_bytes()
+    patch_bytes = (base / node["patch_path"]).read_bytes()
+    assert coordinator.artifacts.patch(record.final_run_id) == patch_bytes
+    assert plan["patch_sha256"] == patch_digest(patch_bytes)
+    assert plan["bundle_sha256"] == bundle_digest(result_bytes, patch_bytes)
     return manifest
+
+
+def _released_state(frozen: Frozen) -> dict:
+    """Every released workflow file and event, per workflow."""
+    state = {}
+    for workflow_id in frozen.workflow_ids:
+        root = frozen.dir / "workflows" / workflow_id
+        files = {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*")) if path.is_file()
+        }
+        assert files
+        state[workflow_id] = (files, _store(frozen).events(workflow_id))
+    return state
+
+
+def _assert_released_kept(frozen: Frozen, state: dict) -> None:
+    """New files and events may follow; none released is changed or lost."""
+    for workflow_id, (files, events) in state.items():
+        root = frozen.project_dir / "workflows" / workflow_id
+        for relative, data in files.items():
+            assert (root / relative).read_bytes() == data, (workflow_id, relative)
+        now = _store(frozen).events(workflow_id)
+        assert now[: len(events)] == events
+        if events and len(now) > len(events):
+            assert now[len(events)]["seq"] > events[-1]["seq"]
 
 
 @pytest.mark.parametrize("target", ["planned", "created", "revised-parent", "revised-child"])
@@ -925,6 +981,9 @@ def test_run_a_released_planned_workflow(release, target, tmp_path, monkeypatch,
     coordinator, agents = _coordinator(frozen, monkeypatch)
     before = {wid: frozen.row(wid) for wid in frozen.workflow_ids}
     released = json.loads(before[workflow_id]["manifest_json"])
+    kept = _released_state(frozen)
+    # The planner's output is among the files kept as written.
+    assert any("planner" in name for name in kept[workflow_id][0]) == (scenario == "planned")
 
     done = coordinator.run(workflow_id)
 
@@ -949,8 +1008,9 @@ def test_run_a_released_planned_workflow(release, target, tmp_path, monkeypatch,
             assert frozen.row(other) == before[other]
     final = _approved_final(coordinator, done, "kimi-code")
     assert "+    return a + b" in coordinator.artifacts.patch(final["run_id"]).decode()
-    assert _render(done, frozen) == ""
-    assert f"[syncmill] final run: {done.final_run_id}" in capsys.readouterr().out
+    _assert_released_kept(frozen, kept)
+    error, lines = _render(done, frozen, capsys, released)
+    assert error == "" and f"[syncmill] final run: {done.final_run_id}" in lines
 
 
 #: Released crashes and failures that HEAD may resume.
@@ -958,7 +1018,7 @@ RESUMABLE = ["running", "recovery-required", "unapproved-running", "failed", "ga
 
 
 @pytest.mark.parametrize("scenario", RESUMABLE)
-def test_resume_honours_the_released_deadline(release, scenario, tmp_path, monkeypatch):
+def test_resume_honours_the_released_deadline(release, scenario, tmp_path, monkeypatch, capsys):
     from datetime import timedelta
 
     frozen = Frozen(release, scenario, tmp_path, monkeypatch)
@@ -976,7 +1036,7 @@ def test_resume_honours_the_released_deadline(release, scenario, tmp_path, monke
     assert done.manifest["calls_used"] == released["calls_used"]
     assert done.final_run_id == row["final_run_id"]
     assert agents["codex"].calls == agents["kimi-code"].calls == []
-    assert _render(done, frozen) == "Error: workflow deadline exceeded"
+    assert _render(done, frozen, capsys, released) == ("Error: workflow deadline exceeded", [])
 
 
 @pytest.mark.parametrize("scenario", ["running", "recovery-required"])
@@ -1015,11 +1075,13 @@ def test_resume_finishes_a_released_crash_on_its_completed_dependency(
     assert done.manifest["nodes"]["fix"]["attempts"] == 1
     assert done.manifest["calls_used"] == released["calls_used"] + 1 == 4
     _approved_final(coordinator, done, "kimi-code")
-    assert _render(done, frozen) == ""
-    assert f"[syncmill] final run: {done.final_run_id}" in capsys.readouterr().out
+    error, lines = _render(done, frozen, capsys, released)
+    assert error == "" and f"[syncmill] final run: {done.final_run_id}" in lines
 
 
-def test_resume_completes_a_released_published_final_artifact(release, tmp_path, monkeypatch):
+def test_resume_completes_a_released_published_final_artifact(
+    release, tmp_path, monkeypatch, capsys
+):
     frozen = Frozen(release, "unapproved-running", tmp_path, monkeypatch)
     coordinator, agents = _coordinator(frozen, monkeypatch)
     released = _before_deadline(frozen, monkeypatch)
@@ -1044,11 +1106,13 @@ def test_resume_completes_a_released_published_final_artifact(release, tmp_path,
     assert manifest.pop("updated_at") != published.pop("updated_at")
     assert manifest == published
     assert (run_dir / "winner.patch").read_bytes() == patch
+    error, lines = _render(done, frozen, capsys, released)
+    assert error == "" and f"[syncmill] final run: {run_id}" in lines
 
 
 @pytest.mark.parametrize("scenario", ["failed", "gate-failed"])
 def test_resume_of_a_released_exhausted_node_dispatches_nothing(
-    release, scenario, tmp_path, monkeypatch
+    release, scenario, tmp_path, monkeypatch, capsys
 ):
     frozen = Frozen(release, scenario, tmp_path, monkeypatch)
     coordinator, agents = _coordinator(frozen, monkeypatch)
@@ -1062,7 +1126,7 @@ def test_resume_of_a_released_exhausted_node_dispatches_nothing(
     assert done.manifest["nodes"] == released["nodes"]
     assert done.manifest["calls_used"] == released["calls_used"]
     assert agents["codex"].calls == agents["kimi-code"].calls == []
-    assert _render(done, frozen) == f"Error: {error}"
+    assert _render(done, frozen, capsys, released) == (f"Error: {error}", [])
 
 
 @pytest.mark.parametrize(
@@ -1148,6 +1212,7 @@ def test_revise_a_released_workflow(release, scenario, tmp_path, monkeypatch):
     document.write_text(json.dumps(spec), encoding="utf-8")
     _store(frozen)  # a v0.2.0 store gains v0.3.0's columns on open
     before = {wid: frozen.row(wid) for wid in frozen.workflow_ids}
+    kept = _released_state(frozen)
 
     result = frozen.cli("workflow", "revise", parent, "--file", str(document))
 
@@ -1159,6 +1224,7 @@ def test_revise_a_released_workflow(release, scenario, tmp_path, monkeypatch):
         *before,
     )
     after = {wid: frozen.row(wid) for wid in frozen.workflow_ids}
+    _assert_released_kept(frozen, kept)
     assert (child["parent_workflow_id"], child["plan_origin"], child["state"]) == (
         parent, "revision", "planned"
     )
@@ -1243,11 +1309,12 @@ def test_apply_verify_narrows_a_released_final_artifact(
     dump = tmp_path / "gate-env.json"
     script = tmp_path / "dump_env.py"
     script.write_text(
-        "import json, os, sys\njson.dump(sorted(os.environ), open(sys.argv[1], 'w'))\n",
+        "import json, os, sys\njson.dump(dict(os.environ), open(sys.argv[1], 'w'))\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("GATE_EXTRA", "gate")
     monkeypatch.setenv("AGENT_EXTRA", "agent")
+    monkeypatch.setenv("UNLISTED_EXTRA", "never")
     monkeypatch.setenv("SYNCMILL_GATE__ENV_ALLOWLIST", json.dumps(["GATE_EXTRA"]))
     monkeypatch.setenv("SYNCMILL_KIMI_CODE__WORKFLOW_ENV_ALLOWLIST", json.dumps(["AGENT_EXTRA"]))
     monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", json.dumps([
@@ -1263,8 +1330,13 @@ def test_apply_verify_narrows_a_released_final_artifact(
 
     assert result.exit_code == 0, result.output
     assert (frozen.repo / "calc.py").read_text() == FIXED
-    names = set(json.loads(dump.read_text()))
+    env = json.loads(dump.read_text())
+    names = set(env)
     notices = _lines(result.stderr, "[syncmill] verify: ")
+    # Closed: a name nothing lists never arrives; the common variables do.
+    assert "UNLISTED_EXTRA" not in names
+    assert {"PATH", "HOME"} <= names
+    assert env["GATE_EXTRA"] == "gate"
     if release == "v0.2.0":
         # No final agent recorded: only the gate's own list, and it says so.
         assert {"GATE_EXTRA", "AGENT_EXTRA"} & names == {"GATE_EXTRA"}
@@ -1274,6 +1346,7 @@ def test_apply_verify_narrows_a_released_final_artifact(
         ]
     else:
         assert {"GATE_EXTRA", "AGENT_EXTRA"} & names == {"GATE_EXTRA", "AGENT_EXTRA"}
+        assert env["AGENT_EXTRA"] == "agent"
         assert notices == []
 
 
@@ -1283,8 +1356,12 @@ def test_control_plans_refuse_a_released_workflow_planned_without_one(
 ):
     from syncmill.workflow import WorkflowError
 
+    toolgraph_calls = []
+
     def no_toolgraph(*args, **kwargs):
-        raise AssertionError("refused before any Toolgraph call")
+        # Recorded, not raised: run_preflight swallows any exception.
+        toolgraph_calls.append(args)
+        raise OSError("no toolgraph here")
 
     monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__ENABLED", "true")
     monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__CONTROL_PLAN_ENABLED", "true")
@@ -1312,3 +1389,4 @@ def test_control_plans_refuse_a_released_workflow_planned_without_one(
     )
     assert frozen.row() == before
     assert agents["codex"].calls == agents["kimi-code"].calls == []
+    assert toolgraph_calls == []
