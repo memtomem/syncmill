@@ -460,7 +460,7 @@ def test_the_stored_spec_reads_back_with_its_digest(release, scenario, tmp_path,
         assert prompts.exit_code == 0, prompts.output
         lines = prompts.output.splitlines()
         for node in spec.nodes:
-            at = lines.index(f"    prompt:", lines.index(next(
+            at = lines.index("    prompt:", lines.index(next(
                 line for line in lines if line.startswith(f"  {node.id}: ")
             )))
             assert lines[at + 1] == f"      {node.prompt}"
@@ -664,7 +664,7 @@ def test_logs_show_the_released_stream_logs(release, tmp_path, monkeypatch):
     for node in ("draft", "fix"):
         log = frozen.frozen_bytes(f"workflows/{frozen.workflow_id}/nodes/{node}/stream.log")
         expected += [f"== {node} ==", *log.decode().splitlines()]
-    assert [line for line in shown.stdout.splitlines() if line] == [l for l in expected if l]
+    assert [line for line in shown.stdout.splitlines() if line] == [line for line in expected if line]
 
 
 def test_cancel_a_released_planned_workflow(release, tmp_path, monkeypatch):
