@@ -104,6 +104,16 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- A file a quality gate writes, such as a test report or build output, no longer
+  enters the candidate's patch or reaches your source on `apply` (#268). Every
+  `run` strategy now captures the candidate before its gate runs. A Room rebuilds a
+  member's worktree when the gate changed it, so the file stays out of later rounds
+  too. That rebuild removes the worktree's ignored files, and the room records a
+  `workspace.rebuilt` event.
+
+  **This changes what a fixing gate does.** Edits from a gate such as `ruff format`
+  or `prettier --write` used to land in a `run` winner's patch, and are now dropped.
+  Configure check modes such as `ruff format --check` instead.
 - Without a terminal, bare `syncmill start` and `start` without `--task`
   print their refusal and the commands to use instead on separate lines. They
   used to come out as one line joined by a literal `\x0a` (#254).

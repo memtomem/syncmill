@@ -1016,6 +1016,16 @@ def test_compete_gate_failer_does_not_block_a_real_failure_report():
     assert gate.evaluated == ["codex"]  # claude's outright failure skipped the gate
 
 
+@pytest.fixture
+def stub_gate_capture(monkeypatch):
+    """``_gate_accepts`` captures before gating, and these worktrees are not repos."""
+    monkeypatch.setattr(
+        "syncmill.strategies.base.capture_changes",
+        lambda path, base=None: CapturedChanges((), ""),
+    )
+
+
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_with_gate_picks_first_passer(monkeypatch):
     from conftest import FakeWorktree
 
@@ -1035,6 +1045,7 @@ def test_select_winner_with_gate_picks_first_passer(monkeypatch):
     assert "quality gate failed" in results[0].error
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_with_gate_none_when_no_passer():
     from conftest import FakeWorktree
 
@@ -1045,6 +1056,7 @@ def test_select_winner_with_gate_none_when_no_passer():
     assert results[0].status is TaskStatus.FAILED  # downgraded
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_priority_does_not_fall_through_gate_failure():
     from conftest import FakeWorktree
 
@@ -1059,6 +1071,7 @@ def test_select_winner_priority_does_not_fall_through_gate_failure():
     assert gate.evaluated == ["claude"]
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_judge_honors_structured_verdict():
     from conftest import FakeWorktree
 
@@ -1104,6 +1117,7 @@ def _judge_inputs():
     return wts, results, config
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_judge_worktree_failure_falls_back_to_verified_priority():
     # Judging is a preference between candidates that already PASSED the gate, so
     # a failure to run it must never discard a good winner and fail the run.
@@ -1120,6 +1134,7 @@ def test_select_winner_judge_worktree_failure_falls_back_to_verified_priority():
     assert winner is not None and winner[0].agent_id == "claude"
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_judge_execute_failure_falls_back_to_verified_priority():
     wts, results, config = _judge_inputs()
 
@@ -1134,6 +1149,7 @@ def test_select_winner_judge_execute_failure_falls_back_to_verified_priority():
     assert winner is not None and winner[0].agent_id == "claude"
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_judge_records_a_span():
     # The judge is a whole agent invocation — without a span the trace
     # under-reports the run's agent calls by exactly the +1 the RunPlan promises.
@@ -1157,6 +1173,7 @@ def test_select_winner_judge_records_a_span():
     assert spans[0].links == ("attempt:claude", "attempt:codex")
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_judge_defers_the_span_through_trace_out():
     # With trace_out the judge span is handed back, NOT recorded: it links the
     # candidate spans, which the CALLER records after _select_winner returns —
@@ -1181,6 +1198,7 @@ def test_select_winner_judge_defers_the_span_through_trace_out():
     assert verdict.status is TaskStatus.COMPLETED
 
 
+@pytest.mark.usefixtures("stub_gate_capture")
 def test_select_winner_judge_runs_outside_any_provider_session_scope():
     # The judge's worktree is a throwaway path: a provider session keyed on it
     # would mint a fresh conversation per run — and on a continuation the

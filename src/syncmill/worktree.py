@@ -594,6 +594,74 @@ def create_worktree(
         return _create_tempdir(agent_id)
 
 
+def _checkout_from_patch(
+    control_repo: Path, worktree: Worktree, patch: bytes | None
+) -> Worktree:
+    """Add ``worktree`` at its base commit, then apply ``patch`` on top.
+
+    The one recipe for a checkout built from a stored patch.
+    """
+    env = isolated_git_env()
+    worktree.path.parent.mkdir(parents=True, exist_ok=True)
+    proc = _run_git(
+        ["git", "worktree", "add", "-b", str(worktree.branch), str(worktree.path),
+         str(worktree.base_commit)],
+        cwd=str(control_repo), env=env,
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise command_error(WorkspaceError, "worktree creation failed", proc.stderr)
+    if patch:
+        proc = _run_git(
+            ["git", "apply", "--binary", "-"],
+            cwd=str(worktree.path), env=env,
+            input=patch, capture_output=True,
+        )
+        if proc.returncode != 0:
+            cleanup_worktree(control_repo, worktree)
+            raise command_error(
+                WorkspaceError,
+                "could not restore parent patch",
+                proc.stderr.decode(errors="replace"),
+            )
+    return worktree
+
+
+def _checkout_verified(control_repo: Path, worktree: Worktree, patch: bytes) -> None:
+    _checkout_from_patch(control_repo, worktree, patch)
+    rebuilt = capture_changes(worktree.path, worktree.base_commit).patch
+    if rebuilt.encode("utf-8", errors="surrogateescape") != patch:
+        raise WorkspaceError(f"worktree {worktree.path} does not reproduce its patch")
+
+
+def rebuild_worktree(control_repo: Path, worktree: Worktree, patch: bytes) -> None:
+    """Replace ``worktree`` with a fresh checkout holding exactly ``patch``.
+
+    Same path and branch, so a provider session bound to the path still resumes.
+    Everything else in the old checkout is gone, ignored files included: this is
+    not a repair of the tree in place, which would have to reason about ignore
+    rules the old tree changed, embedded repositories and directory collisions.
+
+    The patch is proven on a scratch checkout first. A patch can fail to rebuild
+    its tree (a commit inside an embedded repository is only a gitlink in it), and
+    the old checkout may then hold the only copy of the work, so it stays.
+    """
+    rehearsal = Worktree(
+        worktree.path.with_name(f"{worktree.path.name}-rebuild"),
+        f"{worktree.branch}-rebuild",
+        worktree.agent_id,
+        True,
+        base_commit=worktree.base_commit,
+    )
+    try:
+        _checkout_verified(control_repo, rehearsal, patch)
+    finally:
+        cleanup_worktree(control_repo, rehearsal)
+    if not cleanup_worktree(control_repo, worktree):
+        raise WorkspaceError(f"could not remove worktree {worktree.path}")
+    _checkout_verified(control_repo, worktree, patch)
+
+
 def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
     """Remove a worktree and its branch. Returns True if the path is gone after."""
     require_supported_platform()
@@ -770,30 +838,11 @@ class WorktreePool:
             tag = f"{self._task_id[:8]}-{slot}"
             branch = f"syncmill/{agent_id}/{tag}"
             path = self._snapshot.run_root / "worktrees" / f"{agent_id}-{tag}"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            proc = _run_git(
-                ["git", "worktree", "add", "-b", branch, str(path), self._snapshot.commit],
-                cwd=str(self._snapshot.control_repo), env=isolated_git_env(),
-                capture_output=True, text=True,
+            worktree = _checkout_from_patch(
+                self._snapshot.control_repo,
+                Worktree(path, branch, agent_id, True, base_commit=self._snapshot.commit),
+                self._seed_patch,
             )
-            if proc.returncode != 0:
-                raise command_error(WorkspaceError, "worktree creation failed", proc.stderr)
-            worktree = Worktree(
-                path, branch, agent_id, True, base_commit=self._snapshot.commit
-            )
-            if self._seed_patch:
-                proc = _run_git(
-                    ["git", "apply", "--binary", "-"],
-                    cwd=str(path), env=isolated_git_env(),
-                    input=self._seed_patch, capture_output=True,
-                )
-                if proc.returncode != 0:
-                    cleanup_worktree(self._snapshot.control_repo, worktree)
-                    raise command_error(
-                        WorkspaceError,
-                        "could not restore parent patch",
-                        proc.stderr.decode(errors="replace"),
-                    )
         self._worktrees.append(worktree)
         return worktree
 
