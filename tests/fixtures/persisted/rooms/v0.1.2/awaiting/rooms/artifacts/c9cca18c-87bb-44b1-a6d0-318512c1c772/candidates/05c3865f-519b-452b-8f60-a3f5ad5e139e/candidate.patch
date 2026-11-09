@@ -1,0 +1,19 @@
+diff --git a/calc.py b/calc.py
+index 12ee743..4693ad3 100644
+--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+diff --git a/test_calc.py b/test_calc.py
+new file mode 100644
+index 0000000..d509f32
+--- /dev/null
++++ b/test_calc.py
+@@ -0,0 +1,5 @@
++from calc import add
++
++
++def test_add():
++    assert add(2, 3) == 5

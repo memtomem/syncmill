@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "candidate_id": "f03c3756-35ea-4249-9937-0b74b80fd25f",
+  "room_id": "a5d27787-d2dc-4843-81bd-5a1096d3af0d",
+  "round_id": "a0009888-6243-4b7a-a38a-514dda4aa10f",
+  "member_id": "codex",
+  "provider_id": "codex",
+  "attempt": 1,
+  "state": "completed",
+  "eligible": true,
+  "created_at": "2026-11-09T06:35:26.554659+00:00",
+  "base_commit": "adf571a5c8f7117888da995d3a6fcc6cd4c50b5f",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "patch_sha256": "2472428ead6fddc901487e19b792e81fa9b6076f2670ba1703d9d53f7cb167b8",
+  "patch_bytes": 361,
+  "output_sha256": "f5ff11914521176fd0c9cb11673eb6c5171aef2b3c1547540948bf61b7e42835",
+  "output_bytes": 17,
+  "output_truncated": false,
+  "files_changed": [
+    "calc.py",
+    "test_calc.py"
+  ],
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "error": null,
+  "gate": {
+    "passed": true,
+    "score": 1.0,
+    "checks": [
+      {
+        "command": "python -c \"from calc import add; assert add(2, 3) == 5\"",
+        "passed": true,
+        "exit_code": 0,
+        "output": "",
+        "duration_seconds": 0.02
+      }
+    ]
+  },
+  "provider_session_id": "fake-codex-thread",
+  "usage": {
+    "total_input_tokens": 1,
+    "output_tokens": 1,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": null,
+    "total_cost_usd": null
+  }
+}
