@@ -31,16 +31,21 @@ def test_lesson_source_key_is_pinned():
 # ── B: digests recomputed from stored data ────────────────────────────────────
 
 
-def test_patch_and_output_digests_are_plain_sha256_hex():
+def test_patch_and_output_digests_are_plain_sha256_hex(tmp_path):
     # Stored: patch_sha256 / output_sha256 in artifact manifests, room
     # candidates, workflow bundles, selections and judgments. Used: every load
-    # re-hashes the stored bytes and compares.
+    # re-hashes the stored bytes and compares; rooms also hash by streaming.
     from syncmill.artifacts import _digest as artifact_digest
-    from syncmill.rooms import _digest as room_digest
+    from syncmill.rooms import _digest as room_digest, _stream_digest
+    from syncmill.workflow import patch_digest
 
     expected = "a4895eb44afc336fecbba6e520cd67e178dace0276655d102fceffa8e5f70570"
     assert artifact_digest(b"patch") == expected
     assert room_digest(b"patch") == expected
+    assert patch_digest(b"patch") == expected
+    stored = tmp_path / "candidate.patch"
+    stored.write_bytes(b"patch")
+    assert _stream_digest(stored) == expected
 
 
 def test_workflow_bundle_digest_is_pinned():
@@ -93,6 +98,29 @@ def test_memory_migration_destination_binding_is_pinned():
     assert mm._target_storage_digest(config, "memtomem") == (
         "sha256:3c66fb3f3e57b3fdbf59d6520f5a8854e3e1a2957dd817517dbb8c494ce1c01e"
     )
+    assert mm._target_storage_digest(
+        SyncmillConfig(memory={"langgraph": {"db_path": "/srv/pin/lg.db"}}), "langgraph"
+    ) == "sha256:5180607fc5ab1d47e6a782f586e46ff675246bbf869b57b8b8d18de2c6476f41"
+
+    def mem0(vector: dict) -> SyncmillConfig:
+        return SyncmillConfig(memory={"mem0": {
+            "data_dir": "/srv/pin/mem0",
+            "config": {
+                "vector_store": {"provider": "qdrant", "config": vector},
+                "history_db_path": "/srv/pin/history.db",
+            },
+        }})
+
+    # Each Mem0 locator branch: url, host, local path.
+    assert mm._target_storage_digest(mem0(
+        {"url": "https://qdrant.example/v1/", "api_key": "s", "collection_name": "syncmill"}
+    ), "mem0") == "sha256:63c686a565fd66e2c93d637373a3a53ce55718e728942c2c6c54c62607a7b466"
+    assert mm._target_storage_digest(mem0(
+        {"host": "qdrant.example", "port": 6333, "collection_name": "syncmill"}
+    ), "mem0") == "sha256:b26026322e57c762e09fddc0b502923fe94cab0d0ed3e691e24f9a6adf0b7c31"
+    assert mm._target_storage_digest(mem0(
+        {"path": "/srv/pin/qdrant", "collection_name": "syncmill"}
+    ), "mem0") == "sha256:20702fdacba96761b56282a4faabd872da89ad94ff494fd40c1839638ccaccd6"
 
 
 # ── C: derived keys and ids ───────────────────────────────────────────────────
@@ -182,10 +210,17 @@ def test_memory_namespace_names_are_pinned():
 
     from syncmill.memory_backend import _namespace_day_file_suffixes
 
+    from syncmill.memory_backend import _is_day_file
+
     store_config = SimpleNamespace(namespace=SimpleNamespace(default_namespace="default"))
-    assert _namespace_day_file_suffixes(store_config, "agent-runtime:claude")[0] == (
-        ".agent-runtime.claude.md"
-    )
+    suffixes = _namespace_day_file_suffixes(store_config, "agent-runtime:claude")
+    assert suffixes == [
+        ".agent-runtime.claude.md",
+        "--agent-runtime-claude-94b6f6edd26cc066.md",  # memtomem's native shape
+    ]
+    # Names already on disk, written literally, must still be matched.
+    assert _is_day_file("2026-11-09.agent-runtime.claude.md", suffixes[0])
+    assert _is_day_file("2026-11-09--agent-runtime-claude-94b6f6edd26cc066.md", suffixes[1])
     assert _tag_key("council-proposal") == (
         "tag_c63ad47ea511f78d3fd72fbfa5ebe9de5bd988e9ff12255f8fb0d9caa3892159"
     )
@@ -247,3 +282,22 @@ def test_recover_never_decides_on_an_unrecognizable_fingerprint(tmp_path, stored
     assert "unrecognized stored fingerprint" in verdict.detail
     assert store.load("run-1").manifest["state"] not in {"applied", "pending"}
     assert not (repo / "winner.txt").exists()
+
+
+def test_room_member_log_path_is_pinned(tmp_path):
+    # Stored: round_members.log_path (relative to the artifact root). Used: the
+    # room viewer re-derives the path and refuses any other, so a changed
+    # derivation makes every existing member log unavailable.
+    from syncmill.rooms import RoomStore, _safe_member_filename
+
+    digest = "c857d09db23e6822e3600bc06ad8d58f92ed62bc8efd81c753f77048662cb97d"
+    assert _safe_member_filename("claude") == f"claude-{digest}"
+    store = RoomStore(tmp_path / "rooms")
+    try:
+        room = "11111111-1111-4111-8111-111111111111"
+        round_id = "22222222-2222-4222-8222-222222222222"
+        assert store.round_log_relpath(room, round_id, "claude") == (
+            f"{room}/logs/{round_id}/member-claude-{digest}.log"
+        )
+    finally:
+        store.close()

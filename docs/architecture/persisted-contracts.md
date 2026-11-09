@@ -27,19 +27,22 @@ Unless noted otherwise, pins are in `tests/test_persisted_contracts.py`.
 |---|---|---|---|---|
 | Source fingerprint, v1 and v2 | A | `worktree.repository_fingerprint` | artifact manifests, rooms, room candidates, isolated sessions, workflows → apply, recover, continue, room rounds, workflow execution | `test_fingerprint_versions.py`; versioned (`worktrees.md`) |
 | Workflow spec digest | B | `WorkflowSpec.digest` (`model_dump_json(exclude_none=True)`) | `spec_sha256` in the workflow manifest, `commit.json` and the control-plan reference → resume and bundle verification | `test_workflow_lifecycle.py` golden |
-| Patch and output digests | B | `artifacts._digest`, `rooms._digest` (sha256 hex of the stored bytes) | artifact manifests, room candidates, workflow bundles, selections, judgments → every load | `test_patch_and_output_digests_are_plain_sha256_hex` |
+| Patch and output digests | B | `artifacts._digest`, `rooms._digest`, `rooms._stream_digest`, `workflow.patch_digest` (sha256 hex of the stored bytes) | artifact manifests, room candidates, workflow bundles, selections, judgments → every load | `test_patch_and_output_digests_are_plain_sha256_hex` |
 | Workflow bundle digest | B | `workflow.bundle_digest` (sha256 of `result.json` NUL patch) | `commit.json`, a final artifact's plan → resume | `test_workflow_bundle_digest_is_pinned` |
 | Prefixed digest spelling `sha256:<hex>` | B | `workflow._sha256` | control-plan reference → resume | `test_workflow_prefixed_sha256_spelling_is_pinned` |
 | Memory migration record digest, lineage key, `source_digest`, target id | B / C | `memory_migration._record`, `_aggregate`, `_target_id` | migration snapshot and state, destination copies → apply, verify, rollback, retried write | `test_memory_migration_digests_and_target_id_are_pinned` |
-| Memory migration destination binding | B | `memory_migration._target_storage_digest` | migration state → apply, verify, rollback | `test_memory_migration_destination_binding_is_pinned` |
+| Memory migration destination binding | B | `memory_migration._target_storage_digest` (memtomem, LangGraph, and Mem0's url, host and local-path locators) | migration state → apply, verify, rollback | `test_memory_migration_destination_binding_is_pinned` |
 | Path-hash project id | C | `project.project_id`, when no trusted marker exists | state directory names → every lookup | `test_path_hash_project_id_is_pinned` |
 | Lesson `source_key` | C | `rooms.lesson_source_key` | `decisions.source_key` → promote-retry idempotency | `test_lesson_source_key_is_pinned` |
 | Review item projection (id, task, inputs, digest) | C | `review_candidates.item_spec` | the board item → re-import provenance check | `test_review_item_projection_is_pinned` |
 | Unmapped principal id | C | `planning.unmapped_principal_id` | control-plan principals → workflow resume | `test_unmapped_principal_id_is_pinned` |
 | Control-plan node id, final run id | C | `planning.plan_node_id`, `workflow.workflow_final_run_id` | frozen control plan, final artifact → resume, interrupted finalization | `test_workflow_ids_are_pinned` |
-| Memory namespaces, day-file names and matcher, LangGraph namespace and tag key | C | `BOARD_RUN_PREFIX`, the Mem0/LangGraph `agent_namespace_prefix`/`shared_namespace`, `_day_file`, `_namespace_day_file_suffixes`, `_LANGGRAPH_NS`, `_tag_key` | memory rows, day files, the LangGraph index → reads, GC, purge, tag filtering | `test_memory_namespace_names_are_pinned` |
+| Memory namespaces, day-file names and matcher, LangGraph namespace and tag key | C | `BOARD_RUN_PREFIX`, the Mem0/LangGraph `agent_namespace_prefix`/`shared_namespace`, `_day_file`, `_namespace_day_file_suffixes` / `_is_day_file` (syncmill's and memtomem's native shapes, matched against literal names), `_LANGGRAPH_NS`, `_tag_key` | memory rows, day files, the LangGraph index → reads, GC, purge, tag filtering | `test_memory_namespace_names_are_pinned` |
 | TUI job directory keys | C | `tui_jobs.project_key`, `board_key` (legacy root) | job store directory → `list_jobs` | `test_tui_job_directory_keys_are_pinned` |
 | Isolated session run root and tmux name, room viewer name and ownership digest | C | `isolated_session.session_run_name`, `session_tmux_name`; `room_viewer.viewer_session_name`, `_project_digest` | session documents, tmux → path re-check, reattach, sweep | `test_session_and_viewer_names_are_pinned` |
+
+| Room member log path | C | `RoomStore.round_log_relpath` via `rooms._safe_member_filename` | `round_members.log_path` → the room viewer re-derives and compares it | `test_room_member_log_path_is_pinned` |
+| Lesson and decision text, room goal (verbatim) | C | `rooms.round_lessons` (no normalization), `rooms.normalize_goal` (never stripped) | `decisions.text`, `rooms.goal` → round prompts; a goal matches a lesson's `scope` exactly | `test_rooms.py::test_round_lessons_pass_decision_text_through_verbatim`, `test_room_goal.py::test_a_room_keeps_its_goal_verbatim` |
 
 memtomem's own agent namespace prefix comes from memtomem's configuration, not syncmill. The memtomem real smoke covers it (`SYNCMILL_TEST_MEMTOMEM_REAL=1`).
 

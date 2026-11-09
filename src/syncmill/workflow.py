@@ -339,6 +339,13 @@ class WorkflowSpec(BaseModel):
         return hashlib.sha256(payload).hexdigest()
 
 
+def patch_digest(patch_bytes: bytes) -> str:
+    """A node or final patch's ``patch_sha256``: sha256 hex of the stored
+    bytes, as artifacts and rooms compute it. A persisted contract
+    (docs/architecture/persisted-contracts.md)."""
+    return hashlib.sha256(patch_bytes).hexdigest()
+
+
 def bundle_digest(result_bytes: bytes, patch_bytes: bytes) -> str:
     """The digest binding a node's ``result.json`` to its patch, recorded in
     ``commit.json`` and a final artifact's plan and re-checked on resume. A
@@ -1618,7 +1625,7 @@ class WorkflowStore:
             "duration_seconds": result.duration_seconds,
             "files_changed": result.files_changed,
             "gate": gate,
-            "patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
+            "patch_sha256": patch_digest(patch_bytes),
             "patch_bytes": len(patch_bytes),
             "bundle_version": 3,
             "workflow_id": workflow_id,
@@ -1773,7 +1780,7 @@ class WorkflowStore:
         digest = payload.get("patch_sha256")
         if not isinstance(digest, str):
             raise corrupt
-        if hashlib.sha256(patch_bytes).hexdigest() != digest:
+        if patch_digest(patch_bytes) != digest:
             raise corrupt
         record = self.load(workflow_id)
         state = record.manifest["nodes"].get(node_id, {})
@@ -4017,7 +4024,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             "spec_sha256": record.spec.digest(),
             "source_fingerprint": record.source_fingerprint,
             "bundle_sha256": bundle_digest(result_bytes, patch_bytes),
-            "patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
+            "patch_sha256": patch_digest(patch_bytes),
         }
         control_reference = record.manifest.get("control_plan")
         if isinstance(control_reference, dict) and isinstance(
@@ -4100,7 +4107,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
                     artifact_patch = self.artifacts.patch(final_run_id)
                 except (ArtifactError, OSError) as exc:
                     raise WorkflowError("final artifact patch is missing or corrupt") from exc
-                if hashlib.sha256(artifact_patch).hexdigest() != artifact_plan["patch_sha256"]:
+                if patch_digest(artifact_patch) != artifact_plan["patch_sha256"]:
                     raise WorkflowError("final artifact patch digest mismatch")
                 if legacy:
                     artifact.manifest["plan"] = {**plan, **artifact_plan}
