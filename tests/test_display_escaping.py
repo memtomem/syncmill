@@ -205,7 +205,6 @@ def test_apply_escapes_the_run_id_and_its_receipt(monkeypatch, tmp_path):
         load=lambda rid: types.SimpleNamespace(manifest={}),
         apply=lambda *a, **k: receipt,
     )
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp")
     monkeypatch.setattr("syncmill.cli._heal_workflow_approval", lambda *a, **k: None)
     config = types.SimpleNamespace(
         gate=types.SimpleNamespace(commands=[], timeout_seconds=1, env_allowlist=None),
@@ -575,7 +574,6 @@ def test_apply_recovery_suggestion_is_a_real_command_or_none(tmp_path, monkeypat
         load=lambda rid: types.SimpleNamespace(manifest={}),
         apply=broken,
     )
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp")
     monkeypatch.setattr("syncmill.cli._heal_workflow_approval", lambda *a, **k: None)
     config = types.SimpleNamespace(
         gate=types.SimpleNamespace(commands=[], timeout_seconds=1, env_allowlist=None),

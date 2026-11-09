@@ -23,10 +23,11 @@ Every comparison with, or value written into, an existing record is computed in 
 
 - `fingerprint_matches(root, stored)` recomputes in `stored`'s version. It is used at every live check, and each site keeps its own mismatch error.
 - `repository_fingerprint(root, like=stored)` and `capture_repository_snapshot(..., fingerprint_like=like_stored(stored))` are for a value that goes into the record: a room's next round, a workflow's execution snapshot, the room-apply check.
+- `room_compare.live_source_check(root)` is the `SourceCheck` (`source_check(recorded) -> bool`) for every room comparison.
 - `ArtifactStore.apply(run_id, root, None)` checks the source against the manifest's own fingerprint under the apply lock. The CLI's `apply` uses this. A caller passing a value must have computed it in the manifest's version.
 
 Stored-versus-stored comparisons (room vs. candidate bindings, a room's round-start stale check, workflow artifact provenance) therefore only ever see one version.
 
 **Unrecognized values keep main's behavior.** A `None` or unrecognized stored value is simply a mismatch, as `current != stored` always was. `fingerprint_matches` still reads the source first, so a git failure raises as before. At round start a room with no fingerprint is stamped with the current version. Stored-only paths (select, checkpoint, binding checks, `validate_applicable`) do not validate the shape. An unrecognized value is refused at the next recompute, before any source mutation. The one pre-existing gap in that rule is `recover` reading such a mismatch as "applied" when a receipt is bound, tracked in #264.
 
-Tests live in `tests/test_fingerprint_versions.py`. A record "made before the upgrade" is created with `CURRENT_FINGERPRINT_VERSION` patched to 1, so it goes through the real write paths. Each version-aware site has a mutation check: reverting it to a current-version comparison fails a test.
+Tests live in `tests/test_fingerprint_versions.py`. A record "made before the upgrade" is created with `CURRENT_FINGERPRINT_VERSION` patched to 1, so it goes through the real write paths. Each version-aware comparison was mutation-checked when it landed: reverting it to a current-version comparison, or to a strict `like=` that raises on an unrecognized value, fails a test. The room-compare call sites (CLI `room compare`/`export`, `start`, the TUI) share `room_compare.live_source_check`, so the check is made once, in that helper.

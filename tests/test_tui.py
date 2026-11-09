@@ -3785,7 +3785,7 @@ def test_compare_builds_from_a_real_store_off_the_event_loop(
     # the main-thread connection would raise if used from the thread.
     room, passed, failed, not_run = _seeded_room(tmp_path)
     monkeypatch.setattr(
-        "syncmill.tui.fingerprint_matches", lambda root, stored: stored == "fp-1"
+        "syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1"
     )
 
     async def scenario():
@@ -3848,7 +3848,7 @@ def test_details_and_compare_share_wording_with_the_cli_json(tmp_path, monkeypat
 
     # The source check's failure text is git's own stderr; pin it rather than
     # depend on how the runner's temp directory is mounted.
-    monkeypatch.setattr("syncmill.tui.fingerprint_matches", unavailable)
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", unavailable)
     room, *_ = _seeded_room(tmp_path)
     try:
         comparison, *_ = build_room_evidence(
@@ -4005,7 +4005,7 @@ def test_a_failed_rebuild_keeps_the_last_snapshot_through_the_real_reload(
     tmp_path, git_repo, monkeypatch
 ):
     room, passed, _, _ = _seeded_room(tmp_path)
-    monkeypatch.setattr("syncmill.tui.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
 
     async def scenario():
         app = _room_apply_app(tmp_path, git_repo)
@@ -4277,7 +4277,7 @@ def _counting_builder(monkeypatch, gate=None, started=None):
         return real(*args)
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
-    monkeypatch.setattr("syncmill.tui.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     return calls
 
 

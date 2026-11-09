@@ -617,7 +617,7 @@ def _cli_room(tmp_path, monkeypatch, **save_kwargs):
         "syncmill.cli._room_coordinator",
         lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
     )
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == FP)
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == FP)
     return room, saved
 
 

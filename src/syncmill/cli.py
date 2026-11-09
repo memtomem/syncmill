@@ -110,6 +110,7 @@ from syncmill.room_compare import (
     _gate_verdict,
     build_room_comparison,
     comparison_to_dict,
+    live_source_check,
     render_review_markdown,
     render_room_comparison,
 )
@@ -1099,9 +1100,7 @@ def _start_compare(
         coordinator.run_round(room_id, None, lessons=lessons)
         comparison = build_room_comparison(
             coordinator.store, room_id,
-            source_check=lambda recorded: fingerprint_matches(
-                coordinator.repo_root, recorded
-            ),
+            source_check=live_source_check(coordinator.repo_root),
         )
         document = comparison_to_dict(comparison)
         candidates = room_candidates(document)
@@ -3117,9 +3116,7 @@ def room_compare(
             room_id,
             round_number=round_number,
             all_rounds=all_rounds,
-            source_check=lambda recorded: fingerprint_matches(
-                coordinator.repo_root, recorded
-            ),
+            source_check=live_source_check(coordinator.repo_root),
         )
         if as_json:
             echo(_comparison_json(comparison))
@@ -3244,9 +3241,7 @@ def room_export(
             room_id,
             round_number=round_number,
             all_rounds=all_rounds,
-            source_check=lambda recorded: fingerprint_matches(
-                coordinator.repo_root, recorded
-            ),
+            source_check=live_source_check(coordinator.repo_root),
         )
         items = token = None
         if specs:

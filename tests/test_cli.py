@@ -428,7 +428,7 @@ def _compare_room(tmp_path, *, prompt="p", files=("a",)):
 def test_room_compare_renders_text_and_versioned_json(monkeypatch, runner, tmp_path):
     room_id, candidate_id, coordinator, closed = _compare_room(tmp_path)
     _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     try:
         res = runner.invoke(cli, ["room", "compare", room_id])
         assert res.exit_code == 0, res.output
@@ -466,7 +466,7 @@ def test_room_compare_unknown_room_or_round_is_a_clean_error(
 ):
     room_id, _, coordinator, closed = _compare_room(tmp_path)
     _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     try:
         res = runner.invoke(cli, ["room", "compare", room_id, "--round", "9"])
         assert res.exit_code == 2  # a bad argument, reported against --round
@@ -502,7 +502,7 @@ def test_room_compare_source_check_failure_still_renders(monkeypatch, runner, tm
     def no_git(root, stored):
         raise OSError("No such file or directory: 'git'")
 
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", no_git)
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", no_git)
     try:
         res = runner.invoke(cli, ["room", "compare", room_id])
         assert res.exit_code == 0, res.output
@@ -515,7 +515,7 @@ def test_room_compare_source_check_failure_still_renders(monkeypatch, runner, tm
 def test_room_export_json_is_the_compare_json_document(monkeypatch, runner, tmp_path):
     room_id, _, coordinator, closed = _compare_room(tmp_path)
     _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     try:
         compare = runner.invoke(cli, ["room", "compare", room_id, "--json"])
         export = runner.invoke(cli, ["room", "export", room_id, "--format", "json"])
@@ -542,7 +542,7 @@ def test_room_json_outputs_escape_terminal_controls(monkeypatch, runner, tmp_pat
         tmp_path, prompt=_HOSTILE, files=(_HOSTILE,)
     )
     _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     target = tmp_path / "review.json"
     try:
         compare = runner.invoke(cli, ["room", "compare", room_id, "--json"])
@@ -596,7 +596,7 @@ def test_room_export_markdown_to_stdout(monkeypatch, runner, tmp_path):
 
     room_id, candidate_id, coordinator, _ = _compare_room(tmp_path)
     _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     try:
         res = runner.invoke(cli, ["room", "export", room_id])
         assert res.exit_code == 0, res.output
@@ -613,7 +613,7 @@ def test_room_export_markdown_to_stdout(monkeypatch, runner, tmp_path):
 def test_room_export_passes_round_selection_through(monkeypatch, runner, tmp_path):
     room_id, _, coordinator, _ = _compare_room(tmp_path)
     _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     calls: list[dict] = []
     real = cli_module.build_room_comparison
 
@@ -652,7 +652,7 @@ def test_room_export_rejects_conflicting_round_flags_before_opening(
 def test_room_export_output_is_created_exclusively_0600(monkeypatch, runner, tmp_path):
     room_id, _, coordinator, closed = _compare_room(tmp_path)
     _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
-    monkeypatch.setattr("syncmill.cli.fingerprint_matches", lambda root, stored: stored == "fp-1")
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == "fp-1")
     target = tmp_path / "review.md"
     try:
         res = runner.invoke(cli, ["room", "export", room_id, "--output", str(target)])
