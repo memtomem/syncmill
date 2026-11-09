@@ -117,7 +117,7 @@ class Room:
         self.store.finish_round(self.id, rnd["id"])
 
     def compare(self, **kwargs):
-        kwargs.setdefault("source_check", lambda: FP)
+        kwargs.setdefault("source_check", lambda recorded: recorded == FP)
         return build_room_comparison(self.store, self.id, **kwargs)
 
 
@@ -590,7 +590,7 @@ def test_changed_source_is_an_apply_blocker(make_room):
     rnd = room.start()
     saved = room.save(rnd, "a")
     room.finish(rnd)
-    cmp = room.compare(source_check=lambda: "fp-2")
+    cmp = room.compare(source_check=lambda recorded: recorded == "fp-2")
     assert cmp.source_status == "changed"
     assert _row(cmp, saved["candidate_id"]).apply_blockers == (
         "source changed since the room started",
@@ -606,7 +606,7 @@ def test_source_check_failure_is_unavailable_never_current(make_room, error):
     saved = room.save(rnd, "a")
     room.finish(rnd)
 
-    def check():
+    def check(recorded):
         raise error
 
     cmp = room.compare(source_check=check)
@@ -1624,7 +1624,7 @@ def test_review_markdown_source_failure_reason_is_fenced(make_room):
     room.save(rnd, "a")
     room.finish(rnd)
 
-    def check():
+    def check(recorded):
         raise OSError("git said\n# forged https://x.invalid")
 
     tokens = _md_tokens(

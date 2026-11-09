@@ -38,7 +38,10 @@ from syncmill.worktree import (
     Worktree,
     WorktreePool,
     capture_repository_snapshot,
+    CURRENT_FINGERPRINT_VERSION,
     cleanup_worktree,
+    fingerprint_version,
+    like_stored,
     repository_fingerprint,
 )
 
@@ -212,9 +215,10 @@ class IsolatedSessionStore:
 
     def list(self) -> list[dict]:
         values: list[dict] = []
-        current_fingerprint: str | None = None
-        fingerprint_loaded = False
-        fingerprint_failed = False
+        # One scan per fingerprint version present (#262): sessions created
+        # before an upgrade keep theirs, and a failed scan marks only the
+        # sessions that needed it as stale. ``None`` = the scan failed.
+        current_by_version: dict[int, str | None] = {}
         for path in self.root.glob("*.json"):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
@@ -245,15 +249,18 @@ class IsolatedSessionStore:
                 value["live"] = False
             value["source_stale"] = False
             if value.get("state") == "open":
-                if not fingerprint_loaded:
+                stored = value.get("source_fingerprint")
+                like = like_stored(stored)
+                version = fingerprint_version(stored) or CURRENT_FINGERPRINT_VERSION
+                if version not in current_by_version:
                     try:
-                        current_fingerprint = repository_fingerprint(self.repo_root)
+                        current_by_version[version] = repository_fingerprint(
+                            self.repo_root, like=like
+                        )
                     except Exception:
-                        fingerprint_failed = True
-                    fingerprint_loaded = True
-                value["source_stale"] = fingerprint_failed or (
-                    current_fingerprint != value.get("source_fingerprint")
-                )
+                        current_by_version[version] = None
+                current = current_by_version[version]
+                value["source_stale"] = current is None or current != stored
             values.append(value)
         return sorted(values, key=lambda value: value.get("created_at", ""), reverse=True)
 

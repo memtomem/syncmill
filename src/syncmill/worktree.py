@@ -6,6 +6,7 @@ import contextlib
 import logging
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -200,19 +201,65 @@ def capture_changes(workdir: Path, base_commit: str | None = None) -> CapturedCh
         raise PatchCaptureError(f"patch capture failed: {exc}") from exc
 
 
-def repository_fingerprint(repo_root: Path) -> str:
+#: The version new root records are stamped with (#262). A record keeps the
+#: version it was created with: every value later written into it, or compared
+#: against it, is computed in that version (``like=``), so a fingerprint stored
+#: before an upgrade still matches an unchanged source after it.
+CURRENT_FINGERPRINT_VERSION = 2
+_V2_PREFIX = "v2:"
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_CURRENT = object()
+
+
+def fingerprint_version(value: object) -> int | None:
+    """1 for a bare 64-hex value, 2 for ``v2:`` + 64-hex, else ``None``."""
+    if not isinstance(value, str):
+        return None
+    if _HEX64.fullmatch(value):
+        return 1
+    if value.startswith(_V2_PREFIX) and _HEX64.fullmatch(value[len(_V2_PREFIX):]):
+        return 2
+    return None
+
+
+def _framed(data: bytes) -> bytes:
+    return str(len(data)).encode("ascii") + b"\0" + data
+
+
+def repository_fingerprint(repo_root: Path, *, like: object = _CURRENT) -> str:
     """Digest HEAD plus tracked/untracked changes, excluding ignored files.
 
     The commit identity is part of the source contract even for a clean checkout:
     two different clean HEADs must never compare equal merely because both have an
     empty working-tree diff.
 
+    Without ``like`` the current version is computed; only a site creating a
+    new root record omits it. With ``like`` (a stored fingerprint) the digest is
+    computed in that value's version, and an unrecognized ``like`` (``None``
+    included) raises :class:`WorkspaceError`.
+
+    v1 (bare hex) is a persisted contract and stays byte-identical: each
+    untracked entry is ``path NUL`` + ``L``/``F`` + target/bytes. v2 frames
+    every section and entry with its byte length and tags executable files
+    ``X``, closing v1's two gaps (crafted contents that collide across entries,
+    and an untracked file's exec bit going unnoticed).
+
     Not strictly read-only: porcelain ``git status`` and ``git diff`` refresh the
     index's stat cache, and ``git diff`` does so even with ``GIT_OPTIONAL_LOCKS=0``.
     File contents, staged changes and HEAD are untouched, and git skips the write
     when ``index.lock`` is held (#183).
     """
+    if like is _CURRENT:
+        version = CURRENT_FINGERPRINT_VERSION
+    else:
+        found = fingerprint_version(like)
+        if found is None:
+            raise WorkspaceError("unrecognized stored repository fingerprint")
+        version = found
+    framed = version >= 2
     digest = hashlib.sha256()
+    if framed:
+        digest.update(b"syncmill-repository-fingerprint-v2\0")
     env = isolated_git_env()
     commands = (
         ["git", "rev-parse", "--verify", "HEAD"],
@@ -229,7 +276,7 @@ def repository_fingerprint(repo_root: Path) -> str:
                 f"{' '.join(command)} failed",
                 proc.stderr.decode(errors="replace"),
             )
-        digest.update(proc.stdout)
+        digest.update(_framed(proc.stdout) if framed else proc.stdout)
     untracked = _run_git(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         cwd=str(repo_root), env=env, capture_output=True,
@@ -239,24 +286,44 @@ def repository_fingerprint(repo_root: Path) -> str:
     for raw in sorted(p for p in untracked.stdout.split(b"\0") if p):
         rel = os.fsdecode(raw)
         path = repo_root / rel
-        digest.update(raw + b"\0")
+        digest.update(_framed(raw) if framed else raw + b"\0")
         try:
             # lstat first so a FIFO is refused instead of blocking read_bytes.
-            # The digest encoding below is a persisted contract (manifests,
-            # room candidates and isolated sessions store it and compare it at
-            # apply time), so it must stay byte-identical across versions.
             st = path.lstat()
             if stat.S_ISLNK(st.st_mode):
-                digest.update(b"L" + os.readlink(path).encode(errors="surrogateescape"))
+                tag, content = b"L", os.readlink(path).encode(errors="surrogateescape")
             elif stat.S_ISREG(st.st_mode):
-                digest.update(b"F" + path.read_bytes())
+                content = path.read_bytes()
+                tag = b"X" if framed and st.st_mode & 0o111 else b"F"
             else:
                 raise WorkspaceError(
                     f"untracked path {rel} is not a regular file or symlink"
                 )
         except OSError as exc:
             raise WorkspaceError(f"could not read untracked file {rel}: {exc}") from exc
-    return digest.hexdigest()
+        digest.update(tag + (_framed(content) if framed else content))
+    hexdigest = digest.hexdigest()
+    return _V2_PREFIX + hexdigest if framed else hexdigest
+
+
+def like_stored(stored: object) -> object:
+    """The ``like`` for computing a value to compare with, or write into, the
+    record holding ``stored``: ``stored`` itself when it is a recognized
+    fingerprint, else the current version (an unrecognized or missing value
+    then simply mismatches, exactly as before versioning)."""
+    return stored if fingerprint_version(stored) is not None else _CURRENT
+
+
+def fingerprint_matches(repo_root: Path, stored: object) -> bool:
+    """Whether the source still matches ``stored``, recomputed in its version.
+
+    A ``None`` or unrecognized ``stored`` is simply a mismatch, as a plain
+    ``!=`` against it was before versioning: the current fingerprint is still
+    computed first, so a git or filesystem failure raises exactly as it did."""
+    if fingerprint_version(stored) is None:
+        repository_fingerprint(repo_root)
+        return False
+    return repository_fingerprint(repo_root, like=stored) == stored
 
 
 def _seed_snapshot_index(source: Path, index: Path, env: dict) -> bool:
@@ -325,7 +392,12 @@ def _populate_snapshot_index(
 
 
 def capture_repository_snapshot(
-    repo_root: Path, run_id: str, workspace_root: Path, *, sweepable: bool = False
+    repo_root: Path,
+    run_id: str,
+    workspace_root: Path,
+    *,
+    sweepable: bool = False,
+    fingerprint_like: object = _CURRENT,
 ) -> RepositorySnapshot:
     """Capture HEAD + tracked dirty state + untracked files in a private clone.
 
@@ -340,6 +412,10 @@ def capture_repository_snapshot(
     an unmarked leftover is one the sweep can never reclaim. Rooms and
     interactive sessions leave it False: their workspaces are tracked externally
     and may outlive any run, so nothing may reclaim them on liveness or age.
+
+    ``fingerprint_like`` computes the snapshot's fingerprint in the version of
+    an existing record the snapshot serves (a room's next round, a workflow's
+    execution); omitted, the current version, for a new root.
     """
     require_supported_platform()
     source = repo_root.resolve()
@@ -408,7 +484,7 @@ def capture_repository_snapshot(
         if probe.returncode == 0 and operation_path.exists():
             raise WorkspaceError(f"repository operation in progress: {operation_dir}")
 
-    fingerprint_before = repository_fingerprint(source)
+    fingerprint_before = repository_fingerprint(source, like=fingerprint_like)
 
     run_root = workspace_root.expanduser().resolve() / run_id
     control = run_root / "control"
@@ -453,7 +529,7 @@ def capture_repository_snapshot(
             cwd=str(source), env=snapshot_env,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        fingerprint = repository_fingerprint(source)
+        fingerprint = repository_fingerprint(source, like=fingerprint_like)
         if fingerprint != fingerprint_before:
             raise WorkspaceError(
                 "working tree changed while the snapshot was being captured; retry"

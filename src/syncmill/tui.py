@@ -124,7 +124,7 @@ from syncmill.tui_render import (
     plain,
     plain_select,
 )
-from syncmill.worktree import WorkspaceError, repository_fingerprint
+from syncmill.worktree import WorkspaceError, fingerprint_matches
 from syncmill.tui_collaboration import (
     CandidateSelectModal,
     CollaborationConfirmModal,
@@ -695,7 +695,7 @@ def build_room_evidence(
             store,
             room_id,
             all_rounds=True,
-            source_check=lambda: repository_fingerprint(repo_root),
+            source_check=lambda recorded: fingerprint_matches(repo_root, recorded),
             now=now,
         )
     finally:

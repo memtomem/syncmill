@@ -42,7 +42,7 @@ from syncmill.worktree import (
     WorkspaceError,
     _run_git,
     capture_repository_snapshot,
-    repository_fingerprint,
+    fingerprint_matches,
 )
 
 #: Hang bound for every git subprocess on the apply/rollback path (via
@@ -1247,7 +1247,7 @@ class ArtifactStore:
         self,
         run_id: str,
         repo_root: Path,
-        source_fingerprint: str,
+        source_fingerprint: str | None,
         *,
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
@@ -1256,6 +1256,10 @@ class ArtifactStore:
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
+        """Apply a retained run. ``source_fingerprint=None`` checks the source
+        against the manifest's own fingerprint, recomputed in its version under
+        the apply lock; a caller passing a value must have computed it in the
+        manifest's version (``repository_fingerprint(root, like=...)``)."""
         with self.apply_lock(repo_root):
             return self._apply_locked(
                 run_id,
@@ -1274,7 +1278,7 @@ class ArtifactStore:
         self,
         run_id: str,
         repo_root: Path,
-        source_fingerprint: str,
+        source_fingerprint: str | None,
         *,
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
@@ -1332,7 +1336,14 @@ class ArtifactStore:
             ) from exc
         if resolved_recorded != repo_root.resolve():
             raise ArtifactError("run belongs to a different repository")
-        if manifest.get("source_fingerprint") != source_fingerprint:
+        stored_fingerprint = manifest.get("source_fingerprint")
+        if source_fingerprint is None:
+            if not fingerprint_matches(repo_root, stored_fingerprint):
+                raise ArtifactError(
+                    "working tree changed since the run; review the diff and rerun"
+                )
+            source_fingerprint = stored_fingerprint
+        elif stored_fingerprint != source_fingerprint:
             raise ArtifactError(
                 "working tree changed since the run; review the diff and rerun"
             )
@@ -1368,7 +1379,7 @@ class ArtifactStore:
                 env_allowlist=verify_env_allowlist,
                 workspace_root=verify_workspace_root,
             )
-            if repository_fingerprint(repo_root) != source_fingerprint:
+            if not fingerprint_matches(repo_root, source_fingerprint):
                 raise ArtifactError(
                     "working tree changed during isolated verification; retry"
                 )
@@ -1415,12 +1426,12 @@ class ArtifactStore:
                 ) from restore_exc
 
         try:
-            final_fingerprint = repository_fingerprint(repo_root)
+            final_matches = fingerprint_matches(repo_root, source_fingerprint)
             self._io.directory(artifact.path)
         except BaseException:
             restore_pending_before_source_mutation()
             raise
-        if final_fingerprint != source_fingerprint:
+        if not final_matches:
             restore_pending_before_source_mutation()
             raise ArtifactError("working tree changed before patch application; retry")
 
@@ -1460,9 +1471,7 @@ class ArtifactStore:
             except OSError:
                 pass  # the fingerprint below is the verdict, not the rollback
             try:
-                source_unchanged = (
-                    repository_fingerprint(repo_root) == source_fingerprint
-                )
+                source_unchanged = fingerprint_matches(repo_root, source_fingerprint)
             except Exception:
                 source_unchanged = False
             if not source_unchanged:
@@ -1547,7 +1556,7 @@ class ArtifactStore:
                 rolled_back = (
                     rollback is not None
                     and rollback.returncode == 0
-                    and repository_fingerprint(repo_root) == source_fingerprint
+                    and fingerprint_matches(repo_root, source_fingerprint)
                 )
             except Exception:
                 rolled_back = False
@@ -1936,8 +1945,7 @@ class ArtifactStore:
         run_id = artifact.run_id
         manifest = artifact.manifest
         receipt = self._bound_receipt(artifact.path, manifest)
-        current_fingerprint = repository_fingerprint(repo_root)
-        source_matches = current_fingerprint == manifest.get("source_fingerprint")
+        source_matches = fingerprint_matches(repo_root, manifest.get("source_fingerprint"))
 
         if receipt is not None and not source_matches:
             # completed: the patch was applied and receipted; only the final

@@ -61,6 +61,8 @@ from syncmill.worktree import (
     WorkspaceError,
     capture_repository_snapshot,
     cleanup_worktree,
+    fingerprint_matches,
+    like_stored,
     repository_fingerprint,
 )
 
@@ -2191,9 +2193,8 @@ class RoomStore:
                                 )
 
                 try:
-                    source_matches: bool | None = (
-                        repository_fingerprint(Path(current["repo_root"]))
-                        == current["source_fingerprint"]
+                    source_matches: bool | None = fingerprint_matches(
+                        Path(current["repo_root"]), current["source_fingerprint"]
                     )
                 except (OSError, WorkspaceError):
                     source_matches = None
@@ -3576,7 +3577,11 @@ class RoomCoordinator:
         )
         round_prompt = prompt or room["prompt"]
         worker_id = f"{os.getpid()}-{uuid4().hex[:8]}"
-        current_fingerprint = repository_fingerprint(self.repo_root)
+        # Computed in the room's own version (#262), so an unchanged source
+        # still matches a fingerprint recorded before an upgrade.
+        current_fingerprint = repository_fingerprint(
+            self.repo_root, like=like_stored(room.get("source_fingerprint"))
+        )
         if room.get("source_fingerprint") and (
             room["source_fingerprint"] != current_fingerprint
         ):
@@ -3676,6 +3681,9 @@ class RoomCoordinator:
                     self.repo_root,
                     workspace_id,
                     Path(self.config.workspace.root),
+                    # The round's fingerprint goes into the room, which keeps
+                    # the version it was first stamped with (#262).
+                    fingerprint_like=like_stored(room.get("source_fingerprint")),
                 )
             except Exception as exc:
                 self.store.recovery_required(room_id, str(exc), planned_run_root)
@@ -4511,7 +4519,11 @@ class RoomCoordinator:
             round_row = self.store.get_round(candidate["round_id"])
             if round_row["room_id"] != room_id:
                 raise RoomError("candidate round does not belong to this room")
-            current_fingerprint = repository_fingerprint(self.repo_root)
+            # In the candidate's version: it is also the value the room-apply
+            # artifact (a verbatim copy of the candidate's) is checked against.
+            current_fingerprint = repository_fingerprint(
+                self.repo_root, like=like_stored(candidate["source_fingerprint"])
+            )
             if current_fingerprint != candidate["source_fingerprint"]:
                 raise RoomError("working tree changed since the candidate was created")
             patch = candidate["patch"]

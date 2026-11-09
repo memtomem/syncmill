@@ -819,7 +819,8 @@ def test_repository_fingerprint_keeps_its_persisted_encoding(git_repo):
     expected.update(git("diff", "--binary", "HEAD"))
     expected.update(b"untracked-link\0" + b"L" + b"untracked.txt")
     expected.update(b"untracked.txt\0" + b"F" + b"hello\n")
-    assert repository_fingerprint(git_repo) == expected.hexdigest()
+    # A stored v1 value (bare hex) is recomputed in v1.
+    assert repository_fingerprint(git_repo, like="0" * 64) == expected.hexdigest()
 
 
 def test_repository_fingerprint_rejects_an_untracked_fifo(git_repo, monkeypatch):
