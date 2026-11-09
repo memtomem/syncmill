@@ -272,3 +272,6 @@ class TaskResult:
     # Why a gated candidate could not be captured before its gate ran. Raised only
     # if it becomes the winner, so a candidate nobody selects cannot stop the run.
     capture_error: str | None = None
+    # Compete chose this winner by priority order alone: no gate ran, at least one
+    # other candidate also completed, and no judge verdict decided it. Display only.
+    picked_first_completed: bool = False

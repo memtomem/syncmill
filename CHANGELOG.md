@@ -79,6 +79,15 @@ All notable changes to SyncMill are documented here.
 
 ### Changed
 
+- `run` and `apply` no longer present an unverified result as a plain success
+  (#265). A completed result with no gate report prints `Unverified: no quality
+  gate ran on this result` in `run`, `run --monitor`, `continue` and `board run
+  --id`. `compete` adds that the winner is the first completed candidate in
+  priority order when at least two completed and no judge verdict decided it.
+  `apply` without `--verify` says the run recorded no gate commands, or
+  `Verification not recorded` when its manifest has no usable record, which
+  includes runs a workflow produced. A detached apply prints this in its job log.
+  No exit code, selection mode or default changes.
 - `room promote --scope` and the TUI promote dialog refuse a scope that holds
   a line break, tab or other control character (#257); before, it was stored
   and could never match a room goal. The coordinator checks it before it

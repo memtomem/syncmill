@@ -192,6 +192,7 @@ def _result_to_json(result: TaskResult) -> dict:
         "failure_kind": result.failure_kind,
         "gate_summary": result.gate.summary() if result.gate is not None else None,
         "gate_passed": result.gate.passed if result.gate is not None else None,
+        "picked_first_completed": result.picked_first_completed,
         # Already a plain str (or None) — no flattening needed. Carried so the
         # OUTER can honor `--emit-patch` from result.json after a monitored run
         # (json escapes any surrogateescape'd non-UTF-8 bytes losslessly).
@@ -245,6 +246,16 @@ _FAILURE_HINTS = {
 }
 
 
+_UNVERIFIED_NOTICE = (
+    "[syncmill] Unverified: no quality gate ran on this result. To check results, "
+    "add commands under [gate] in syncmill.toml."
+)
+_FIRST_COMPLETED_NOTICE = (
+    "[syncmill] With no gate, the winner is the first completed candidate in "
+    "priority order, not the result of a comparison."
+)
+
+
 def render_result(data: dict) -> int:
     """Echo a result.json dict the way the CLI prints a live result, and return the
     process exit code (0 completed, 1 failed). Shared by the OUTER (after detach)
@@ -260,6 +271,11 @@ def render_result(data: dict) -> int:
         if data.get("gate_summary") is not None:
             summary = printable_name(str(data["gate_summary"]))
             secho(f"[syncmill] Quality gate: passed ({summary})", fg="green")
+        else:
+            secho(_UNVERIFIED_NOTICE, fg="yellow")
+            # result.json is unvalidated: only a real true prints this.
+            if data.get("picked_first_completed") is True:
+                secho(_FIRST_COMPLETED_NOTICE, fg="yellow")
         if data.get("files_changed"):
             names = ", ".join(printable_name(str(f)) for f in data["files_changed"])
             echo(f"[syncmill] Files changed: {names}")

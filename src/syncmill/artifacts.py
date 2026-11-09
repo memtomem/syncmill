@@ -577,6 +577,21 @@ def is_room_bound(manifest: dict[str, Any]) -> bool:
     return isinstance(plan, dict) and plan.get("origin") == "room"
 
 
+def recorded_gate_commands(manifest: dict[str, Any]) -> list[str] | None:
+    """The gate commands a run recorded, or ``None`` when it has no usable record.
+
+    ``[]`` means the run recorded that no gate was configured; ``None`` must never
+    be read as either verified or unverified.
+    """
+    plan = manifest.get("plan")
+    commands = plan.get("gate_commands") if isinstance(plan, dict) else None
+    if not isinstance(commands, list):
+        return None
+    if not all(isinstance(command, str) for command in commands):
+        return None
+    return commands
+
+
 def workflow_origin_id(manifest: dict[str, Any]) -> str | None:
     """The workflow a run artifact came from, or ``None`` if it came from none.
 
