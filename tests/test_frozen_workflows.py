@@ -13,6 +13,10 @@ every workflow row, a lease owner's ``pid@host`` (set to a pid that cannot be
 alive on this host), and the root and fingerprint of a final run artifact.
 ``spec_json``, node bundles and ``commit.json`` are never touched: digests
 cover their bytes. ``_install`` asserts that every other cell is unchanged.
+
+The later sections run HEAD on the released stores: ``run``, ``resume`` and
+``revise`` of released rows, the launch's reads before a job starts, and
+``apply --verify`` of a released final artifact.
 """
 
 from __future__ import annotations
@@ -799,3 +803,512 @@ def test_recover_skips_a_released_final_artifact(release, tmp_path, monkeypatch)
         f"Run {run_id}: skipped \N{EM DASH} run is 'pending', not applying"
     ]
     assert (run_dir / "manifest.json").read_bytes() == before
+
+
+# ── HEAD executes a released workflow ─────────────────────────────────────
+#
+# Through ``WorkflowCoordinator.run``, the call the detached job's worker makes:
+# the hermetic suite starts no job. The CLI's reads before the launch
+# (``_peek_workflow_team`` and ``_execute_workflow``'s checks) are tested with
+# the launch stubbed.
+
+FIXED = "def add(a, b):\n    return a + b\n"
+#: The released fake codex's answer, stored in every released ``draft`` bundle.
+RELEASED_DRAFT_OUTPUT = "codex (fake) fix."
+
+
+class NodeAgent:
+    """A workflow node agent: records each prompt; ``fix`` repairs ``calc.py``."""
+
+    def __init__(self, agent_id: str, output: str, *, fix: bool = False):
+        self.agent_id = agent_id
+        self.output = output
+        self.fix = fix
+        self.calls: list[str] = []
+
+    def execute(self, prompt, workdir, timeout):
+        raise AssertionError("a released plan needs no planner call")
+
+    async def aexecute(self, prompt, workdir, timeout):
+        from uuid import uuid4
+
+        from syncmill.models import TaskResult, TaskStatus
+
+        self.calls.append(prompt)
+        if self.fix:
+            (Path(workdir) / "calc.py").write_text(FIXED, encoding="utf-8")
+        return TaskResult(
+            task_id=uuid4(), agent_id=self.agent_id, status=TaskStatus.COMPLETED,
+            output=self.output, exit_code=0, duration_seconds=0.01,
+        )
+
+
+def _workflow_env(frozen: Frozen, monkeypatch) -> None:
+    """The configuration every released scenario was written under."""
+    monkeypatch.setenv("SYNCMILL_AGENT_PRIORITY", json.dumps(["codex", "kimi-code"]))
+    monkeypatch.setenv("SYNCMILL_CLAUDE__ENABLED", "false")
+    if frozen.scenario != "no-changes":
+        monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", json.dumps([GATE_COMMAND]))
+
+
+def _coordinator(frozen: Frozen, monkeypatch):
+    from conftest import FakeRegistry
+    from syncmill.project import load_project_config
+    from syncmill.workflow import WorkflowCoordinator
+
+    _workflow_env(frozen, monkeypatch)
+    _, config = load_project_config(frozen.repo)
+    agents = {
+        "codex": NodeAgent("codex", "HEAD draft."),
+        "kimi-code": NodeAgent("kimi-code", "HEAD fix.", fix=True),
+    }
+    return WorkflowCoordinator(config, FakeRegistry(list(agents.values()))), agents
+
+
+def _at(monkeypatch, moment) -> None:
+    """Fix both clocks the workflow module reads: ``datetime.now`` (lease and
+    deadline bookkeeping) and ``time()`` (the time left before the deadline).
+    ``monotonic`` stays real; it only measures this run's own waits."""
+    _clock(monkeypatch, moment)
+    monkeypatch.setattr("syncmill.workflow.time", moment.timestamp)
+
+
+def _deadline(manifest: dict):
+    from datetime import datetime
+
+    return datetime.fromisoformat(manifest["deadline_at"])
+
+
+def _before_deadline(frozen: Frozen, monkeypatch) -> dict:
+    """The released manifest, with the clock a minute before its deadline:
+    resume keeps the stored absolute deadline, and three of these rows were
+    stored without a heartbeat, so the deadline is the one time they all carry."""
+    from datetime import timedelta
+
+    released = json.loads(frozen.row()["manifest_json"])
+    _at(monkeypatch, _deadline(released) - timedelta(seconds=60))
+    return released
+
+
+def _render(record, frozen: Frozen) -> str:
+    """What ``workflow run``/``resume`` prints for this invocation."""
+    import click
+
+    from syncmill.cli import _render_workflow_completion
+
+    try:
+        _render_workflow_completion(record, str(frozen.repo))
+    except click.ClickException as exc:
+        return f"Error: {exc.message}"
+    return ""
+
+
+def _approved_final(coordinator, record, final_agent) -> dict:
+    from syncmill.artifacts import workflow_approved
+    from syncmill.workflow import workflow_final_run_id
+
+    assert record.final_run_id == workflow_final_run_id(record.workflow_id)
+    manifest = coordinator.artifacts.load(record.final_run_id).manifest
+    assert workflow_approved(manifest)
+    assert manifest["plan"].get("final_agent") == final_agent
+    return manifest
+
+
+@pytest.mark.parametrize("target", ["planned", "created", "revised-parent", "revised-child"])
+def test_run_a_released_planned_workflow(release, target, tmp_path, monkeypatch, capsys):
+    scenario = target.split("-")[0]
+    if scenario not in scenarios(release):
+        pytest.skip(f"{release} has no {scenario}")
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    # A revision leaves its parent runnable: either row can be run.
+    workflow_id = frozen.workflow_ids[0 if target == "revised-parent" else -1]
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    before = {wid: frozen.row(wid) for wid in frozen.workflow_ids}
+    released = json.loads(before[workflow_id]["manifest_json"])
+
+    done = coordinator.run(workflow_id)
+
+    assert done.state == "completed"
+    # Each node gets the goal and its own stored prompt; the final node also
+    # gets its dependency's output.
+    [draft_prompt] = agents["codex"].calls
+    [fix_prompt] = agents["kimi-code"].calls
+    spec = json.loads(before[workflow_id]["spec_json"])
+    prompts = {node["id"]: node["prompt"] for node in spec["nodes"]}
+    goal = f"Original goal:\n{spec['goal']}\n"
+    assert goal in draft_prompt and goal in fix_prompt
+    assert f"task:\n{prompts['draft']}\n" in draft_prompt
+    assert f"task:\n{prompts['fix']}\n" in fix_prompt and "HEAD draft." in fix_prompt
+    assert prompts["fix"] not in draft_prompt
+    # The planner's call (a planner plan) stays counted.
+    assert released["calls_used"] == (1 if scenario == "planned" else 0)
+    assert done.manifest["calls_used"] == released["calls_used"] + 2
+    assert frozen.row(workflow_id)["spec_json"] == before[workflow_id]["spec_json"]
+    for other in frozen.workflow_ids:
+        if other != workflow_id:
+            assert frozen.row(other) == before[other]
+    final = _approved_final(coordinator, done, "kimi-code")
+    assert "+    return a + b" in coordinator.artifacts.patch(final["run_id"]).decode()
+    assert _render(done, frozen) == ""
+    assert f"[syncmill] final run: {done.final_run_id}" in capsys.readouterr().out
+
+
+#: Released crashes and failures that HEAD may resume.
+RESUMABLE = ["running", "recovery-required", "unapproved-running", "failed", "gate-failed"]
+
+
+@pytest.mark.parametrize("scenario", RESUMABLE)
+def test_resume_honours_the_released_deadline(release, scenario, tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    row = frozen.row()
+    released = json.loads(row["manifest_json"])
+    _at(monkeypatch, _deadline(released) + timedelta(seconds=1))
+
+    done = coordinator.run(frozen.workflow_id, resume=True)
+
+    # The stored absolute deadline holds across the upgrade: it is not reset,
+    # and it comes before any dispatch or exhaustion decision.
+    assert (done.state, done.manifest["error"]) == ("failed", "workflow deadline exceeded")
+    assert done.manifest["deadline_at"] == released["deadline_at"]
+    assert done.manifest["calls_used"] == released["calls_used"]
+    assert done.final_run_id == row["final_run_id"]
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
+    assert _render(done, frozen) == "Error: workflow deadline exceeded"
+
+
+@pytest.mark.parametrize("scenario", ["running", "recovery-required"])
+def test_resume_finishes_a_released_crash_on_its_completed_dependency(
+    release, scenario, tmp_path, monkeypatch, capsys
+):
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    released = _before_deadline(frozen, monkeypatch)
+    draft = released["nodes"]["draft"]
+    stored = json.loads(frozen.frozen_bytes(
+        f"workflows/{frozen.workflow_id}/{draft['output_path']}"
+    ))
+    assert stored["output"] == RELEASED_DRAFT_OUTPUT
+    # The dead owner's final node left no bundle: nothing to reclaim.
+    assert not list((frozen.dir / "workflows" / frozen.workflow_id).rglob("nodes/fix/**/result.json"))
+    released_events = _store(frozen).events(frozen.workflow_id)
+    assert released_events
+
+    done = coordinator.run(frozen.workflow_id, resume=True)
+
+    # HEAD's events continue the released sequence; the released ones stay.
+    events = _store(frozen).events(frozen.workflow_id)
+    assert events[: len(released_events)] == released_events
+    assert len(events) > len(released_events)
+    assert min(e["seq"] for e in events[len(released_events):]) > released_events[-1]["seq"]
+
+    assert done.state == "completed"
+    # The released draft is reused as written, read from its released bundle.
+    assert agents["codex"].calls == []
+    assert done.manifest["nodes"]["draft"] == draft
+    [fix_prompt] = agents["kimi-code"].calls
+    assert RELEASED_DRAFT_OUTPUT in fix_prompt and "apply the fix" in fix_prompt
+    # The killed attempt had no outcome, so it was refunded before this one.
+    assert released["nodes"]["fix"]["attempts"] == 1
+    assert done.manifest["nodes"]["fix"]["attempts"] == 1
+    assert done.manifest["calls_used"] == released["calls_used"] + 1 == 4
+    _approved_final(coordinator, done, "kimi-code")
+    assert _render(done, frozen) == ""
+    assert f"[syncmill] final run: {done.final_run_id}" in capsys.readouterr().out
+
+
+def test_resume_completes_a_released_published_final_artifact(release, tmp_path, monkeypatch):
+    frozen = Frozen(release, "unapproved-running", tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    released = _before_deadline(frozen, monkeypatch)
+    run_id, run_dir = _final(frozen)
+    patch = (run_dir / "winner.patch").read_bytes()
+    published = json.loads((run_dir / "manifest.json").read_text())
+    assert published["state"] == "pending" and "approved" not in published["plan"]
+    assert frozen.row()["final_run_id"] is None
+
+    done = coordinator.run(frozen.workflow_id, resume=True)
+
+    assert (done.state, done.final_run_id) == ("completed", run_id)
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
+    assert done.manifest["calls_used"] == released["calls_used"]
+    # Only the approval stamp is added: v0.2.0's artifact is not backfilled
+    # with the final agent it never recorded.
+    manifest = _approved_final(
+        coordinator, done, None if release == "v0.2.0" else "kimi-code"
+    )
+    approval = manifest["plan"].pop("approved")
+    assert (approval["workflow_id"], approval["run_id"]) == (frozen.workflow_id, run_id)
+    assert manifest.pop("updated_at") != published.pop("updated_at")
+    assert manifest == published
+    assert (run_dir / "winner.patch").read_bytes() == patch
+
+
+@pytest.mark.parametrize("scenario", ["failed", "gate-failed"])
+def test_resume_of_a_released_exhausted_node_dispatches_nothing(
+    release, scenario, tmp_path, monkeypatch
+):
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    released = _before_deadline(frozen, monkeypatch)
+    error = "no runnable nodes remain before final_node completed"
+
+    done = coordinator.run(frozen.workflow_id, resume=True)
+
+    assert (done.state, done.manifest["error"]) == ("failed", error)
+    # A durable failure keeps its attempt: no refund, no new dispatch.
+    assert done.manifest["nodes"] == released["nodes"]
+    assert done.manifest["calls_used"] == released["calls_used"]
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
+    assert _render(done, frozen) == f"Error: {error}"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "state"),
+    [("completed", "completed"), ("unapproved-completed", "completed"),
+     ("no-changes", "completed"), ("cancelled", "cancelled"), ("planned", "planned")],
+)
+def test_resume_refuses_a_released_workflow_in_a_final_or_unstarted_state(
+    release, scenario, state, tmp_path, monkeypatch
+):
+    from syncmill.workflow import WorkflowError
+
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    before = frozen.row()
+    with pytest.raises(WorkflowError) as refused:
+        coordinator.run(frozen.workflow_id, resume=True)
+    assert str(refused.value) == (
+        f"cannot resume workflow {frozen.workflow_id} from state {state!r}"
+    )
+    assert frozen.row() == before
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
+
+
+def test_resume_never_takes_a_released_lease_whose_owner_lives(release, tmp_path, monkeypatch):
+    import os
+
+    from syncmill.workflow import WorkflowError
+
+    frozen = Frozen(release, "running", tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    conn = sqlite3.connect(frozen.project_dir / "workflows" / "workflows.db")
+    try:
+        conn.execute("UPDATE workflows SET lease_owner = ?",
+                     (f"{os.getpid()}@{socket.gethostname()}",))
+        conn.commit()
+    finally:
+        conn.close()
+    # Before the deadline, and long past the lease timeout: only the owner's
+    # pid keeps the lease.
+    _before_deadline(frozen, monkeypatch)
+    before = frozen.row()
+    with pytest.raises(WorkflowError) as refused:
+        coordinator.run(frozen.workflow_id, resume=True)
+    assert str(refused.value) == (
+        f"workflow {frozen.workflow_id} is still owned by a live run "
+        f"({before['lease_owner']}); cancel it first or wait for it to finish"
+    )
+    after = frozen.row()
+    lease = ("state", "lease_owner", "lease_id", "lease_heartbeat")
+    assert {k: after[k] for k in lease} == {k: before[k] for k in lease}
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
+    # The refused attempt is recorded after the released execution history,
+    # which is kept as written; nothing else in the manifest moves.
+    released, manifest = json.loads(before["manifest_json"]), json.loads(after["manifest_json"])
+    *kept, attempt = manifest.pop("executions")
+    assert kept == released.pop("executions")
+    assert (attempt["action"], attempt["status"]) == ("resume", "failed")
+    assert manifest == released
+
+
+# ── the CLI around execution ──────────────────────────────────────────────
+
+
+def _cli_supervisor(frozen: Frozen, monkeypatch) -> None:
+    """A real Supervisor for workflow commands, without real memtomem."""
+    from conftest import FakeMemory
+
+    _workflow_env(frozen, monkeypatch)
+    monkeypatch.setattr("syncmill.supervisor.SyncmillMemory", lambda _cfg: FakeMemory())
+
+
+@pytest.mark.parametrize("scenario", ["planned", "revised"])
+def test_revise_a_released_workflow(release, scenario, tmp_path, monkeypatch):
+    if scenario not in scenarios(release):
+        pytest.skip(f"{release} has no {scenario}")
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    _cli_supervisor(frozen, monkeypatch)
+    parent = frozen.workflow_id
+    document = tmp_path / "revision.json"
+    spec = json.loads(frozen.row(parent)["spec_json"])
+    spec["goal"] = "fix add, revised at HEAD"
+    document.write_text(json.dumps(spec), encoding="utf-8")
+    _store(frozen)  # a v0.2.0 store gains v0.3.0's columns on open
+    before = {wid: frozen.row(wid) for wid in frozen.workflow_ids}
+
+    result = frozen.cli("workflow", "revise", parent, "--file", str(document))
+
+    assert result.exit_code == 0, result.output
+    [child] = frozen.rows(
+        "SELECT * FROM workflows WHERE workflow_id NOT IN ({})".format(
+            ",".join("?" * len(before))
+        ),
+        *before,
+    )
+    after = {wid: frozen.row(wid) for wid in frozen.workflow_ids}
+    assert (child["parent_workflow_id"], child["plan_origin"], child["state"]) == (
+        parent, "revision", "planned"
+    )
+    if release == "v0.2.0":
+        # A released row has no lineage: the revision gives it one, and that
+        # one column is all that changes on it.
+        assert before[parent]["lineage_id"] is None
+        assert re.fullmatch(r"wl-[0-9a-f]{16}", after[parent]["lineage_id"])
+        assert child["lineage_id"] == after[parent]["lineage_id"]
+        assert child["plan_version"] == 2
+        changed = {k for k in before[parent] if before[parent][k] != after[parent][k]}
+        assert changed == {"lineage_id"}
+    else:
+        # The released lineage continues past its last version.
+        released_versions = {"planned": [1], "revised": [1, 2]}[scenario]
+        assert child["lineage_id"] == before[parent]["lineage_id"]
+        assert [before[w]["plan_version"] for w in frozen.workflow_ids] == released_versions
+        assert child["plan_version"] == released_versions[-1] + 1
+        assert after == before
+
+
+class _Launches:
+    """``workflow run``/``resume`` up to the job launch, which is recorded."""
+
+    def __init__(self, monkeypatch):
+        self.launched: list = []
+        monkeypatch.setattr("syncmill.cli._workflow_job_store", lambda config, root: self)
+
+    def launch(self, spec, *, resolved_config):
+        self.launched.append((spec, resolved_config))
+        return {"job_id": "0" * 32}
+
+
+@pytest.mark.parametrize(("command", "scenario"), [("run", "planned"), ("resume", "recovery-required")])
+def test_the_launch_follows_the_team_a_released_row_recorded(
+    release, command, scenario, tmp_path, monkeypatch
+):
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    _cli_supervisor(frozen, monkeypatch)
+    monkeypatch.setenv("SYNCMILL_TEAMS", json.dumps({"pair": {"agents": ["codex", "kimi-code"]}}))
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "pair")
+    launches = _Launches(monkeypatch)
+    before = frozen.row()
+
+    result = frozen.cli("workflow", command, frozen.workflow_id, "--detach")
+
+    assert result.exit_code == 0, result.output
+    [(spec, config)] = launches.launched
+    assert (spec.workflow_id, spec.resume) == (frozen.workflow_id, command == "resume")
+    # v0.2.0 never recorded a team, so the default applies; v0.3.0 recorded
+    # that none applied, and the default must not override that.
+    assert config.applied_team == ("pair" if release == "v0.2.0" else None)
+    assert frozen.row()["state"] == before["state"]
+
+
+@pytest.mark.parametrize(
+    ("command", "scenario", "state"),
+    [("run", "completed", "completed"), ("resume", "cancelled", "cancelled")],
+)
+def test_the_cli_refuses_a_released_state_before_any_launch(
+    release, command, scenario, state, tmp_path, monkeypatch
+):
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    _cli_supervisor(frozen, monkeypatch)
+    launches = _Launches(monkeypatch)
+    result = frozen.cli("workflow", command, frozen.workflow_id, "--detach")
+    assert (result.exit_code, result.output.splitlines()[-1]) == (
+        1, f"Error: cannot {command} workflow {frozen.workflow_id} from state {state!r}"
+    )
+    assert launches.launched == []
+
+
+@pytest.mark.parametrize("prune_first", [False, True])
+def test_apply_verify_narrows_a_released_final_artifact(
+    release, prune_first, tmp_path, monkeypatch
+):
+    import shlex
+    import sys
+
+    frozen = Frozen(release, "completed", tmp_path, monkeypatch)
+    run_id, _ = _final(frozen)
+    dump = tmp_path / "gate-env.json"
+    script = tmp_path / "dump_env.py"
+    script.write_text(
+        "import json, os, sys\njson.dump(sorted(os.environ), open(sys.argv[1], 'w'))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GATE_EXTRA", "gate")
+    monkeypatch.setenv("AGENT_EXTRA", "agent")
+    monkeypatch.setenv("SYNCMILL_GATE__ENV_ALLOWLIST", json.dumps(["GATE_EXTRA"]))
+    monkeypatch.setenv("SYNCMILL_KIMI_CODE__WORKFLOW_ENV_ALLOWLIST", json.dumps(["AGENT_EXTRA"]))
+    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", json.dumps([
+        GATE_COMMAND, shlex.join([sys.executable, str(script), str(dump)]),
+    ]))
+    if prune_first:
+        # The narrowing is read from the artifact alone.
+        _Later.install(monkeypatch)
+        assert frozen.cli("workflow", "prune", "--keep", "0", "--retention-days", "1").exit_code == 0
+        assert frozen.rows("SELECT * FROM workflows") == []
+
+    result = frozen.cli("apply", run_id, "--verify")
+
+    assert result.exit_code == 0, result.output
+    assert (frozen.repo / "calc.py").read_text() == FIXED
+    names = set(json.loads(dump.read_text()))
+    notices = _lines(result.stderr, "[syncmill] verify: ")
+    if release == "v0.2.0":
+        # No final agent recorded: only the gate's own list, and it says so.
+        assert {"GATE_EXTRA", "AGENT_EXTRA"} & names == {"GATE_EXTRA"}
+        assert notices == [
+            "[syncmill] verify: the workflow's final agent is not recorded on this "
+            "artifact, so verify runs without that agent's workflow_env_allowlist"
+        ]
+    else:
+        assert {"GATE_EXTRA", "AGENT_EXTRA"} & names == {"GATE_EXTRA", "AGENT_EXTRA"}
+        assert notices == []
+
+
+@pytest.mark.parametrize(("scenario", "resume"), [("planned", False), ("recovery-required", True)])
+def test_control_plans_refuse_a_released_workflow_planned_without_one(
+    release, scenario, resume, tmp_path, monkeypatch
+):
+    from syncmill.workflow import WorkflowError
+
+    def no_toolgraph(*args, **kwargs):
+        raise AssertionError("refused before any Toolgraph call")
+
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__CONTROL_PLAN_ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__CANDIDATE_TOOLS", '["workspace::read"]')
+    monkeypatch.setenv(
+        "SYNCMILL_INTEGRATION__TOOLGRAPH__AGENT_MAP", '{"codex": "codex", "kimi-code": "kimi"}'
+    )
+    monkeypatch.setattr("syncmill.preflight._sync_run", no_toolgraph)
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    assert coordinator.config.integration.toolgraph.control_plan_enabled
+    # A planned row has no deadline yet; a crashed one is resumed before it.
+    released = (
+        _before_deadline(frozen, monkeypatch) if resume
+        else json.loads(frozen.row()["manifest_json"])
+    )
+    assert released["control_plan"] is None
+    before = frozen.row()
+
+    with pytest.raises(WorkflowError) as refused:
+        coordinator.run(frozen.workflow_id, resume=resume)
+
+    assert str(refused.value) == (
+        "workflow predates control-plan evidence; create a new workflow plan"
+    )
+    assert frozen.row() == before
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
