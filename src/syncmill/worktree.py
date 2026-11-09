@@ -627,6 +627,13 @@ def _checkout_from_patch(
     return worktree
 
 
+def _checkout_verified(control_repo: Path, worktree: Worktree, patch: bytes) -> None:
+    _checkout_from_patch(control_repo, worktree, patch)
+    rebuilt = capture_changes(worktree.path, worktree.base_commit).patch
+    if rebuilt.encode("utf-8", errors="surrogateescape") != patch:
+        raise WorkspaceError(f"worktree {worktree.path} does not reproduce its patch")
+
+
 def rebuild_worktree(control_repo: Path, worktree: Worktree, patch: bytes) -> None:
     """Replace ``worktree`` with a fresh checkout holding exactly ``patch``.
 
@@ -634,13 +641,25 @@ def rebuild_worktree(control_repo: Path, worktree: Worktree, patch: bytes) -> No
     Everything else in the old checkout is gone, ignored files included: this is
     not a repair of the tree in place, which would have to reason about ignore
     rules the old tree changed, embedded repositories and directory collisions.
+
+    The patch is proven on a scratch checkout first. A patch can fail to rebuild
+    its tree (a commit inside an embedded repository is only a gitlink in it), and
+    the old checkout may then hold the only copy of the work, so it stays.
     """
+    rehearsal = Worktree(
+        worktree.path.with_name(f"{worktree.path.name}-rebuild"),
+        f"{worktree.branch}-rebuild",
+        worktree.agent_id,
+        True,
+        base_commit=worktree.base_commit,
+    )
+    try:
+        _checkout_verified(control_repo, rehearsal, patch)
+    finally:
+        cleanup_worktree(control_repo, rehearsal)
     if not cleanup_worktree(control_repo, worktree):
         raise WorkspaceError(f"could not remove worktree {worktree.path}")
-    _checkout_from_patch(control_repo, worktree, patch)
-    rebuilt = capture_changes(worktree.path, worktree.base_commit).patch
-    if rebuilt.encode("utf-8", errors="surrogateescape") != patch:
-        raise WorkspaceError(f"rebuilt worktree {worktree.path} does not match its patch")
+    _checkout_verified(control_repo, worktree, patch)
 
 
 def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:

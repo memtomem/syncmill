@@ -387,6 +387,40 @@ def test_room_failed_rebuild_freezes_the_room_instead_of_reusing_the_tree(
         coordinator.close()
 
 
+def test_room_keeps_a_checkout_its_patch_cannot_rebuild(git_repo, tmp_path):
+    # A commit inside an embedded repository is only a gitlink in the patch, so
+    # the retained checkout holds the only copy of that work.
+    class _EmbeddedRepoAgent(FakeAgent):
+        async def aexecute(self, prompt: str, workdir: Path, timeout: int):
+            nested = workdir / "component"
+            nested.mkdir()
+            (nested / "important.py").write_text("irreplaceable\n", encoding="utf-8")
+            for args in (
+                ["init", "-q"],
+                ["add", "-A"],
+                ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "work"],
+            ):
+                subprocess.run(["git", *args], cwd=nested, check=True, capture_output=True)
+            return self.execute(prompt, workdir, timeout)
+
+    coordinator = RoomCoordinator(
+        _room_config(tmp_path, [_gate_writes()]), git_repo, agents=[_EmbeddedRepoAgent("claude")]
+    )
+    try:
+        room = coordinator.create("go", ["claude"])
+        with pytest.raises(WorkspaceError):
+            coordinator.run_round(room["id"])
+
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        workspace = coordinator.store.list_workspaces(room["id"])[0]
+        path = Path(workspace["path"])
+        assert (path / "component" / "important.py").read_text() == "irreplaceable\n"
+        assert (path / "component" / ".git").is_dir()
+        assert not path.with_name(f"{path.name}-rebuild").exists()
+    finally:
+        coordinator.close()
+
+
 # ── rebuild_worktree ─────────────────────────────────────────────────────────
 
 
@@ -429,3 +463,36 @@ def test_rebuild_handles_an_empty_patch(git_repo, tmp_path):
 
     assert capture_changes(worktree.path, base).patch == ""
     assert not (worktree.path / "debris.txt").exists()
+
+
+def test_rebuild_leaves_the_checkout_and_no_scratch_when_the_patch_will_not_apply(
+    git_repo, tmp_path
+):
+    worktree, base = _linked_worktree(git_repo, tmp_path)
+    (worktree.path / "work.txt").write_text("work\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError):
+        rebuild_worktree(git_repo, worktree, b"this is not a patch\n")
+
+    assert (worktree.path / "work.txt").read_text() == "work\n"
+    assert not worktree.path.with_name(f"{worktree.path.name}-rebuild").exists()
+    branches = subprocess.run(
+        ["git", "branch", "--list", "linked-branch*"],
+        cwd=git_repo, check=True, capture_output=True, text=True,
+    ).stdout.split()
+    assert "linked-branch-rebuild" not in branches
+    assert "linked-branch" in branches
+
+
+def test_rebuild_refuses_a_patch_that_does_not_reproduce_itself(git_repo, tmp_path):
+    worktree, base = _linked_worktree(git_repo, tmp_path)
+    (worktree.path / "work.txt").write_text("work\n", encoding="utf-8")
+    patch = capture_changes(worktree.path, base).patch
+    # Applies cleanly, but capture would not produce these bytes.
+    altered = ("# a leading comment git apply ignores\n" + patch).encode()
+    (worktree.path / "not-in-the-patch.txt").write_text("kept\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="does not reproduce"):
+        rebuild_worktree(git_repo, worktree, altered)
+
+    assert (worktree.path / "not-in-the-patch.txt").exists()
