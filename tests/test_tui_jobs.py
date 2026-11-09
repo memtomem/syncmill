@@ -1698,10 +1698,10 @@ def test_a_launch_binds_the_jobs_socket_and_removes_it(tmp_path, monkeypatch, sh
     assert list(short_runtime.iterdir()) == []
 
 
-def test_a_failed_probe_cleanup_does_not_fail_the_launch(tmp_path, monkeypatch, short_runtime):
+def test_a_probe_it_cannot_remove_refuses_the_launch(tmp_path, monkeypatch, short_runtime):
+    # The manager unlinks this path before binding, so it would die on the same error.
     store = _store(tmp_path)
-    bound = _spy_on_bind(monkeypatch)
-    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", lambda *a, **k: object())
+    _refuse_popen(monkeypatch)
     real_unlink = Path.unlink
     reached: list[Path] = []
 
@@ -1712,6 +1712,21 @@ def test_a_failed_probe_cleanup_does_not_fail_the_launch(tmp_path, monkeypatch, 
         return real_unlink(self, *a, **k)
 
     monkeypatch.setattr(Path, "unlink", unlink)
-    row = store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
-    assert bound == [str(_socket_path(row["job_id"]))]
-    assert reached == [_socket_path(row["job_id"])]
+    with pytest.raises(JobError, match="unlink denied"):
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+    assert reached
+    assert list(store.jobs_dir.iterdir()) == []
+
+
+def test_a_probe_already_gone_does_not_fail_the_launch(tmp_path, monkeypatch, short_runtime):
+    store = _store(tmp_path)
+    real = socket.socket
+
+    class _RemovedAtOnce(real):
+        def bind(self, address):
+            super().bind(address)
+            os.unlink(address)
+
+    monkeypatch.setattr("syncmill.tui_jobs.socket.socket", _RemovedAtOnce)
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", lambda *a, **k: object())
+    assert store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)["job_id"]

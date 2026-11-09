@@ -17,7 +17,6 @@ the only op the UI launches (room/artifact-apply execution lands in Chunk B).
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
 import os
@@ -324,14 +323,15 @@ def _probe_control_socket(job_id: str) -> None:
         path = _socket_path(job_id)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
             probe.bind(str(path))
+        # The manager unlinks the same path before its bind, so a failure here
+        # would kill it too.
+        path.unlink(missing_ok=True)
     except OSError as exc:
         where = f" at {path}" if path is not None else ""
         raise JobError(
-            f"cannot create this job's control socket{where}: {exc}. Nothing was "
+            f"cannot set up this job's control socket{where}: {exc}. Nothing was "
             "started. Point XDG_RUNTIME_DIR at a shorter, writable directory."
         ) from exc
-    with contextlib.suppress(OSError):
-        path.unlink()
 
 
 class JobStore:
