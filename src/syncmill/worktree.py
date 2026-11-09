@@ -240,8 +240,8 @@ def repository_fingerprint(repo_root: Path, *, like: object = _CURRENT) -> str:
 
     v1 (bare hex) is a persisted contract and stays byte-identical: each
     untracked entry is ``path NUL`` + ``L``/``F`` + target/bytes. v2 frames
-    every section and entry with its byte length and tags executable files
-    ``X``, closing v1's two gaps (crafted contents that collide across entries,
+    every section and entry with its byte length and tags a file Git would
+    record as 100755 (owner execute bit) ``X``, closing v1's two gaps (crafted contents that collide across entries,
     and an untracked file's exec bit going unnoticed).
 
     Not strictly read-only: porcelain ``git status`` and ``git diff`` refresh the
@@ -294,7 +294,10 @@ def repository_fingerprint(repo_root: Path, *, like: object = _CURRENT) -> str:
                 tag, content = b"L", os.readlink(path).encode(errors="surrogateescape")
             elif stat.S_ISREG(st.st_mode):
                 content = path.read_bytes()
-                tag = b"X" if framed and st.st_mode & 0o111 else b"F"
+                # Git's own rule: a regular file is 100755 iff the owner
+                # execute bit is set, so the snapshot's mode changes exactly
+                # when this tag does.
+                tag = b"X" if framed and st.st_mode & stat.S_IXUSR else b"F"
             else:
                 raise WorkspaceError(
                     f"untracked path {rel} is not a regular file or symlink"

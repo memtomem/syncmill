@@ -107,6 +107,37 @@ def test_v2_closes_the_framing_collision_v1_keeps(git_repo):
     assert first_v2 != second_v2
 
 
+@pytest.mark.parametrize(
+    ("before", "after", "git_mode_changes"),
+    [
+        (0o644, 0o755, True),
+        (0o654, 0o754, True),  # another exec bit stays set; Git's mode still flips
+        (0o644, 0o654, False),  # group exec only: Git keeps 100644
+        (0o755, 0o744, False),
+    ],
+)
+def test_v2_tracks_the_exec_bit_exactly_as_git_does(git_repo, before, after, git_mode_changes):
+    script = git_repo / "run.sh"
+    script.write_bytes(b"#!/bin/sh\n")
+
+    index = git_repo.parent / "probe-index"  # outside the tree: never an untracked file
+
+    def observed(mode: int) -> tuple[str, str]:
+        os.chmod(script, mode)
+        env = {**isolated_git_env(), "GIT_INDEX_FILE": str(index)}
+        subprocess.run(["git", "add", "--", "run.sh"], cwd=git_repo, env=env, check=True)
+        staged = subprocess.run(
+            ["git", "ls-files", "-s", "--", "run.sh"],
+            cwd=git_repo, env=env, check=True, capture_output=True, text=True,
+        ).stdout.split()[0]
+        return repository_fingerprint(git_repo), staged
+
+    first_fp, first_mode = observed(before)
+    second_fp, second_mode = observed(after)
+    assert (first_mode != second_mode) is git_mode_changes
+    assert (first_fp != second_fp) is git_mode_changes
+
+
 def test_v2_sees_an_untracked_exec_bit_v1_does_not(git_repo):
     script = git_repo / "run.sh"
     script.write_bytes(b"#!/bin/sh\n")
