@@ -169,6 +169,19 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def encode_json_document(value: object) -> bytes:
+    """``value`` as indented UTF-8 JSON, lossless for lone surrogates.
+
+    Readable UTF-8 is the normal form. A lone surrogate (a non-UTF-8 path
+    decoded with ``os.fsdecode``, or a surrogateescape'd prompt) cannot be
+    encoded as UTF-8, so only then is the document written with ASCII
+    escapes, which ``json.loads`` turns back into the same string."""
+    try:
+        return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return (json.dumps(value, ensure_ascii=True, indent=2) + "\n").encode("ascii")
+
+
 # Apply receipts are a few hundred bytes; anything far larger is a bad file, not
 # evidence — the reconciler skips it without parsing (a cheap DoS/oversize guard).
 _MAX_RECEIPT_BYTES = 64 * 1024
@@ -919,14 +932,14 @@ class ArtifactStore:
         self._io.write(run_dir / "winner.patch", patch)
         self._io.write(
             run_dir / "result.json",
-            (json.dumps({
+            encode_json_document({
                 "status": result.status.value,
                 "output": result.output,
                 "error": result.error,
                 "exit_code": result.exit_code,
                 "duration_seconds": result.duration_seconds,
                 "failure_kind": result.failure_kind,
-            }, ensure_ascii=False, indent=2) + "\n").encode("utf-8", errors="replace"),
+            }),
         )
         self._write_manifest(run_dir, manifest)
         return RunArtifact(run_id, run_dir, manifest)
@@ -1989,7 +2002,5 @@ class ArtifactStore:
         self._check_binding(run_dir.name, manifest)
         self._io.write(
             run_dir / "manifest.json",
-            (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(
-                "utf-8", errors="replace"
-            ),
+            encode_json_document(manifest),
         )

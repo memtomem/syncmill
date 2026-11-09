@@ -320,7 +320,6 @@ def round_lessons(value: object) -> tuple[RoundLesson, ...]:
             raise RoomError(f"round lesson {lesson_id} is listed twice")
         if not isinstance(text, str) or not text.strip():
             raise RoomError("a round lesson text must not be empty")
-        text = normalize_lesson(text)
         seen.add(lesson_id)
         lessons.append(RoundLesson(lesson_id, text))
     return tuple(lessons)

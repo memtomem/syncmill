@@ -45,6 +45,7 @@ from syncmill.agents import (
 from syncmill.artifacts import (
     ArtifactError,
     ArtifactStore,
+    encode_json_document,
     printable_name,
     printable_text,
     terminal_json,
@@ -1618,9 +1619,7 @@ class WorkflowStore:
         # the patch first makes result.json a commit marker — it exists only
         # once the bytes it describes are durable — and its digest lets a
         # reader prove the two halves belong together.
-        result_bytes = (
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-        ).encode("utf-8", errors="replace")
+        result_bytes = encode_json_document(payload)
         _atomic_write(patch_path, patch_bytes)
         _atomic_write(output_path, result_bytes)
         _atomic_write(

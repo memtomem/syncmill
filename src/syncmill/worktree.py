@@ -241,14 +241,15 @@ def repository_fingerprint(repo_root: Path) -> str:
         path = repo_root / rel
         digest.update(raw + b"\0")
         try:
+            # lstat first so a FIFO is refused instead of blocking read_bytes.
+            # The digest encoding below is a persisted contract (manifests,
+            # room candidates and isolated sessions store it and compare it at
+            # apply time), so it must stay byte-identical across versions.
             st = path.lstat()
             if stat.S_ISLNK(st.st_mode):
-                target = os.readlink(path).encode(errors="surrogateescape")
-                digest.update(b"L" + f"{len(target)}\0".encode("ascii") + target)
+                digest.update(b"L" + os.readlink(path).encode(errors="surrogateescape"))
             elif stat.S_ISREG(st.st_mode):
-                data = path.read_bytes()
-                tag = b"X" if (st.st_mode & 0o111) else b"F"
-                digest.update(tag + f"{len(data)}\0".encode("ascii") + data)
+                digest.update(b"F" + path.read_bytes())
             else:
                 raise WorkspaceError(
                     f"untracked path {rel} is not a regular file or symlink"

@@ -3538,16 +3538,17 @@ def test_tampering_after_select_verification_is_caught_by_apply(
         coordinator.close()
 
 
-def test_round_lessons_validates_control_characters_and_size_limit():
+def test_round_lessons_pass_decision_text_through_verbatim():
+    # `board decide --supersedes <lesson>` keeps the lesson's project but its
+    # text is not held to the promote rules, and the launcher shows it as
+    # stored. A round must deliver exactly that text, not refuse the round.
     from uuid import uuid4
 
     from syncmill.rooms import LESSON_MAX_BYTES, RoundLesson, round_lessons
 
-    uid = str(uuid4())
-    with pytest.raises(RoomError, match="control characters"):
-        round_lessons([RoundLesson(uid, "bad\x1b[31m")])
-    with pytest.raises(RoomError, match="limit"):
-        round_lessons([RoundLesson(uid, "x" * (LESSON_MAX_BYTES + 1))])
+    texts = ["x" * (LESSON_MAX_BYTES + 500), "line1\r\nline2", "  padded  "]
+    lessons = [RoundLesson(str(uuid4()), text) for text in texts]
+    assert [lesson.text for lesson in round_lessons(lessons)] == texts
 
 
 def test_round_log_sink_refuses_symlinks_on_open_and_rotate(tmp_path):

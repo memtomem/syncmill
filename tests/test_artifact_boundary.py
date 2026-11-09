@@ -795,20 +795,37 @@ def test_warm_listing_keeps_descriptor_use_bounded(tmp_path, monkeypatch):
     assert high_water <= 4  # base, project, runs, one run (the cold-pass bound)
 
 
-def test_repository_fingerprint_distinguishes_untracked_exec_bit_and_rejects_fifo(
-    git_repo, monkeypatch
-):
+def test_repository_fingerprint_keeps_its_persisted_encoding(git_repo):
+    # Manifests, room candidates and isolated sessions store this digest and
+    # compare it at apply time, so a format change would make every record
+    # taken before an upgrade read as "source changed".
+    import hashlib
+    import subprocess
+
+    from syncmill.worktree import isolated_git_env, repository_fingerprint
+
+    (git_repo / "untracked.txt").write_bytes(b"hello\n")
+    (git_repo / "untracked-link").symlink_to("untracked.txt")
+    env = isolated_git_env()
+
+    def git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=git_repo, env=env, check=True, capture_output=True
+        ).stdout
+
+    expected = hashlib.sha256()
+    expected.update(git("rev-parse", "--verify", "HEAD"))
+    expected.update(git("status", "--porcelain=v2", "--untracked-files=all"))
+    expected.update(git("diff", "--binary", "HEAD"))
+    expected.update(b"untracked-link\0" + b"L" + b"untracked.txt")
+    expected.update(b"untracked.txt\0" + b"F" + b"hello\n")
+    assert repository_fingerprint(git_repo) == expected.hexdigest()
+
+
+def test_repository_fingerprint_rejects_an_untracked_fifo(git_repo, monkeypatch):
     import subprocess
     import syncmill.worktree as wt_mod
     from syncmill.worktree import WorkspaceError, repository_fingerprint
-
-    script = git_repo / "untracked.sh"
-    script.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
-    script.chmod(0o644)
-    fp_non_exec = repository_fingerprint(git_repo)
-    script.chmod(0o755)
-    fp_exec = repository_fingerprint(git_repo)
-    assert fp_non_exec != fp_exec
 
     fifo = git_repo / "untracked.fifo"
     os.mkfifo(fifo)
@@ -859,4 +876,9 @@ def test_artifact_save_tolerates_lone_surrogates_in_output(git_repo, tmp_path):
         strategy="route",
     )
     assert art.manifest["run_id"] == "run-surrogate"
+    # Lossless, not replaced: the stored strings read back unchanged.
+    stored = json.loads((art.path / "manifest.json").read_bytes())
+    assert stored["prompt"] == "prompt with \ud800 surrogate"
+    result = json.loads(store.read_result("run-surrogate"))
+    assert result["output"] == "output with \ud800 surrogate"
 

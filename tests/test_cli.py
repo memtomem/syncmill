@@ -6264,3 +6264,25 @@ def test_cli_rationale_file_and_room_worker_fd_bounds(runner, tmp_path):
             os.close(r_fd)
         with contextlib.suppress(OSError):
             os.close(w_fd)
+
+
+def test_room_worker_refuses_an_oversized_prompt_fd(runner):
+    import threading
+
+    from syncmill.rooms import _ROOM_PROMPT_MAX_BYTES
+
+    r_fd, w_fd = os.pipe()
+    payload = b"x" * (_ROOM_PROMPT_MAX_BYTES + 1)
+
+    def write_all() -> None:
+        with os.fdopen(w_fd, "wb") as handle:
+            handle.write(payload)
+
+    writer = threading.Thread(target=write_all)
+    writer.start()
+    try:
+        res = runner.invoke(cli, ["room-worker", "r1", "--prompt-fd", str(r_fd)])
+    finally:
+        writer.join(timeout=10)
+    assert res.exit_code != 0
+    assert f"prompt exceeds {_ROOM_PROMPT_MAX_BYTES} bytes" in res.output

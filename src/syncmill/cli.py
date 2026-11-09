@@ -3337,7 +3337,7 @@ def _read_bounded_utf8(path: Path, *, max_bytes: int = 64 * 1024) -> str:
 
 
 def _read_rationale(rationale: str | None, rationale_file: Path | None) -> str | None:
-    if rationale is not None and rationale_file not in (None,):
+    if rationale is not None and rationale_file is not None:
         raise click.UsageError("--rationale and --rationale-file are mutually exclusive")
     if rationale_file is None:
         return rationale
@@ -3828,9 +3828,12 @@ def room_worker(
             handle = os.fdopen(prompt_fd, "rb")
             prompt_fd = None
             with handle:
-                prompt = handle.read(_ROOM_PROMPT_MAX_BYTES + 1).decode(
-                    "utf-8", errors="surrogateescape"
+                raw_prompt = handle.read(_ROOM_PROMPT_MAX_BYTES + 1)
+            if len(raw_prompt) > _ROOM_PROMPT_MAX_BYTES:
+                raise click.ClickException(
+                    f"room worker prompt exceeds {_ROOM_PROMPT_MAX_BYTES} bytes"
                 )
+            prompt = raw_prompt.decode("utf-8", errors="surrogateescape")
         if lessons_fd is not None:
             handle = os.fdopen(lessons_fd, "rb")
             lessons_fd = None
