@@ -130,6 +130,9 @@ detached POSIX manager. The manager owns per-board `flock`, atomic 0600 job stat
 two-segment bounded logs, a token-authenticated Unix socket, and a same-interpreter
 Click child in its own process group. `q` only exits the UI. Explicit stop is
 SIGINT-first; explicit force after ten seconds is SIGKILL and never fabricates a
-Board transition. PID fields are informational only. `Board.renew_claim` plus the
+Board transition. `JobStore.launch` binds and removes the job's socket path before it
+takes a lock or spawns, because the manager binds after `launch` has returned; a job
+whose socket cannot exist is refused with `JobError` instead of dying unseen. `launch`
+still gives no readiness guarantee for other failures. PID fields are informational only. `Board.renew_claim` plus the
 Supervisor's separate-connection heartbeat prevents a healthy run from crossing the
 lease timeout and being dispatched twice. Default tests use fake children only.

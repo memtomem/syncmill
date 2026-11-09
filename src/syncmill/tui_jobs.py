@@ -311,6 +311,29 @@ def _socket_path(job_id: str) -> Path:
     return _runtime_dir() / f"tui-{job_id[:24]}.sock"
 
 
+def _probe_control_socket(job_id: str) -> None:
+    """Refuse a job whose manager could not bind its control socket.
+
+    The manager binds only after ``launch`` has returned, so this is the last point
+    where the failure can reach the caller. A real bind, because the path limit
+    differs by platform and a denied or read-only directory fails the same way.
+    """
+    path: Path | None = None
+    try:
+        path = _socket_path(job_id)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.bind(str(path))
+        # The manager unlinks the same path before its bind, so a failure here
+        # would kill it too.
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        where = f" at {path}" if path is not None else ""
+        raise JobError(
+            f"cannot set up this job's control socket{where}: {exc}. Nothing was "
+            "started. Point XDG_RUNTIME_DIR at a shorter, writable directory."
+        ) from exc
+
+
 class JobStore:
     def __init__(
         self,
@@ -653,6 +676,7 @@ class JobStore:
         except OSError as exc:
             raise JobError(f"cannot prepare the job store: {exc}") from exc
         job_id = str(uuid4())
+        _probe_control_socket(job_id)
         lock_key = self._target_key_for(spec)
         job_dir = self.jobs_dir / job_id
         created = time.time()

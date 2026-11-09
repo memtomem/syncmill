@@ -113,6 +113,13 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- A detached job whose control socket cannot be created is now refused at launch
+  (#275). `apply --detach` printed `detached artifact-apply job ...` and exited 0
+  while the job died at once, for example when `TMPDIR` made the socket path too long
+  for `AF_UNIX`, and nothing was applied. `apply --detach`, `room apply --detach`,
+  `workflow run` and `workflow resume` now exit non-zero, and the TUI shows the error,
+  before any worker or lock. A worker that dies right after starting for another
+  reason still gets the immediate `detached ...` message; check the job in the TUI.
 - A file a quality gate writes, such as a test report or build output, no longer
   enters the candidate's patch or reaches your source on `apply` (#268). Every
   `run` strategy now captures the candidate before its gate runs. A Room rebuilds a

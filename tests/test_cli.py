@@ -1186,6 +1186,30 @@ def test_apply_detach_surfaces_a_launch_failure(monkeypatch, runner, git_repo):
     assert "detached" not in res.output
 
 
+def test_apply_detach_refuses_a_socket_it_cannot_bind(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # The real JobStore: the launch used to print success and exit 0 here, while
+    # the worker died binding its socket and nothing was applied.
+    captured: dict = {}
+    _patch_apply_store(monkeypatch, captured)
+    monkeypatch.setenv("SYNCMILL_TUI__STATE_DIR", str(tmp_path / "tui"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / ("r" * 120)))
+
+    real_popen = subprocess.Popen
+
+    def no_worker(argv, *a, **k):
+        assert "syncmill.tui_jobs" not in argv, "no worker may be spawned"
+        return real_popen(argv, *a, **k)
+
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", no_worker)
+    res = runner.invoke(cli, ["apply", "run-77", "--repo", str(git_repo), "--detach"])
+    assert res.exit_code == 1, res.output
+    assert "control socket" in res.output
+    assert "Nothing was started" in res.output
+    assert "detached artifact-apply job" not in res.output
+
+
 def test_apply_detach_rejects_an_unknown_run_id(monkeypatch, runner, git_repo):
     # PR #78 review: a typo'd run id must fail HERE with a clean non-zero exit,
     # not exit 0 with "detached job launched" and die in the background log.

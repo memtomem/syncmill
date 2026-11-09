@@ -7,6 +7,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1566,3 +1567,166 @@ def test_manager_serve_survives_non_dict_payload_and_broken_pipe(tmp_path):
     reply = json.loads(c2_c.recv(4096).decode("utf-8"))
     c2_c.close()
     assert reply == {"ok": False, "error": "control request must be a JSON object"}
+
+
+# ── A job whose control socket cannot exist is refused at launch ──────────
+
+
+def _refuse_popen(monkeypatch) -> None:
+    def fail(*a, **k):
+        raise AssertionError("no worker may be spawned")
+
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", fail)
+
+
+@pytest.fixture
+def long_runtime(tmp_path, monkeypatch) -> Path:
+    """A runtime directory too long for any platform's sun_path."""
+    path = tmp_path / ("r" * 120)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(path))
+    return path
+
+
+@pytest.fixture
+def short_runtime(monkeypatch):
+    """A runtime directory short enough to bind on every platform."""
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="smj") as path:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", path)
+        yield Path(path) / "syncmill"
+
+
+def _store(tmp_path: Path) -> JobStore:
+    cfg = TuiConfig(state_dir=str(tmp_path / "tui"))
+    return JobStore(cfg, tmp_path, board_db=tmp_path / "board.db")
+
+
+def test_launch_refuses_a_socket_path_too_long_to_bind(tmp_path, monkeypatch, long_runtime):
+    store = _store(tmp_path)
+    _refuse_popen(monkeypatch)
+    with pytest.raises(JobError) as caught:
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+    message = str(caught.value)
+    assert f"control socket at {long_runtime / 'syncmill'}" in message
+    assert "Nothing was started" in message
+    assert "XDG_RUNTIME_DIR" in message
+    assert list(store.jobs_dir.iterdir()) == []
+
+
+def test_a_refused_launch_never_touches_locks_or_older_jobs(
+    tmp_path, monkeypatch, long_runtime
+):
+    store = _store(tmp_path)
+    _refuse_popen(monkeypatch)
+
+    def untouched(*a, **k):
+        raise AssertionError("a refused launch must stop before this")
+
+    monkeypatch.setattr(store, "_try_target_lock", untouched)
+    monkeypatch.setattr(store, "_try_legacy_lock", untouched)
+    monkeypatch.setattr(store, "_reconcile_superseded", untouched)
+    with pytest.raises(JobError, match="control socket"):
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+
+
+def test_a_refused_launch_leaves_the_target_free(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / ("r" * 120)))
+    _refuse_popen(monkeypatch)
+    with pytest.raises(JobError, match="control socket"):
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", lambda *a, **k: object())
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="smj") as short:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", short)
+        assert store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)["job_id"]
+
+
+def test_a_chmod_failure_on_the_runtime_directory_becomes_a_job_error(
+    tmp_path, monkeypatch, short_runtime
+):
+    short_runtime.mkdir(mode=0o755)
+    short_runtime.chmod(0o755)  # _runtime_dir tightens this, through the failing chmod
+    store = _store(tmp_path)
+    store.ensure()
+    _refuse_popen(monkeypatch)
+    real_chmod = os.chmod
+    reached = []
+
+    def chmod(path, mode, **kwargs):
+        if Path(path) == short_runtime:
+            reached.append(path)
+            raise PermissionError("chmod denied")
+        return real_chmod(path, mode, **kwargs)
+
+    monkeypatch.setattr("syncmill.tui_jobs.os.chmod", chmod)
+    with pytest.raises(JobError, match="chmod denied"):
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+    assert reached
+
+
+def test_a_socket_creation_failure_becomes_a_job_error(tmp_path, monkeypatch, short_runtime):
+    store = _store(tmp_path)
+    _refuse_popen(monkeypatch)
+
+    def no_socket(*a, **k):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("syncmill.tui_jobs.socket.socket", no_socket)
+    with pytest.raises(JobError, match="Too many open files"):
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+
+
+def _spy_on_bind(monkeypatch) -> list[str]:
+    bound: list[str] = []
+    real = socket.socket
+
+    class _Spy(real):
+        def bind(self, address):
+            bound.append(address)
+            return super().bind(address)
+
+    monkeypatch.setattr("syncmill.tui_jobs.socket.socket", _Spy)
+    return bound
+
+
+def test_a_launch_binds_the_jobs_socket_and_removes_it(tmp_path, monkeypatch, short_runtime):
+    store = _store(tmp_path)
+    bound = _spy_on_bind(monkeypatch)
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", lambda *a, **k: object())
+    row = store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+    assert bound == [str(_socket_path(row["job_id"]))]
+    assert list(short_runtime.iterdir()) == []
+
+
+def test_a_probe_it_cannot_remove_refuses_the_launch(tmp_path, monkeypatch, short_runtime):
+    # The manager unlinks this path before binding, so it would die on the same error.
+    store = _store(tmp_path)
+    _refuse_popen(monkeypatch)
+    real_unlink = Path.unlink
+    reached: list[Path] = []
+
+    def unlink(self, *a, **k):
+        if self.suffix == ".sock":
+            reached.append(self)
+            raise PermissionError("unlink denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(JobError, match="unlink denied"):
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+    assert reached
+    assert list(store.jobs_dir.iterdir()) == []
+
+
+def test_a_probe_already_gone_does_not_fail_the_launch(tmp_path, monkeypatch, short_runtime):
+    store = _store(tmp_path)
+    real = socket.socket
+
+    class _RemovedAtOnce(real):
+        def bind(self, address):
+            super().bind(address)
+            os.unlink(address)
+
+    monkeypatch.setattr("syncmill.tui_jobs.socket.socket", _RemovedAtOnce)
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", lambda *a, **k: object())
+    assert store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)["job_id"]

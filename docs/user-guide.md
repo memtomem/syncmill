@@ -668,6 +668,14 @@ Detached background workers such as `apply --detach` and `room round --detach`
 require POSIX process and file-locking primitives. Use foreground execution on
 non-POSIX systems.
 
+`apply --detach` and `room apply --detach`, and every `workflow run` or
+`workflow resume` on POSIX, use a Unix socket under `XDG_RUNTIME_DIR` or the temporary
+directory. If it cannot be set up, the command fails before starting anything and says
+why. When the path is too long, set `XDG_RUNTIME_DIR` to a shorter, writable directory,
+and set it for later commands too, so they can find the running job.
+`detached ... job` means the worker was started, not that it finished or even stayed up;
+follow it in the TUI's Runs tab.
+
 ### `agents` — list registered agents
 
 ```bash
