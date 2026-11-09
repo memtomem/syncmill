@@ -1668,6 +1668,7 @@ def test_run_a_released_control_planned_workflow(release, tight, tmp_path, monke
     if tight:
         monkeypatch.setenv("SYNCMILL_WORKFLOW__DEADLINE_SECONDS", "1800")
         monkeypatch.setenv("SYNCMILL_WORKFLOW__MAX_PARALLEL", "1")
+        monkeypatch.setenv("SYNCMILL_WORKFLOW__MAX_OUTPUT_BYTES", "65536")
         monkeypatch.setenv("SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS", "120")
     else:
         # Wider than every released limit: each released one holds.
@@ -1705,7 +1706,7 @@ def test_run_a_released_control_planned_workflow(release, tight, tmp_path, monke
     assert execution["limits"] == {
         "deadline_seconds": 1800 if tight else stored["deadline_seconds"],
         "max_parallel": 1 if tight else plan["limits"]["maximum_parallelism"],
-        "max_output_bytes": stored["max_output_bytes"],
+        "max_output_bytes": 65536 if tight else stored["max_output_bytes"],
     }
     assert agents["codex"].timeouts == [stored_timeouts["workflow:draft"]]
     assert agents["kimi-code"].timeouts == [120 if tight else stored_timeouts["workflow:fix"]]
