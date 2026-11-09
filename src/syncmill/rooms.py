@@ -303,6 +303,110 @@ class RoundLesson:
     text: str
 
 
+@dataclasses.dataclass(frozen=True)
+class RepairPlan:
+    """One ``room repair``, fixed by its preview: which member runs, from which
+    candidate, with which settings. Its token is the digest of
+    :meth:`document`, so a confirmation proceeds only when a plan rebuilt at
+    that moment is identical. The bodies stay out of the document; the task's
+    digest covers them."""
+
+    room_id: str
+    revision: int
+    candidate_id: str
+    patch_sha256: str
+    output_sha256: str
+    parent_round_number: int
+    member_id: str
+    provider_id: str
+    agent_settings_sha256: str
+    conversations_enabled: bool
+    cold: bool
+    #: resume | cold
+    session_mode: str
+    session_sha256: str | None
+    prompt: str
+    agent_task: str
+    agent_task_sha256: str
+    lesson_ids: tuple[str, ...]
+    gate: dict[str, Any]
+    #: Each entry binds a request's id, record digest and status. Requests
+    #: arrive with the feedback store, so a plan holds none yet.
+    feedback: tuple[dict[str, str], ...] = ()
+    provider_calls: int = 1
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "v": 1,
+            "room": self.room_id,
+            "revision": self.revision,
+            "candidate": self.candidate_id,
+            "patch_sha256": self.patch_sha256,
+            "output_sha256": self.output_sha256,
+            "parent_round": self.parent_round_number,
+            "member": self.member_id,
+            "provider": self.provider_id,
+            "agent_settings_sha256": self.agent_settings_sha256,
+            "conversations_enabled": self.conversations_enabled,
+            "cold": self.cold,
+            "session_mode": self.session_mode,
+            "session_sha256": self.session_sha256,
+            "agent_task_sha256": self.agent_task_sha256,
+            "lessons": list(self.lesson_ids),
+            "gate": self.gate,
+            "feedback": list(self.feedback),
+            "provider_calls": self.provider_calls,
+        }
+
+    @property
+    def token(self) -> str:
+        canonical = json.dumps(
+            self.document(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        return sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _text_sha256(value: str) -> str:
+    return sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def render_repair_task(candidate_id: str, prompt: str) -> str:
+    """What a repair asks of its member. Deterministic, because the plan binds
+    its digest and a preview and its confirmation must agree on the bytes."""
+    return (
+        f"Repair your candidate {candidate_id}. Your working tree holds exactly "
+        "that candidate's patch. Ignored files, such as installed dependencies, "
+        f"may be missing.\n\n{prompt}"
+    )
+
+
+_GITLINK_HEADER = re.compile(
+    rb"^(?:(?:new file mode|deleted file mode|old mode|new mode) 160000"
+    rb"|index [0-9a-f]+\.\.[0-9a-f]+ 160000)$",
+    re.MULTILINE,
+)
+
+
+def patch_has_gitlink(patch: bytes) -> bool:
+    """Whether a captured patch records an embedded repository. A patch holds
+    only the commit id of one, so it cannot rebuild that repository's files."""
+    return _GITLINK_HEADER.search(patch) is not None
+
+
+def _gate_settings_record(gate: GateConfig) -> dict[str, Any]:
+    """The ``gate`` part of a round's provenance record."""
+    if not gate.commands:
+        return {"kind": "none"}
+    return {
+        "kind": "commands",
+        "commands": list(gate.commands),
+        "timeout_seconds": gate.timeout_seconds,
+        "env_allowlist": (
+            None if gate.env_allowlist is None else list(gate.env_allowlist)
+        ),
+    }
+
+
 def _canonical_uuid(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -662,13 +766,28 @@ def room_outcome_status(
 
 
 _PROVENANCE_SCHEMA_VERSION = 2
-_PROVENANCE_READABLE_VERSIONS = frozenset({1, 2})
-ROUND_LINEAGES = frozenset({"continue-own", "fresh", "branch-from"})
+#: Written only by a repair round, which names one member and one parent.
+#: All-member rounds keep writing v2, whatever came before them in the room.
+_PROVENANCE_REPAIR_SCHEMA_VERSION = 3
+_PROVENANCE_READABLE_VERSIONS = frozenset({1, 2, 3})
+ROUND_LINEAGES = frozenset({"continue-own", "fresh", "branch-from", "repair"})
 _LINEAGE_TREES = {
     "fresh": frozenset({"snapshot"}),
     "branch-from": frozenset({"branch"}),
     "continue-own": frozenset({"snapshot", "continued"}),
+    "repair": frozenset({"repair"}),
 }
+_REPAIR_TREE_KEYS = frozenset(
+    {
+        "kind",
+        "member_id",
+        "parent_candidate_id",
+        "parent_patch_sha256",
+        "parent_round_number",
+        "feedback_ids",
+        "agent_task_sha256",
+    }
+)
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -724,6 +843,8 @@ def round_provenance_status(
     lineage = record["requested_lineage"]
     if not isinstance(lineage, str) or lineage not in ROUND_LINEAGES:
         return malformed(f"provenance lineage {lineage!r} is unknown")
+    if (lineage == "repair") != (version == _PROVENANCE_REPAIR_SCHEMA_VERSION):
+        return malformed(f"lineage {lineage} cannot be recorded in version {version}")
 
     gate = record["gate"]
     if not isinstance(gate, dict):
@@ -763,7 +884,12 @@ def round_provenance_status(
     kind = tree.get("kind")
     # A str check first: an unhashable kind ([] / {}) must read malformed,
     # never raise out of a validator its readers expect to return.
-    if not isinstance(kind, str) or kind not in {"snapshot", "branch", "continued"}:
+    if not isinstance(kind, str) or kind not in {
+        "snapshot",
+        "branch",
+        "continued",
+        "repair",
+    }:
         return malformed(f"provenance tree kind {kind!r} is unknown")
     if kind not in _LINEAGE_TREES[lineage]:
         return malformed(f"tree {kind} cannot result from lineage {lineage}")
@@ -789,6 +915,10 @@ def round_provenance_status(
         digest = tree["base_patch_sha256"]
         if not _sha256_hex(digest) or digest != base.get("patch_sha256"):
             return malformed("branch base digest differs from the candidate's")
+    elif kind == "repair":
+        reason = _repair_tree_problem(tree, round_number, member_ids, candidates)
+        if reason is not None:
+            return malformed(reason)
     else:
         if set(tree) != {"kind", "members"}:
             return malformed("provenance tree keys are not the v1 set")
@@ -819,6 +949,69 @@ def round_provenance_status(
                     f"continued parent of {member_id} is not from the previous round"
                 )
     return ProvenanceCheck("recorded", record=record)
+
+
+def _repair_tree_problem(
+    tree: dict[str, Any],
+    round_number: int,
+    member_ids: list[str],
+    candidates: dict[str, dict[str, Any]],
+) -> str | None:
+    """Why a repair tree cannot be believed, or ``None``. It must name a member
+    of the room and that member's newest completed candidate as of this round."""
+    if set(tree) != _REPAIR_TREE_KEYS:
+        return "provenance tree keys are not the v3 repair set"
+    member_id = tree["member_id"]
+    if not isinstance(member_id, str) or member_id not in member_ids:
+        return "repair member is not a member of this room"
+    parent_id = tree["parent_candidate_id"]
+    parent = candidates.get(parent_id) if isinstance(parent_id, str) else None
+    if parent is None or parent.get("member_id") != member_id:
+        return "repair parent is not that member's candidate"
+    if parent.get("state") != "completed":
+        return "repair parent is not a completed candidate"
+    parent_round = tree["parent_round_number"]
+    if not _plain_int(parent_round) or parent_round != parent.get("round_number"):
+        return "repair parent round differs from the candidate's"
+    if parent_round >= round_number:
+        return "repair parent is not from an earlier round"
+    digest = tree["parent_patch_sha256"]
+    if not _sha256_hex(digest) or digest != parent.get("patch_sha256"):
+        return "repair parent digest differs from the candidate's"
+    for row in candidates.values():
+        number = row.get("round_number")
+        if (
+            row.get("member_id") == member_id
+            and row.get("state") == "completed"
+            and _plain_int(number)
+            and parent_round < number < round_number
+        ):
+            return "repair parent is not that member's newest completed candidate"
+    feedback = tree["feedback_ids"]
+    if not isinstance(feedback, list) or not all(_canonical_uuid(f) for f in feedback):
+        return "repair feedback ids are not canonical uuids"
+    if len(set(feedback)) != len(feedback):
+        return "repair feedback ids list a request twice"
+    if not _sha256_hex(tree["agent_task_sha256"]):
+        return "repair task digest is malformed"
+    return None
+
+
+def round_expected_members(
+    members: list[dict[str, Any]], provenance: ProvenanceCheck
+) -> list[dict[str, Any]]:
+    """The members a round was meant to run: the target alone for a recorded
+    repair, the room's members otherwise. A malformed record keeps the room's
+    members, so its damage stays visible as missing candidates."""
+    record = provenance.record
+    if (
+        provenance.status != "recorded"
+        or record is None
+        or record["tree"]["kind"] != "repair"
+    ):
+        return members
+    target = record["tree"]["member_id"]
+    return [m for m in members if isinstance(m, dict) and m.get("member_id") == target]
 
 
 def verify_settings_notice(check: ProvenanceCheck, gate: GateConfig) -> str | None:
@@ -1786,6 +1979,7 @@ class RoomStore:
         lease_timeout_seconds: int,
         max_rounds: int,
         provenance: dict[str, Any] | None = None,
+        repair_guard: RepairPlan | None = None,
     ) -> dict[str, Any]:
         """Insert the next round and claim its lease.
 
@@ -1794,6 +1988,10 @@ class RoomStore:
         read inside this transaction and written by the same INSERT, so a round
         never exists without the record its writer meant. ``None`` leaves the
         legacy NULL (direct store callers); the coordinator always passes one.
+
+        ``repair_guard`` is a confirmed repair plan. What can change between its
+        confirmation and this claim is derived again here, and any difference
+        refuses before a round exists.
         """
         now = _now()
         round_id = str(uuid4())
@@ -1816,6 +2014,10 @@ class RoomStore:
                 self._event(conn, room_id, "room.stale", {})
                 stale = True
             else:
+                if repair_guard is not None:
+                    problem = self._repair_guard_problem(conn, row, repair_guard)
+                    if problem is not None:
+                        raise RoomError(problem)
                 encoded: str | None = None
                 if provenance is not None:
                     encoded = _encode_provenance(provenance)
@@ -1873,6 +2075,105 @@ class RoomStore:
             self._conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
         )
 
+    def repair_parent_problem(self, room_id: str, candidate_id: str) -> str | None:
+        """Why this candidate cannot be repaired now, or ``None``."""
+        row = self._conn.execute(
+            "SELECT * FROM rooms WHERE id=?", (room_id,)
+        ).fetchone()
+        if row is None:
+            return f"unknown room: {room_id}"
+        return self._repair_parent_problem(self._conn, row, candidate_id)
+
+    @classmethod
+    def _repair_parent_problem(
+        cls, conn: sqlite3.Connection, room: sqlite3.Row, candidate_id: str
+    ) -> str | None:
+        state = room["state"]
+        if state == "selected":
+            return (
+                "a candidate is already selected, so this room cannot be repaired; "
+                "`room close`, then `room create`"
+            )
+        if state != "awaiting_decision":
+            return f"room cannot be repaired from {state}"
+        if room["recovery_path"] or room["workspace_owner"]:
+            return "room has workspace recovery pending; recover or close it"
+        rows = cls._candidate_rows(conn, room["id"])
+        parent = rows.get(candidate_id)
+        if parent is None:
+            return "candidate does not belong to this room"
+        if parent["state"] != "completed":
+            return (
+                f"candidate ended {parent['state']}, so it holds no finished work to "
+                "repair; only a completed candidate can be repaired"
+            )
+        number = parent["round_number"]
+        if not _plain_int(number):
+            return "candidate's round is not recorded"
+        newer = [
+            value
+            for value in rows.values()
+            if value["member_id"] == parent["member_id"]
+            and value["state"] == "completed"
+            and _plain_int(value["round_number"])
+            and value["round_number"] > number
+        ]
+        if newer:
+            newest = max(newer, key=lambda value: value["round_number"])
+            return (
+                f"candidate {newest['id']} is its member's newer completed candidate; "
+                "repair that one, or use `room round --lineage branch-from` for this one"
+            )
+        workspace = conn.execute(
+            "SELECT base_commit FROM room_workspaces WHERE room_id=? AND member_id=?",
+            (room["id"], parent["member_id"]),
+        ).fetchone()
+        if workspace is None:
+            return "the candidate's member has no retained workspace; `room create` a new room"
+        if parent["base_commit"] != workspace["base_commit"]:
+            return (
+                "the member's workspace moved to another snapshot after this candidate; "
+                "use `room round --lineage branch-from` for this one"
+            )
+        return None
+
+    @classmethod
+    def _repair_guard_problem(
+        cls, conn: sqlite3.Connection, room: sqlite3.Row, plan: RepairPlan
+    ) -> str | None:
+        again = "preview the repair again"
+        if int(room["revision"]) != plan.revision:
+            return f"the room changed since this repair was confirmed; {again}"
+        problem = cls._repair_parent_problem(conn, room, plan.candidate_id)
+        if problem is not None:
+            return problem
+        parent = cls._candidate_rows(conn, room["id"])[plan.candidate_id]
+        if (
+            parent["patch_sha256"] != plan.patch_sha256
+            or parent["output_sha256"] != plan.output_sha256
+            or parent["member_id"] != plan.member_id
+        ):
+            return f"the candidate differs from the one confirmed; {again}"
+        stored = cls._stored_session(conn, room, plan.member_id)
+        if (None if stored is None else _text_sha256(stored)) != plan.session_sha256:
+            return f"the member's provider session changed; {again}"
+        return None
+
+    @staticmethod
+    def _stored_session(
+        conn: sqlite3.Connection, room: sqlite3.Row, member_id: str
+    ) -> str | None:
+        """One member's stored session id, read as :meth:`member_sessions` does:
+        the live workspace row wins over the durable copy."""
+        row = conn.execute(
+            "SELECT provider_session_id FROM room_workspaces WHERE room_id=? AND member_id=?",
+            (room["id"], member_id),
+        ).fetchone()
+        live = row["provider_session_id"] if row is not None else None
+        if isinstance(live, str) and live:
+            return live
+        return _parse_sessions_json(room["sessions_json"]).get(member_id)
+
     def record_round_conversation(
         self,
         room_id: str,
@@ -1891,18 +2192,29 @@ class RoomStore:
         encoded = json.dumps(record, sort_keys=True, separators=(",", ":"))
         with self._tx() as conn:
             round_row = conn.execute(
-                "SELECT room_id, number FROM rounds WHERE id=?", (round_id,)
+                "SELECT room_id, number, provenance_json FROM rounds WHERE id=?",
+                (round_id,),
             ).fetchone()
             if round_row is None or round_row["room_id"] != room_id:
                 raise RoomError(f"round {round_id} is not a round of room {room_id}")
             room = conn.execute(
                 "SELECT members_json FROM rooms WHERE id=?", (room_id,)
             ).fetchone()
+            members = json.loads(room["members_json"])
+            candidates = self._candidate_rows(conn, room_id)
             check = round_conversation_status(
                 encoded,
                 round_number=int(round_row["number"]),
-                members=json.loads(room["members_json"]),
-                candidates=self._candidate_rows(conn, room_id),
+                members=round_expected_members(
+                    members,
+                    round_provenance_status(
+                        round_row["provenance_json"],
+                        round_number=int(round_row["number"]),
+                        member_ids=[m["member_id"] for m in members],
+                        candidates=candidates,
+                    ),
+                ),
+                candidates=candidates,
             )
             if check.status != "recorded":
                 raise RoomError(f"invalid round conversation record: {check.reason}")
@@ -3516,25 +3828,40 @@ class RoomCoordinator:
         *,
         lineage: str = "continue-own",
         fresh_session: bool = False,
+        member_id: str | None = None,
     ) -> bool:
         """Whether a round launched now would resume at least one member's
         provider conversation in a room where an earlier round selected
         approved lessons (#174). Such a conversation may still hold lessons
         this round leaves out: exclusion stops new injection, it cannot
         retract what a conversation was sent. Read-only and as of now; it
-        names no lesson and claims nothing about what a conversation holds."""
+        names no lesson and claims nothing about what a conversation holds.
+        ``member_id`` asks about that member's conversation alone (a repair)."""
         if fresh_session or lineage == "fresh" or not self.config.conversations.enabled:
             return False
         room = self.store.get_room(room_id)
         sessions = self.store.member_sessions(room_id)
-        if not any(sessions.get(member["member_id"]) for member in room["members"]):
+        if not any(
+            sessions.get(member["member_id"])
+            for member in room["members"]
+            if member_id is None or member["member_id"] == member_id
+        ):
             return False
         candidates = self.store.candidate_rows(room_id)
+        member_ids = [member["member_id"] for member in room["members"]]
         for row in self.store.list_rounds(room_id):
             check = round_conversation_status(
                 row.get("conversation_json"),
                 round_number=int(row["number"]),
-                members=room["members"],
+                members=round_expected_members(
+                    room["members"],
+                    round_provenance_status(
+                        row.get("provenance_json"),
+                        round_number=int(row["number"]),
+                        member_ids=member_ids,
+                        candidates=candidates,
+                    ),
+                ),
                 candidates=candidates,
             )
             if (
@@ -3544,6 +3871,76 @@ class RoomCoordinator:
             ):
                 return True
         return False
+
+    def build_repair_plan(
+        self,
+        candidate_id: str,
+        prompt: str,
+        *,
+        cold: bool = False,
+        lessons: list[RoundLesson] | tuple[RoundLesson, ...] | None = None,
+    ) -> RepairPlan:
+        """The plan for repairing one candidate as of now. Read-only: it starts
+        nothing, and a repair that could only fail after the round's lease is
+        refused here instead, so such a repair cannot freeze the room."""
+        room_id = str(self.store.get_candidate(candidate_id)["room_id"])
+        problem = self.store.repair_parent_problem(room_id, candidate_id)
+        if problem is not None:
+            raise RoomError(problem)
+        if not prompt.strip():
+            raise RoomError("a repair needs a prompt saying what to change")
+        room = self.preflight_round(room_id, prompt)
+        parent = self.store.candidate_rows(room_id)[candidate_id]
+        member_id = parent["member_id"]
+        try:
+            member = next(m for m in room["members"] if m["member_id"] == member_id)
+        except StopIteration:
+            raise RoomError("candidate's member is not a member of this room") from None
+        provider_id = member["provider_id"]
+        if provider_id not in {agent.agent_id for agent in self.agents}:
+            raise RoomError(f"room provider is no longer enabled: {provider_id}")
+        self.store.verify_candidate_artifact(candidate_id)
+        artifact = self.store.load_candidate(candidate_id)
+        if patch_has_gitlink(artifact["patch"] or b""):
+            raise RoomError(
+                "candidate's patch records an embedded repository, which a rebuild "
+                "cannot restore, so it cannot be repaired"
+            )
+        agent_task = render_repair_task(candidate_id, prompt)
+        # round_lessons_fit answers True when there are no lessons, and an
+        # oversized task would otherwise first fail after the lease is held.
+        _validate_prompt_text(agent_task)
+        selected = round_lessons(lessons)
+        if not round_lessons_fit(agent_task, [lesson.text for lesson in selected]):
+            raise RoomError(
+                "the selected lessons do not fit beside this repair's prompt; "
+                "leave some out with --skip-lesson or --no-lessons"
+            )
+        conversations = self.config.conversations.enabled
+        stored = self.store.member_sessions(room_id).get(member_id)
+        settings = self.config.agent_config(provider_id).model_dump(mode="json")
+        return RepairPlan(
+            room_id=room_id,
+            revision=int(room["revision"]),
+            candidate_id=candidate_id,
+            patch_sha256=parent["patch_sha256"],
+            output_sha256=parent["output_sha256"],
+            parent_round_number=int(parent["round_number"]),
+            member_id=member_id,
+            provider_id=provider_id,
+            agent_settings_sha256=_text_sha256(
+                json.dumps(settings, sort_keys=True, separators=(",", ":"))
+            ),
+            conversations_enabled=conversations,
+            cold=cold,
+            session_mode="resume" if conversations and stored and not cold else "cold",
+            session_sha256=None if stored is None else _text_sha256(stored),
+            prompt=prompt,
+            agent_task=agent_task,
+            agent_task_sha256=_text_sha256(agent_task),
+            lesson_ids=tuple(lesson.id for lesson in selected),
+            gate=_gate_settings_record(self.config.gate),
+        )
 
     def _continued_parents(self, room: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
         """Each member's candidate in the previous round: the attempt whose
@@ -3574,12 +3971,29 @@ class RoomCoordinator:
         fresh_session: bool = False,
         fork: bool = False,
         lessons: list[RoundLesson] | tuple[RoundLesson, ...] | None = None,
+        target: RepairPlan | None = None,
     ) -> dict[str, Any]:
         """Run one round. ``lessons`` are the approved project lessons the
         launcher showed and chose (#174); the coordinator never opens the
         board. They go to every member this round, after the checkpoint and
-        before the task, and the round's conversation record names them."""
+        before the task, and the round's conversation record names them.
+
+        ``target`` makes this a repair: one member runs, from one candidate of
+        its own, as its confirmed plan says. Without it every member runs."""
         selected_lessons = round_lessons(lessons)
+        if target is not None:
+            if (
+                lineage != "continue-own"
+                or base_candidate_id
+                or fresh_session
+                or fork
+                or prompt != target.prompt
+            ):
+                raise RoomError("a repair takes its prompt and session from its plan")
+            if tuple(lesson.id for lesson in selected_lessons) != target.lesson_ids:
+                raise RoomError("a repair's lessons differ from its plan")
+            if target.room_id != room_id:
+                raise RoomError("a repair's plan names another room")
         room = self.preflight_round(
             room_id,
             prompt,
@@ -3633,8 +4047,23 @@ class RoomCoordinator:
             fresh_session
             or lineage == "fresh"
             or not self.config.conversations.enabled
+            or (target is not None and target.session_mode == "cold")
         )
         seed_sessions = {} if cold_sessions else self.store.member_sessions(room_id)
+        parent_patch: str | None = None
+        if target is not None:
+            # Peers' stored sessions are not this round's: only the target runs.
+            seed_sessions = {
+                member_id: session
+                for member_id, session in seed_sessions.items()
+                if member_id == target.member_id
+            }
+            if not existing:
+                raise RoomError("the room has no retained workspace to repair")
+            artifact = self.store.load_candidate(target.candidate_id)
+            parent_patch = (artifact["patch"] or b"").decode(
+                "utf-8", errors="surrogateescape"
+            )
         # One private copy of the gate settings: it is what the round records
         # AND what build_gate receives after the fan-out, so the two cannot
         # diverge.
@@ -3645,7 +4074,10 @@ class RoomCoordinator:
         tree: dict[str, Any]
         if lineage == "continue-own" and existing:
             _, validated = self._validated_workspace_records(
-                room_id, existing, require_live=True
+                room_id,
+                existing,
+                require_live=True,
+                live_members=None if target is None else {target.member_id},
             )
             retained_worktrees = {
                 value["member_id"]: Worktree(
@@ -3659,10 +4091,22 @@ class RoomCoordinator:
             }
             source_fingerprint = room["source_fingerprint"]
             snapshot_commit = room["snapshot_commit"]
-            tree = {
-                "kind": "continued",
-                "members": self._continued_parents(room),
-            }
+            tree = (
+                {
+                    "kind": "continued",
+                    "members": self._continued_parents(room),
+                }
+                if target is None
+                else {
+                    "kind": "repair",
+                    "member_id": target.member_id,
+                    "parent_candidate_id": target.candidate_id,
+                    "parent_patch_sha256": target.patch_sha256,
+                    "parent_round_number": target.parent_round_number,
+                    "feedback_ids": [item["id"] for item in target.feedback],
+                    "agent_task_sha256": target.agent_task_sha256,
+                }
+            )
         else:
             seed_patch: bytes | None = None
             tree = {"kind": "snapshot"}
@@ -3719,24 +4163,16 @@ class RoomCoordinator:
                 lease_timeout_seconds=self.config.rooms.lease_timeout_seconds,
                 max_rounds=self.config.rooms.max_rounds,
                 provenance={
-                    "schema_version": _PROVENANCE_SCHEMA_VERSION,
-                    "requested_lineage": lineage,
-                    "tree": tree,
-                    "gate": (
-                        {
-                            "kind": "commands",
-                            "commands": list(gate_config.commands),
-                            "timeout_seconds": gate_config.timeout_seconds,
-                            "env_allowlist": (
-                                None
-                                if gate_config.env_allowlist is None
-                                else list(gate_config.env_allowlist)
-                            ),
-                        }
-                        if gate_config.commands
-                        else {"kind": "none"}
+                    "schema_version": (
+                        _PROVENANCE_SCHEMA_VERSION
+                        if target is None
+                        else _PROVENANCE_REPAIR_SCHEMA_VERSION
                     ),
+                    "requested_lineage": lineage if target is None else "repair",
+                    "tree": tree,
+                    "gate": _gate_settings_record(gate_config),
                 },
+                repair_guard=target,
             )
         except BaseException:
             if snapshot is not None:
@@ -3754,7 +4190,14 @@ class RoomCoordinator:
             # those rounds. A successful cold turn repopulates them below.
             if fresh_session or lineage == "fresh":
                 self.store.clear_member_sessions(room_id)
-            members = room["members"]
+            if target is not None and target.cold:
+                # One member's, never clear_member_sessions: peers sat this out.
+                self.store.clear_member_session(room_id, target.member_id)
+            members = (
+                room["members"]
+                if target is None
+                else [m for m in room["members"] if m["member_id"] == target.member_id]
+            )
             by_id = {agent.agent_id: agent for agent in self.agents}
             try:
                 selected_agents = [by_id[member["provider_id"]] for member in members]
@@ -3786,6 +4229,19 @@ class RoomCoordinator:
                 existing = self.store.list_workspaces(room_id)
             else:
                 worktrees = [retained_worktrees[member["member_id"]] for member in members]
+            if target is not None and parent_patch is not None:
+                # A failed attempt since the parent can have left changes here.
+                self._keep_candidate_tree(
+                    room_id,
+                    target.member_id,
+                    worktrees[0],
+                    parent_patch,
+                    existing,
+                    reason="the worktree differed from the repair's parent",
+                )
+            # The text every member is asked to act on. A repair's stays out of
+            # rounds.prompt, which `apply` shares to memory.
+            round_task = round_prompt if target is None else target.agent_task
             # Per-member prompts: a RESUMING member's provider conversation
             # already holds its own prior outputs and every candidate published
             # before its last round's prompt was built — re-sending them is pure
@@ -3807,13 +4263,15 @@ class RoomCoordinator:
             # round, strictly BEFORE the fan-out (the shared-loop rule), and
             # apply it only to the AGENT prompts (the stored rounds.prompt row
             # keeps the user-authored text).
-            memory_context = self._memory_context(room_id, round_prompt)
+            memory_context = self._memory_context(
+                room_id, round_prompt if target is None else room["prompt"]
+            )
             # The lessons are member-independent and so is their fit: only
             # the task can leave too little room (excerpts and memory make way
             # for them). The launcher's preview ran the same check; a set that
             # still does not fit is recorded as dropped, never cut mid-text.
             lesson_texts = [lesson.text for lesson in selected_lessons]
-            if round_lessons_fit(round_prompt, lesson_texts):
+            if round_lessons_fit(round_task, lesson_texts):
                 delivered_lessons = lesson_texts
                 lesson_delivery = "included" if lesson_texts else "none"
             else:
@@ -3828,14 +4286,14 @@ class RoomCoordinator:
                 if seeded and last_seen is not None:
                     agent_prompt, included, omitted = self._checkpoint(
                         room_id,
-                        round_prompt,
+                        round_task,
                         exclude_member=member_id,
                         min_round_number=last_seen,
                         lessons=delivered_lessons,
                     )
                 else:
                     agent_prompt, included, omitted = self._checkpoint(
-                        room_id, round_prompt, lessons=delivered_lessons
+                        room_id, round_task, lessons=delivered_lessons
                     )
                 composed, delivered = self._memory_prefixed(memory_context, agent_prompt)
                 # Final-argv guarantee: the checkpoint embeds candidate OUTPUTS
@@ -4006,13 +4464,16 @@ class RoomCoordinator:
         worktree: Worktree,
         patch: str,
         workspaces: list[dict[str, Any]],
+        *,
+        reason: str = "the gate changed the worktree",
     ) -> None:
-        """Keep what a gate wrote out of this member's later rounds (#268).
+        """Make this member's worktree hold exactly ``patch``.
 
         The worktree outlives the candidate, so a file the gate left would enter
-        the next round's patch. Only a tree the gate actually changed is rebuilt,
-        which costs its ignored files. A failure propagates to the round's
-        recovery path, so a tree that may still hold gate output is never reused.
+        the next round's patch (#268), and a repair must start from its parent.
+        Only a tree that differs is rebuilt, which costs its ignored files. A
+        failure propagates to the round's recovery path, so a tree that may hold
+        something else is never reused.
         """
         try:
             unchanged = capture_changes(worktree.path, worktree.base_commit).patch == patch
@@ -4031,7 +4492,7 @@ class RoomCoordinator:
         self.store.record_event(
             room_id,
             "workspace.rebuilt",
-            {"member_id": member_id, "reason": "the gate changed the worktree"},
+            {"member_id": member_id, "reason": reason},
         )
 
     def _memory_context(self, room_id: str, prompt: str) -> str:
@@ -4261,11 +4722,16 @@ class RoomCoordinator:
         values: list[dict[str, Any]],
         *,
         require_live: bool,
+        live_members: set[str] | None = None,
     ) -> tuple[dict[str, Any], list[tuple[dict[str, Any], Path, Path]]]:
+        """Validate workspace records. ``live_members`` narrows ``require_live``
+        to those members, so a repair is not blocked by a peer's damaged
+        workspace; the next all-member round still fails on it."""
         room = self.store.get_room(room_id)
         members = {member["member_id"]: member for member in room["members"]}
         observed_members = {value["member_id"] for value in values}
-        if (require_live and observed_members != set(members)) or not (
+        must_be_live = set(members) if live_members is None else live_members
+        if (require_live and not must_be_live <= observed_members) or not (
             observed_members <= set(members)
         ):
             raise RoomError("room workspace metadata does not match room members")
@@ -4283,7 +4749,7 @@ class RoomCoordinator:
                 or value["provider_id"] != member["provider_id"]
             ):
                 raise RoomError("room workspace metadata contains unsafe paths")
-            if require_live:
+            if require_live and value["member_id"] in must_be_live:
                 control_git = control_repo / ".git"
                 self._resolved_owned_path(control_git)
                 git_marker = worktree_path / ".git"

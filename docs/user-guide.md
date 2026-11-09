@@ -792,6 +792,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room cand
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--include KIND:TARGET ... (--preview | --confirm TOKEN)] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room repair <candidate-id> --prompt "what to change" (--preview | --confirm TOKEN) [--cold]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # after you have lived with the applied change: record whether you accept it
@@ -1082,6 +1083,33 @@ every member then receives the full checkpoint rather than a delta.
 `room round --fresh-session` drops the stored session ids for one round,
 and `room round --fork` (claude members only) forks the conversations instead
 of continuing them in place. Session ids survive crashes and `room recover`.
+To fix one candidate without running the other members again, use `room repair`.
+Preview it, then confirm with the token the preview prints:
+
+```bash
+syncmill room repair <candidate-id> --prompt "what to change" --preview
+syncmill room repair <candidate-id> --prompt "what to change" --confirm <token>
+```
+
+The preview starts nothing. It shows the member that will run (the one that produced
+the candidate, one provider call), whether it resumes its conversation or starts cold,
+and the verification commands. `--confirm` runs only if the room, the candidate, the
+session, the settings and your options are still what the preview showed; otherwise it
+asks you to preview again. The result is a new candidate in a new round, which counts
+toward `max_rounds`. It is verified again and inherits no gate result, and you compare,
+select and apply it yourself (`room compare <room-id> --round N`). Other members and
+their candidates stay as they were, and your source is not touched.
+
+- Only a member's newest completed candidate can be repaired, and only while the room
+  is `awaiting_decision`. A candidate whose gate failed qualifies. A candidate that holds
+  an embedded repository does not, because a patch cannot restore one.
+- A failed repair leaves the original candidate repairable. A provider that cannot resume
+  its conversation fails instead of quietly starting a new one: preview again with `--cold`.
+- The checkout usually stays as it was. If a failed attempt changed it, it is rebuilt from
+  the candidate's patch first, and that loses its ignored files, such as installed
+  dependencies. A gate that relies on them can fail until the agent reinstalls them.
+- `--detach` and the TUI do not offer repair yet.
+
 When a provider reports token usage, `room candidates` and the TUI candidate
 views show it — e.g. `cache 85% (34.2k/40.1k)` — so you can see the cache
 hit-rate per member per round.

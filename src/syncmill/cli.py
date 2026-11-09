@@ -129,6 +129,7 @@ from syncmill.room_raw import (
 from syncmill.rooms import (
     _ROOM_PROMPT_MAX_BYTES,
     JUDGMENT_VERDICTS,
+    RepairPlan,
     RoomCoordinator,
     RoomError,
     RoundLesson,
@@ -3100,6 +3101,135 @@ def room_round(
         coordinator.close()
 
 
+@room_group.command("repair")
+@click.argument("candidate_id")
+@click.option("--prompt", default=None, help="What to change in this candidate.")
+@click.option(
+    "--prompt-file",
+    default=None,
+    type=click.Path(path_type=Path, allow_dash=True),
+    help=_PROMPT_FILE_HELP,
+)
+@click.option(
+    "--preview",
+    is_flag=True,
+    help="Show what the repair would run and print its confirmation token. "
+    "Starts nothing.",
+)
+@click.option(
+    "--confirm",
+    default=None,
+    metavar="TOKEN",
+    help="Run the repair, only if it is still exactly what the preview showed. "
+    "Pass the same options as the preview.",
+)
+@click.option(
+    "--cold",
+    is_flag=True,
+    help="Start this member's provider without its earlier conversation. Its stored "
+    "session id is dropped; other members' are kept.",
+)
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+@click.option(
+    "--skip-lesson",
+    "skip_lesson",
+    multiple=True,
+    metavar="ID",
+    help="Leave this approved project lesson out of this repair (repeatable). "
+    "A resumed conversation keeps what earlier rounds sent it.",
+)
+@click.option(
+    "--no-lessons",
+    is_flag=True,
+    help="Run this repair without any approved project lessons. A resumed "
+    "conversation keeps what earlier rounds sent it.",
+)
+def room_repair(
+    candidate_id: str,
+    prompt: str | None,
+    prompt_file: Path | None,
+    preview: bool,
+    confirm: str | None,
+    cold: bool,
+    repo: Path,
+    skip_lesson: tuple[str, ...] = (),
+    no_lessons: bool = False,
+) -> None:
+    """Run only the member that produced CANDIDATE_ID, from that candidate.
+
+    The result is a new candidate, verified again, that you compare and select
+    yourself. Other members, their candidates and the source are not touched."""
+    if preview == (confirm is not None):
+        raise click.UsageError("room repair needs exactly one of --preview and --confirm")
+    prompt = _resolve_prompt(prompt, prompt_file, required=True)
+    _, config, coordinator = _room_coordinator(repo)
+    try:
+        parent = coordinator.store.get_candidate(candidate_id)
+        room_id = str(parent["room_id"])
+        lessons = _show_repair_lessons(
+            config,
+            coordinator,
+            room_id,
+            str(parent["member_id"]),
+            list(skip_lesson),
+            no_lessons,
+            cold=cold,
+        )
+        plan = coordinator.build_repair_plan(
+            candidate_id, str(prompt), cold=cold, lessons=lessons
+        )
+        if preview:
+            _print_repair_plan(plan)
+            return
+        if plan.token != confirm:
+            raise _MultilineError(
+                "This repair is not what that token confirmed: the room, the candidate, "
+                "the session, the settings or these options changed.",
+                "Run it with --preview again.",
+            )
+        room = coordinator.run_round(room_id, plan.prompt, lessons=lessons, target=plan)
+        echo(f"Room {_shown(room_id)}: {_shown(room['state'])}")
+        number = int(room["round_count"])
+        for row in coordinator.store.list_candidates(room_id):
+            if row.get("round_number") != number:
+                continue
+            echo(
+                f"{_shown(row['id'])}  {_shown(row['member_id']):10} "
+                f"{_shown(row['state']):9} eligible:{bool(row['eligible'])}"
+            )
+            if row["state"] != "completed":
+                echo(
+                    f"{candidate_id} is still repairable: preview it again, with --cold "
+                    "if the provider could not resume its conversation."
+                )
+        echo(f"Review: syncmill room compare {_shown(room_id)} --round {number}")
+    except (RoomError, WorkspaceError, ProjectError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+
+def _print_repair_plan(plan: RepairPlan) -> None:
+    echo(f"Repair candidate {_shown(plan.candidate_id)} of room {_shown(plan.room_id)}")
+    echo(f"Runs:         {_shown(plan.member_id)} alone, {plan.provider_calls} provider call")
+    if plan.session_mode == "resume":
+        echo("Session:      resumes the member's stored conversation")
+    else:
+        echo("Session:      cold; the provider starts without the earlier conversation")
+    if plan.gate["kind"] == "none":
+        echo("Verification: none; the result will not be verified")
+    else:
+        for command in plan.gate["commands"]:
+            echo(f"Verification: {_shown(command)}")
+    echo(f"Prompt:       {len(plan.agent_task.encode('utf-8', 'surrogateescape'))} bytes")
+    echo("Starts from:  this candidate's patch. The checkout is rebuilt only if it differs,")
+    echo("              which loses its ignored files, such as installed dependencies.")
+    echo(f"Token:        {plan.token}")
+    echo("To run it, repeat this command with --confirm TOKEN in place of --preview.")
+
+
 @room_group.command("candidates")
 @click.argument("room_id")
 @click.option(
@@ -4247,6 +4377,41 @@ def _show_round_lessons(
         secho(
             "[syncmill] note: resumed conversations may still hold lessons sent in "
             "earlier rounds; --fresh-session starts them without that history",
+            fg="yellow",
+            err=True,
+        )
+    return tuple(RoundLesson(lesson.id, lesson.text) for lesson in used)
+
+
+def _show_repair_lessons(
+    config: SyncmillConfig,
+    coordinator: RoomCoordinator,
+    room_id: str,
+    member_id: str,
+    skip: list[str],
+    no_lessons: bool,
+    *,
+    cold: bool,
+) -> tuple[RoundLesson, ...]:
+    """The approved lessons a repair sends to its one member. No fit check here:
+    leaving a set out would change what the repair runs, so the plan refuses a
+    set that does not fit."""
+    used: list[Decision] = []
+    if config.board.enabled:
+        used = _show_lessons(
+            config,
+            coordinator.project_id,
+            skip,
+            no_lessons,
+            into="this member's prompt",
+            goal=coordinator.store.get_room(room_id).get("goal"),
+        )
+    if coordinator.resumes_with_lesson_history(
+        room_id, fresh_session=cold, member_id=member_id
+    ):
+        secho(
+            "[syncmill] note: a resumed conversation may still hold lessons sent in "
+            "earlier rounds; --cold starts it without that history",
             fg="yellow",
             err=True,
         )

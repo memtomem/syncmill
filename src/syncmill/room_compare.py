@@ -44,6 +44,7 @@ from syncmill.rooms import (
     RoomStore,
     SelectionCheck,
     round_conversation_status,
+    round_expected_members,
     round_provenance_status,
     room_outcome_status,
     selection_record_status,
@@ -179,15 +180,17 @@ class LineageView:
     #: recorded | not_recorded | malformed
     status: str
     reason: str | None = None
-    #: the lineage the user asked for: continue-own | fresh | branch-from
+    #: the lineage the user asked for: continue-own | fresh | branch-from | repair
     requested: str | None = None
-    #: snapshot | branch | continued
+    #: snapshot | branch | continued | repair
     tree: str | None = None
+    #: branch: the candidate seeded into every member; repair: the target's parent.
     base_candidate_id: str | None = None
     base_patch_sha256: str | None = None
     base_round_number: int | None = None
-    #: continued only: member id -> (parent candidate id, parent round), or
-    #: None when the previous round held no single candidate for the member.
+    #: continued: member id -> (parent candidate id, parent round), or None when
+    #: the previous round held no single candidate for the member. repair: the
+    #: target's entry alone.
     parents: dict[str, tuple[str, int] | None] = field(default_factory=dict)
 
 
@@ -755,13 +758,18 @@ def _provenance_views(
             )
             for member_id, parent in tree["members"].items()
         }
+    repair = tree["kind"] == "repair"
+    if repair:
+        parents = {
+            tree["member_id"]: (tree["parent_candidate_id"], tree["parent_round_number"])
+        }
     lineage = LineageView(
         "recorded",
         requested=record["requested_lineage"],
         tree=tree["kind"],
-        base_candidate_id=tree.get("base_candidate_id"),
-        base_patch_sha256=tree.get("base_patch_sha256"),
-        base_round_number=tree.get("base_round_number"),
+        base_candidate_id=tree["parent_candidate_id"] if repair else tree.get("base_candidate_id"),
+        base_patch_sha256=tree["parent_patch_sha256"] if repair else tree.get("base_patch_sha256"),
+        base_round_number=tree["parent_round_number"] if repair else tree.get("base_round_number"),
         parents=parents,
     )
     gate = record["gate"]
@@ -951,12 +959,13 @@ def _missing_members(
     round_row: dict[str, Any],
     rows: list[CandidateRow],
     now: float,
+    provenance: ProvenanceCheck,
 ) -> tuple[list[MissingMember], list[str]]:
     warnings: list[str] = []
     members = room.get("members")
     expected: list[tuple[str, str]] = []
     if isinstance(members, list):
-        for member in members:
+        for member in round_expected_members(members, provenance):
             if isinstance(member, dict) and isinstance(member.get("member_id"), str):
                 provider = member.get("provider_id")
                 expected.append(
@@ -971,6 +980,14 @@ def _missing_members(
         for m in store.list_round_members(str(round_row["id"]))
     }
     have = {r.member_id for r in rows}
+    if provenance.record is not None and provenance.record["tree"]["kind"] == "repair":
+        target = provenance.record["tree"]["member_id"]
+        strays = sorted((have | set(progress)) - {target})
+        if strays:
+            warnings.append(
+                f"this repair of {_p(target)} also holds records for "
+                + ", ".join(_p(member_id) for member_id in strays)
+            )
     lease = round_row.get("lease_expires")
     lease_live = isinstance(lease, (int, float)) and lease > now
     missing: list[MissingMember] = []
@@ -1107,25 +1124,25 @@ def build_room_comparison(
         ]
         try:
             profile, warnings = _gate_profile(rows)
-            lineage, settings, provenance_warnings = _provenance_views(
-                round_provenance_status(
-                    round_row.get("provenance_json"),
-                    round_number=int(round_row["number"]),
-                    member_ids=member_ids,
-                    candidates=candidate_rows,
-                ),
-                rows,
+            provenance = round_provenance_status(
+                round_row.get("provenance_json"),
+                round_number=int(round_row["number"]),
+                member_ids=member_ids,
+                candidates=candidate_rows,
             )
+            lineage, settings, provenance_warnings = _provenance_views(provenance, rows)
             conversation, conversation_warnings = _conversation_view(
                 round_conversation_status(
                     round_row.get("conversation_json"),
                     round_number=int(round_row["number"]),
-                    members=members if isinstance(members, list) else [],
+                    members=round_expected_members(
+                        members if isinstance(members, list) else [], provenance
+                    ),
                     candidates=candidate_rows,
                 )
             )
             missing, member_warnings = _missing_members(
-                store, room, round_row, rows, now
+                store, room, round_row, rows, now, provenance
             )
             groups.append(
                 RoundGroup(
@@ -1404,6 +1421,13 @@ def starts_from(group: RoundGroup, row: CandidateRow) -> dict[str, Any] | None:
             "base_candidate_id": lineage.base_candidate_id,
             "base_patch_sha256": lineage.base_patch_sha256,
         }
+    if lineage.tree == "repair":
+        return {
+            "kind": "repair",
+            "parent_candidate_id": lineage.base_candidate_id,
+            "parent_patch_sha256": lineage.base_patch_sha256,
+            "parent_round_number": lineage.base_round_number,
+        }
     return {"kind": "snapshot"}
 
 
@@ -1562,17 +1586,29 @@ def starting_tree_label(group: RoundGroup) -> str:
             "each member continues its own retained worktree; "
             "a common starting tree is not established" + requested
         )
+    if lineage.tree == "repair":
+        members = ", ".join(_p(member_id) for member_id in lineage.parents)
+        return (
+            f"candidate {_p(lineage.base_candidate_id)}'s patch "
+            f"(round {lineage.base_round_number}, sha256 {_p(lineage.base_patch_sha256)}), "
+            f"for {members} alone" + requested
+        )
     return "snapshot" + requested
 
 
 def row_start_label(group: RoundGroup, row: CandidateRow) -> str | None:
     """Where one candidate's worktree started, when that differs per candidate
     (a round that continued each member's own worktree); else None."""
-    if group.lineage.status != "recorded" or group.lineage.tree != "continued":
+    if group.lineage.status != "recorded" or group.lineage.tree not in {
+        "continued",
+        "repair",
+    }:
         return None
     parent = group.lineage.parents.get(row.member_id)
     if parent is None:
         return "parent not recorded"
+    if group.lineage.tree == "repair":
+        return f"a repair of candidate {_p(parent[0])} (round {parent[1]})"
     return f"the worktree left by candidate {_p(parent[0])} (round {parent[1]})"
 
 
@@ -2120,7 +2156,10 @@ def render_round_table(
             patch += " large"
         files = "? files" if row.files_changed is None else f"{len(row.files_changed)} files"
         start = []
-        if group.lineage.status == "recorded" and group.lineage.tree == "continued":
+        if group.lineage.status == "recorded" and group.lineage.tree in {
+            "continued",
+            "repair",
+        }:
             parent = group.lineage.parents.get(row.member_id)
             start = [
                 "  from: parent not recorded"

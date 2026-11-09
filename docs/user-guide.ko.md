@@ -749,6 +749,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room cand
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--include KIND:TARGET ... (--preview | --confirm TOKEN)] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room repair <후보-id> --prompt "고칠 내용" (--preview | --confirm TOKEN) [--cold]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # 적용한 변경을 써 본 뒤: 받아들이는지 기록
@@ -986,6 +987,31 @@ resume 자체가 없으므로 모든 멤버가 델타가 아니라 전체 체크
 `room round --fresh-session`은 저장된 세션 id를 버리고 새 대화로 시작하며,
 `room round --fork`(claude 멤버 전용)는 대화를 이어 가는 대신 fork합니다. 세션 id는
 크래시와 `room recover`를 거쳐도 살아남습니다. provider가 토큰 사용량을 보고하면
+다른 멤버를 다시 돌리지 않고 후보 하나만 고치려면 `room repair`를 씁니다. 먼저
+미리 보고, 미리보기가 출력한 토큰으로 확정해요.
+
+```bash
+syncmill room repair <후보-id> --prompt "고칠 내용" --preview
+syncmill room repair <후보-id> --prompt "고칠 내용" --confirm <토큰>
+```
+
+미리보기는 아무것도 실행하지 않아요. 실행될 멤버(그 후보를 만든 멤버, provider 호출
+1번), 대화를 이어 가는지 새로 시작하는지, 검증 명령을 보여 줍니다. `--confirm`은 방,
+후보, 세션, 설정, 옵션이 미리보기 때와 그대로일 때만 실행하고, 달라졌으면 다시
+미리 보라고 안내해요. 결과는 새 라운드의 새 후보이고, 이 라운드도 `max_rounds`에
+포함됩니다. 다시 검증하며 이전 게이트 결과를 물려받지 않고, 비교, 선택, 적용은 직접
+해야 해요(`room compare <room-id> --round N`). 다른 멤버와 그 후보는 그대로이고 원본도
+건드리지 않습니다.
+
+- 멤버의 가장 최근 완료 후보만, 방이 `awaiting_decision`일 때만 고칠 수 있어요. 게이트에
+  실패한 후보도 됩니다. 내장 저장소가 든 후보는 안 돼요. 패치로 복원할 수 없기 때문입니다.
+- 수리가 실패해도 원래 후보는 다시 고칠 수 있어요. provider가 대화를 이어 가지 못하면
+  조용히 새로 시작하지 않고 실패합니다. 이때는 `--cold`로 다시 미리 보세요.
+- 체크아웃은 보통 그대로 둡니다. 실패한 시도가 바꿔 놓았다면 먼저 후보의 패치로 다시
+  만들고, 이때 설치된 의존성 같은 무시 파일이 사라져요. 그 파일에 기대는 게이트는
+  에이전트가 다시 설치할 때까지 실패할 수 있습니다.
+- `--detach`와 TUI에서는 아직 수리를 쓸 수 없어요.
+
 `room candidates`와 TUI 후보 화면에 `cache 85% (34.2k/40.1k)`처럼 캐시 적중률이
 표시됩니다.
 
