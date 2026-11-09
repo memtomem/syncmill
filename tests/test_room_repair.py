@@ -649,6 +649,17 @@ def test_a_repair_candidate_can_itself_be_selected_and_repaired(make):
     assert state["selected_candidate_id"] == third["id"]
 
 
+def test_the_next_rounds_prompt_passes_over_a_repair(make):
+    room = make(*_both())
+    assert room.coordinator.next_round_prompt(room.room_id) == ("the room prompt", False)
+    room.round("every member")
+    assert room.coordinator.next_round_prompt(room.room_id) == ("every member", False)
+    room.repair(room.candidate("claude")["id"], "fix your own file")
+    assert room.coordinator.next_round_prompt(room.room_id) == ("every member", True)
+    room.round("every member again")
+    assert room.coordinator.next_round_prompt(room.room_id) == ("every member again", False)
+
+
 def test_memory_is_searched_with_the_rooms_prompt(git_repo, tmp_path):
     class RecordingMemory(FakeMemory):
         def __init__(self):

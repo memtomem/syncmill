@@ -163,7 +163,7 @@ class RoomRoundModal(_CollabModal):
     """Per-round prompt + lineage input for the Rooms tab.
 
     Replaces the bare confirm the round used to run through: the TextArea is
-    prefilled with the PREVIOUS round's prompt (creation prompt on a fresh
+    prefilled with the PREVIOUS all-member round's prompt (creation prompt on a fresh
     room) so every round can carry a new instruction, and lineage/base-candidate
     are selectable in place. The review checkbox safety gate is preserved.
     Dumb like the other modals — dismisses raw strings; parsing/validation

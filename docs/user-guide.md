@@ -1120,7 +1120,7 @@ prompt **with a visible warning**, and the round output echoes the prompt that
 actually ran. `room rounds <id>` lists every round with its prompt, the TUI
 room detail shows the creation prompt, and the candidate Details view shows the
 round's prompt. In the TUI, `x` now opens a round modal — prompt (prefilled
-with the previous round's), lineage, and base candidate — instead of replaying
+with the previous all-member round's), lineage, and base candidate — instead of replaying
 the creation prompt. Round prompts are also enriched with bounded shared-memory
 context (the same best-effort enrichment `run`/`board` get — a broken memory
 backend never blocks a round), and an **applied** candidate is written back to

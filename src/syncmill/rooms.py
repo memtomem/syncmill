@@ -3872,6 +3872,29 @@ class RoomCoordinator:
                 return True
         return False
 
+    def next_round_prompt(self, room_id: str) -> tuple[str, bool]:
+        """The prompt to offer for the room's next all-member round, and whether
+        the latest round was a repair and so was passed over: a repair's prompt
+        was written for one member about its own candidate."""
+        room = self.store.get_room(room_id)
+        rows = self.store.list_rounds(room_id)
+        candidates = self.store.candidate_rows(room_id)
+        member_ids = [member["member_id"] for member in room["members"]]
+
+        def is_repair(row: dict[str, Any]) -> bool:
+            check = round_provenance_status(
+                row.get("provenance_json"),
+                round_number=int(row["number"]),
+                member_ids=member_ids,
+                candidates=candidates,
+            )
+            return check.record is not None and check.record["tree"]["kind"] == "repair"
+
+        for row in reversed(rows):
+            if not is_repair(row):
+                return str(row["prompt"]), row is not rows[-1]
+        return str(room["prompt"]), bool(rows)
+
     def build_repair_plan(
         self,
         candidate_id: str,
