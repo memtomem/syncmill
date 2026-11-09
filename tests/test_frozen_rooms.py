@@ -483,6 +483,11 @@ def test_select_then_apply_a_released_room(release, scenario, tmp_path, monkeypa
     room = _room(frozen)
     assert room["state"] == "applied"
     assert (frozen.repo / "calc.py").read_text() == FIXED[candidate["member_id"]]
+    # What the released candidate's own gate record supports, read on real old bytes.
+    lines = applied.output.splitlines()
+    assert ("[syncmill] Unverified: this candidate has no quality gate report, "
+            "and --verify was not used." in lines) == (scenario == "ungated")
+    assert not [line for line in lines if line.startswith("[syncmill] Verification not recorded")]
 
 
 def test_a_released_selection_applies(release, tmp_path, monkeypatch):
