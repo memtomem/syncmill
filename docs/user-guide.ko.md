@@ -290,7 +290,7 @@ uv run --project "$SYNCMILL_SRC" syncmill run \
 ```
 
 `Completed`는 에이전트가 일을 끝냈다는 뜻이지 결과가 맞다는 뜻이 아닙니다. `Unverified`
-줄은 아무 검사도 돌지 않았다는 안내예요. [품질 게이트](#한-단계-더-선택-기능)를 설정하면 그 자리에
+줄은 SyncMill이 품질 게이트를 돌리지 않았다는 안내예요(에이전트가 직접 테스트를 돌렸을 수는 있어요). [품질 게이트](#한-단계-더-선택-기능)를 설정하면 그 자리에
 `Quality gate: passed`가 나옵니다. 종료 코드는 어느 쪽이든 같습니다.
 
 에이전트가 격리된 worktree에서 파일을 바꾸면 이런 줄도 나옵니다.
@@ -1287,7 +1287,7 @@ enabled = true
   `Unverified: no quality gate ran on this result`를 출력해요. `compete`에서 후보가 둘 이상
   완료됐고 judge 판정으로 결정되지 않았다면 다음 줄에 `With no gate, the winner is the first
   completed candidate in priority order, not the result of a comparison`이 나와요. 다른 후보에
-  대해서는 아무것도 말하지 않아요. 그 후보들의 코드도 검사받지 않았으니까요. `--verify` 없는
+  대해서는 아무것도 말하지 않아요. 그 후보들의 코드에도 게이트가 돌지 않았으니까요. `--verify` 없는
   `apply`는 `Unverified: this run recorded no quality gate commands, and --verify was not
   used`를 출력하고, run의 manifest에 게이트 기록이 제대로 남아 있지 않으면(workflow가 만든 run 포함)
   `Verification not recorded`를 출력해요. detached apply는 job 로그(TUI의 Runs 탭)에 출력해요.
