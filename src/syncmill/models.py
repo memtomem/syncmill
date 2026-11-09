@@ -268,3 +268,7 @@ class TaskResult:
     # Why a FAILED attempt failed, when known for certain (see FailureKind);
     # None for a success or an ordinary failure. Appended last, like usage.
     failure_kind: FailureKind | None = None
+
+    # Why a gated candidate could not be captured before its gate ran. Raised only
+    # if it becomes the winner, so a candidate nobody selects cannot stop the run.
+    capture_error: str | None = None

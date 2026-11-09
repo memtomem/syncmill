@@ -351,6 +351,13 @@ uv run --project "$SYNCMILL_SRC" syncmill run "Fix the failing tests" --agent co
 The gate runs inside the agent's worktree. A passing gate means the isolated result
 validated there; it still does not apply the diff to your original checkout.
 
+A gate validates and does not contribute. Anything it writes, such as a test report or a
+reformatted file, stays out of the candidate's patch, so use check modes
+(`ruff format --check`, not `ruff format`). In a Room, a gate that changes the worktree
+causes that member's checkout to be rebuilt from its patch, which also removes ignored
+files there, such as installed dependencies. To avoid this, have the gate write its output
+to an ignored path.
+
 ### Real-agent troubleshooting checklist
 
 | Symptom | Check |

@@ -58,11 +58,13 @@ from syncmill.worktree import (
     capture_changes,
     Worktree,
     WorktreePool,
+    PatchCaptureError,
     WorkspaceError,
     capture_repository_snapshot,
     cleanup_worktree,
     fingerprint_matches,
     like_stored,
+    rebuild_worktree,
     repository_fingerprint,
 )
 
@@ -3956,6 +3958,10 @@ class RoomCoordinator:
                 # member stays running and the recovery boundary reconciles it.
                 self.store.set_member_state(round_row["id"], member["member_id"], state)
                 saved.append(manifest)
+                if report is not None:
+                    self._keep_candidate_tree(
+                        room_id, member["member_id"], worktree, patch or "", existing
+                    )
             self.store.publish_checkpoint(room_id, round_row["id"], saved)
             self.store.finish_round(room_id, round_row["id"])
             return self.store.get_room(room_id)
@@ -3992,6 +3998,41 @@ class RoomCoordinator:
         finally:
             if pool is not None:
                 pool.cleanup_all()
+
+    def _keep_candidate_tree(
+        self,
+        room_id: str,
+        member_id: str,
+        worktree: Worktree,
+        patch: str,
+        workspaces: list[dict[str, Any]],
+    ) -> None:
+        """Keep what a gate wrote out of this member's later rounds (#268).
+
+        The worktree outlives the candidate, so a file the gate left would enter
+        the next round's patch. Only a tree the gate actually changed is rebuilt,
+        which costs its ignored files. A failure propagates to the round's
+        recovery path, so a tree that may still hold gate output is never reused.
+        """
+        try:
+            unchanged = capture_changes(worktree.path, worktree.base_commit).patch == patch
+        except PatchCaptureError:
+            unchanged = False
+        if unchanged:
+            return
+        control_repo = next(
+            Path(value["control_repo"])
+            for value in workspaces
+            if value["member_id"] == member_id
+        )
+        rebuild_worktree(
+            control_repo, worktree, patch.encode("utf-8", errors="surrogateescape")
+        )
+        self.store.record_event(
+            room_id,
+            "workspace.rebuilt",
+            {"member_id": member_id, "reason": "the gate changed the worktree"},
+        )
 
     def _memory_context(self, room_id: str, prompt: str) -> str:
         """Best-effort shared-memory context for a round (the run/board

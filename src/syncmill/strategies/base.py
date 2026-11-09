@@ -42,7 +42,13 @@ from syncmill.memory import SyncmillMemory
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
 from syncmill.tracer import SpanRecord, Tracer
-from syncmill.worktree import Worktree, WorktreePool, _run_git, capture_changes
+from syncmill.worktree import (
+    PatchCaptureError,
+    Worktree,
+    WorktreePool,
+    _run_git,
+    capture_changes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +300,16 @@ def _enrich_prompt(
 
 
 def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
-    """Capture the completed winner before its mandatory artifact is persisted."""
+    """Capture the completed winner before its mandatory artifact is persisted.
+
+    A gated result was captured by ``_gate_accepts`` before its gate ran, and
+    capturing again here would add whatever the gate wrote. If that capture
+    failed, this is where it stops the run: only the winner's capture is mandatory.
+    """
+    if result.gate is not None:
+        if result.capture_error is not None:
+            raise PatchCaptureError(result.capture_error)
+        return
     if worktree.is_git and result.status == TaskStatus.COMPLETED:
         changes = capture_changes(worktree.path, getattr(worktree, "base_commit", None))
         result.files_changed = list(changes.files)
@@ -467,18 +482,31 @@ def _gate_accepts(
     attached to ``result.gate`` either way (pass or fail) — an annotation like
     ``files_changed``, so callers/CLI can surface the verdict.
 
+    The candidate is captured BEFORE the gate runs: it is what the agent produced,
+    and a gate's test reports or build output must not enter its patch (#268). A
+    rejected result drops the capture, since nothing may apply it. A capture that
+    fails is only recorded here; ``_collect_files_changed`` raises it if this
+    candidate wins.
+
     Shared by every strategy so "passed the gate" means exactly one thing across
     them. Call only on a COMPLETED result — a failed agent is never gated (there's
     nothing trustworthy to check).
     """
     if gate is None:
         return True
+    try:
+        _collect_files_changed(result, worktree)
+    except PatchCaptureError as exc:
+        result.capture_error = str(exc)
     report = gate.evaluate(worktree)
     result.gate = report
     if report.passed:
         return True
     result.status = TaskStatus.FAILED
     result.error = f"quality gate failed: {report.summary()}"
+    result.files_changed = []
+    result.patch = None
+    result.capture_error = None
     return False
 
 
@@ -981,18 +1009,18 @@ def _select_winner(
     try:
         sections: list[str] = []
         for worktree, result in verified:
-            # Bounded excerpt, never the full --binary patch (#116): the winner's
-            # single full patch is still produced by _collect_files_changed, so
-            # the judge no longer stages+diffs the winning tree a second time
-            # into a string that was sliced anyway.
-            excerpt = (
-                _git_diff_excerpt(
+            # Bounded excerpt, never the full --binary patch (#116). A gated
+            # candidate is judged on its captured patch: the tree now also holds
+            # whatever its gate wrote, which is not what would be kept (#268).
+            if result.gate is not None:
+                excerpt = _bounded_head(result.patch or "", 12_000)
+            elif worktree.is_git:
+                excerpt = _git_diff_excerpt(
                     worktree.path, getattr(worktree, "base_commit", None),
                     max_bytes=12_000,
                 )
-                if worktree.is_git
-                else None
-            )
+            else:
+                excerpt = None
             sections.append(
                 f"CANDIDATE {result.agent_id}\n"
                 f"REPORT:\n{_bounded_head(result.output, 6000)}\n"
