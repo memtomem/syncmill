@@ -100,6 +100,18 @@ def _strict_checkpoint_patch(workdir: Path, base_commit: str) -> tuple[list[str]
     return list(changes.files), changes.patch
 
 
+def session_run_name(session_id: str) -> str:
+    """A session's workspace directory name under ``workspace.root``. A
+    persisted contract: stored session paths are re-checked against it."""
+    return f"session-{session_id}"
+
+
+def session_tmux_name(project_id: str, agent_id: str, session_id: str) -> str:
+    """A session's tmux name. A persisted contract: the stored name is
+    re-checked against it, and it is the reattach key."""
+    return f"syncmill-p-{project_id[:8]}-{agent_id}-{session_id[:8]}"
+
+
 class IsolatedSessionStore:
     def __init__(self, config: SyncmillConfig, repo_root: Path):
         require_supported_platform()
@@ -195,7 +207,7 @@ class IsolatedSessionStore:
                 raise ValueError("non-canonical session id")
             expected_run = (
                 Path(self.config.workspace.root).expanduser().resolve()
-                / f"session-{sid}"
+                / session_run_name(sid)
             )
             run_root = Path(value["run_root"]).resolve()
             control = Path(value["control_repo"]).resolve()
@@ -204,7 +216,7 @@ class IsolatedSessionStore:
         except (KeyError, TypeError, ValueError, OSError) as exc:
             raise IsolatedSessionError("session metadata contains unsafe paths") from exc
         expected_tmux = (
-            f"syncmill-p-{self.project_id[:8]}-{value.get('agent_id')}-{sid[:8]}"
+            session_tmux_name(self.project_id, str(value.get("agent_id")), sid)
         )
         if (
             run_root != expected_run
@@ -270,18 +282,18 @@ class IsolatedSessionStore:
         session_id = str(uuid4())
         snapshot = capture_repository_snapshot(
             self.repo_root,
-            f"session-{session_id}",
+            session_run_name(session_id),
             Path(self.config.workspace.root),
         )
         pool = WorktreePool(
-            self.repo_root, f"session-{session_id}", snapshot=snapshot
+            self.repo_root, session_run_name(session_id), snapshot=snapshot
         )
         tmux_name: str | None = None
         launched = False
         try:
             worktree = pool.acquire(agent_id)
             tmux_name = (
-                f"syncmill-p-{self.project_id[:8]}-{agent_id}-{session_id[:8]}"
+                session_tmux_name(self.project_id, agent_id, session_id)
             )
             value = {
                 "schema_version": 1,

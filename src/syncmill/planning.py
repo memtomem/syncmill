@@ -45,6 +45,13 @@ def unmapped_principal_id(agent_id: str) -> str:
     return f"{UNMAPPED_PRINCIPAL_PREFIX}{suffix}"
 
 
+def plan_node_id(node_id: str) -> str:
+    """A workflow node's id in its control plan. A persisted contract
+    (docs/architecture/persisted-contracts.md): the frozen plan is re-checked
+    against the workflow's DAG by these ids on every resume."""
+    return f"workflow:{node_id}"
+
+
 def control_principal_id(config: SyncmillConfig, agent_id: str) -> str:
     """Return the stable Toolgraph principal for one SyncMill agent."""
     mapped = config.integration.toolgraph.agent_map.get(agent_id)
@@ -365,10 +372,10 @@ def build_workflow_control_plan(
         node_id = str(row["id"])
         agent_id = str(row["agent"])
         needs = [str(value) for value in row.get("needs") or []]
-        plan_node_id = f"workflow:{node_id}"
+        node_plan_id = plan_node_id(node_id)
         plan_nodes.append(
             {
-                "id": plan_node_id,
+                "id": node_plan_id,
                 "kind": "agent",
                 "principals": [mapped_by_agent[agent_id]],
                 "agent_call": True,
@@ -381,7 +388,7 @@ def build_workflow_control_plan(
             source = "control:fanout:roots" if len(roots) > 1 else "control:start"
             edge: dict[str, Any] = {
                 "from": source,
-                "to": plan_node_id,
+                "to": node_plan_id,
                 "kind": "fanout" if len(roots) > 1 else "always",
                 "decided_by": "code",
             }
@@ -391,8 +398,8 @@ def build_workflow_control_plan(
         elif len(needs) == 1:
             edges.append(
                 {
-                    "from": f"workflow:{needs[0]}",
-                    "to": plan_node_id,
+                    "from": plan_node_id(needs[0]),
+                    "to": node_plan_id,
                     "kind": "success",
                     "decided_by": "code",
                 }
@@ -410,7 +417,7 @@ def build_workflow_control_plan(
             for dependency in needs:
                 edges.append(
                     {
-                        "from": f"workflow:{dependency}",
+                        "from": plan_node_id(dependency),
                         "to": join_id,
                         "kind": "join",
                         "decided_by": "code",
@@ -419,7 +426,7 @@ def build_workflow_control_plan(
             edges.append(
                 {
                     "from": join_id,
-                    "to": plan_node_id,
+                    "to": node_plan_id,
                     "kind": "success",
                     "decided_by": "code",
                 }
@@ -436,14 +443,14 @@ def build_workflow_control_plan(
     for node_id in ids:
         edges.append(
             {
-                "from": f"workflow:{node_id}",
+                "from": plan_node_id(node_id),
                 "to": "control:end",
                 "kind": "failure",
                 "decided_by": "code",
             }
         )
 
-    final_source = f"workflow:{final_node}"
+    final_source = plan_node_id(final_node)
     if config.gate.commands:
         validator_id = "control:validator:final"
         plan_nodes.insert(

@@ -43,6 +43,7 @@ from syncmill.worktree import (
     _run_git,
     capture_repository_snapshot,
     fingerprint_matches,
+    fingerprint_version,
 )
 
 #: Hang bound for every git subprocess on the apply/rollback path (via
@@ -1946,8 +1947,12 @@ class ArtifactStore:
         manifest = artifact.manifest
         receipt = self._bound_receipt(artifact.path, manifest)
         source_matches = fingerprint_matches(repo_root, manifest.get("source_fingerprint"))
+        # An unrecognizable stored fingerprint can never match, so its mismatch
+        # proves nothing about the source (#264): neither branch below may act
+        # on it, and it falls through to manual recovery.
+        decidable = fingerprint_version(manifest.get("source_fingerprint")) is not None
 
-        if receipt is not None and not source_matches:
+        if decidable and receipt is not None and not source_matches:
             # completed: the patch was applied and receipted; only the final
             # applying -> applied flip was interrupted.  Finish it.
             applied_manifest = {
@@ -1963,7 +1968,7 @@ class ArtifactStore:
                 receipt=str(receipt),
             )
 
-        if receipt is None and source_matches:
+        if decidable and receipt is None and source_matches:
             # not applied: the source was never mutated, so the applying record
             # is safe to unwind back to a fresh pending run.
             pending_manifest = {
@@ -1992,7 +1997,7 @@ class ArtifactStore:
         reason = (
             "interrupted apply is undecidable: "
             f"receipt={'present' if receipt else 'absent'}, "
-            f"source_matches={source_matches}, {reverse}. "
+            f"source_matches={source_matches if decidable else 'unknown (unrecognized stored fingerprint)'}, {reverse}. "
             "Inspect the repository and resolve manually."
         )
         self.recovery_required(run_id, reason, expected_states=("applying",))
