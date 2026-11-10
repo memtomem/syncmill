@@ -749,7 +749,11 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room cand
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--include KIND:TARGET ... (--preview | --confirm TOKEN)] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room repair <후보-id> --prompt "고칠 내용" (--preview | --confirm TOKEN) [--cold]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback add <후보-id> --kind change|question [--file PATH] (--text TEXT | --text-file PATH)
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback list <room-id> [--candidate <후보-id>]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room repair <후보-id> [--prompt "고칠 내용"] [--feedback ID ...] (--preview | --confirm TOKEN) [--cold]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback resolve <피드백-id> addressed|not-addressed|withdrawn [--on <후보-id>]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback carry <피드백-id> --to <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # 적용한 변경을 써 본 뒤: 받아들이는지 기록
@@ -1011,6 +1015,37 @@ syncmill room repair <후보-id> --prompt "고칠 내용" --confirm <토큰>
   만들고, 이때 설치된 의존성 같은 무시 파일이 사라져요. 그 파일에 기대는 게이트는
   에이전트가 다시 설치할 때까지 실패할 수 있습니다.
 - `--detach`와 TUI에서는 아직 수리를 쓸 수 없어요.
+
+프롬프트 하나 대신 후보에 리뷰 피드백을 먼저 남길 수도 있어요. 고칠 요청(change)과
+답을 듣고 싶은 질문(question)이고, 각각 후보가 바꾼 파일 하나에 묶을 수 있습니다.
+그러면 수리는 그 후보에 열려 있는 요청을 모두 보내고, `--prompt`를 주면 그것도 함께
+보내요. `--feedback ID`를 주면 지정한 요청만 보냅니다.
+
+```bash
+syncmill room feedback add <후보-id> --kind change --file calc.py --text "예전 이름 유지"
+syncmill room feedback add <후보-id> --kind question --text "캐시를 하나 더 둔 이유는?"
+syncmill room feedback list <room-id>
+syncmill room repair <후보-id> --preview
+```
+
+피드백을 쓰는 일은 provider를 부르지 않고, 방의 상태도 revision도 바꾸지 않아요. 그
+텍스트는 수리되는 멤버의 프롬프트에만 들어가고, 라운드에 저장되는 프롬프트, 방의 이벤트
+로그, 공유 메모리에는 들어가지 않습니다(에이전트가 자기 출력에서 인용할 수는 있어요).
+`feedback list`는 요청마다 상태를 보여 주는데, 매번 기록에서 다시 계산합니다.
+
+- `open`: 아직 보내지 않았거나, 실패한 수리로만 보냈어요. 다음 수리가 다시 보냅니다.
+- `sent`: 이 후보의 수리가 완료되면서 받았어요.
+- `addressed`, `not-addressed`, `withdrawn`: `feedback resolve`로 직접 기록한 결과예요.
+  요청을 해결 처리하는 건 사람뿐이고, 에이전트 출력에서 해결했다는 주장을 읽지
+  않습니다. `addressed`와 `not-addressed`에는 확인한, 같은 멤버의 이후 후보를
+  `--on`으로 지정해요.
+- `unknown`: 믿을 수 없는 기록이에요. 예전 상태로 대신 읽지 않습니다. 방의 피드백
+  기록끼리의 연결이 깨지면(중간 기록이 빠졌거나, resolution이 엉뚱한 요청을 가리키면)
+  그 방의 요청이 모두 `unknown`이 되고, 더는 피드백을 쓸 수 없어요.
+
+요청은 처음 쓴 후보에 머물러요. 수리로 더 새로운 후보가 생기면 예전 후보는 다시 고칠
+수 없으니, `feedback carry <id> --to <새-id>`로 새 후보에 열린 요청으로 다시 씁니다.
+파일 지정은 새 후보도 그 파일을 바꿨을 때만 유지돼요.
 
 `room candidates`와 TUI 후보 화면에 `cache 85% (34.2k/40.1k)`처럼 캐시 적중률이
 표시됩니다.

@@ -436,7 +436,7 @@ def _no_change(room: Harness, revision: int, rounds: int) -> None:
 def test_a_repair_with_nothing_to_do_is_refused(make, prompt):
     room = make(Member("claude"))
     room.round()
-    with pytest.raises(RoomError, match="needs a prompt"):
+    with pytest.raises(RoomError, match="nothing to repair"):
         room.coordinator.build_repair_plan(room.candidate("claude")["id"], prompt)
 
 

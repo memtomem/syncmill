@@ -128,6 +128,7 @@ from syncmill.room_raw import (
 )
 from syncmill.rooms import (
     _ROOM_PROMPT_MAX_BYTES,
+    FEEDBACK_KINDS,
     JUDGMENT_VERDICTS,
     RepairPlan,
     RoomCoordinator,
@@ -3146,6 +3147,14 @@ def room_round(
     help="Run this repair without any approved project lessons. A resumed "
     "conversation keeps what earlier rounds sent it.",
 )
+@click.option(
+    "--feedback",
+    "feedback_ids",
+    multiple=True,
+    metavar="ID",
+    help="Send only this open feedback request (repeatable). Default: every open "
+    "request on the candidate.",
+)
 def room_repair(
     candidate_id: str,
     prompt: str | None,
@@ -3156,14 +3165,17 @@ def room_repair(
     repo: Path,
     skip_lesson: tuple[str, ...] = (),
     no_lessons: bool = False,
+    feedback_ids: tuple[str, ...] = (),
 ) -> None:
     """Run only the member that produced CANDIDATE_ID, from that candidate.
 
-    The result is a new candidate, verified again, that you compare and select
-    yourself. Other members, their candidates and the source are not touched."""
+    It sends the candidate's open feedback requests (`room feedback add`) and
+    the optional --prompt. The result is a new candidate, verified again, that
+    you compare and select yourself. Other members, their candidates and the
+    source are not touched."""
     if preview == (confirm is not None):
         raise click.UsageError("room repair needs exactly one of --preview and --confirm")
-    prompt = _resolve_prompt(prompt, prompt_file, required=True)
+    prompt = _resolve_prompt(prompt, prompt_file, required=False)
     _, config, coordinator = _room_coordinator(repo)
     try:
         parent = coordinator.store.get_candidate(candidate_id)
@@ -3178,7 +3190,11 @@ def room_repair(
             cold=cold,
         )
         plan = coordinator.build_repair_plan(
-            candidate_id, str(prompt), cold=cold, lessons=lessons
+            candidate_id,
+            prompt,
+            feedback_ids=list(feedback_ids) or None,
+            cold=cold,
+            lessons=lessons,
         )
         if preview:
             _print_repair_plan(plan)
@@ -3223,6 +3239,17 @@ def _print_repair_plan(plan: RepairPlan) -> None:
     else:
         for command in plan.gate["commands"]:
             echo(f"Verification: {_shown(command)}")
+    if plan.feedback:
+        changes = sum(1 for item in plan.feedback if item["kind"] == "change")
+        questions = len(plan.feedback) - changes
+        echo(
+            f"Feedback:     {changes} change request(s), {questions} question(s); "
+            "the text is in `room feedback list`"
+        )
+        for item in plan.feedback:
+            echo(f"              {_shown(item['id'])}  {_shown(item['kind'])}")
+    else:
+        echo("Feedback:     none; the prompt alone says what to change")
     echo(f"Prompt:       {len(plan.agent_task.encode('utf-8', 'surrogateescape'))} bytes")
     echo("Starts from:  this candidate's patch. The checkout is rebuilt only if it differs,")
     echo("              which loses its ignored files, such as installed dependencies.")
@@ -3676,6 +3703,216 @@ def room_judge(
             "(kept in the room's history)"
         )
     echo("Rationale: " + ("recorded" if record["rationale"] else "none"))
+
+
+@room_group.group("feedback")
+def room_feedback_group() -> None:
+    """Review feedback on one candidate: change requests and questions that
+    `room repair` sends to the member that produced it. No provider call."""
+
+
+def _feedback_text(text: str | None, text_file: Path | None) -> str:
+    if (text is None) == (text_file is None):
+        raise click.UsageError("give exactly one of --text and --text-file")
+    if text_file is None:
+        return str(text)
+    try:
+        # Decoded from bytes so that \r reaches the control-character check.
+        return _read_bounded_utf8(text_file)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise click.BadParameter(
+            f"cannot read {printable_name(str(text_file))}: {exc}",
+            param_hint="--text-file",
+        ) from exc
+
+
+def _feedback_status_label(status: str) -> str:
+    return status.replace("_", "-")
+
+
+@room_feedback_group.command("add")
+@click.argument("candidate_id")
+@click.option("--kind", required=True, type=click.Choice(sorted(FEEDBACK_KINDS)))
+@click.option(
+    "--file", "path", default=None, metavar="PATH",
+    help="Anchor the request to a file this candidate changed, as `room compare` lists it.",
+)
+@click.option("--text", default=None, help="The request or question (your own words).")
+@click.option(
+    "--text-file", type=click.Path(path_type=Path, dir_okay=False), default=None,
+    help="Read the text from a UTF-8 file.",
+)
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_feedback_add(
+    candidate_id: str,
+    kind: str,
+    path: str | None,
+    text: str | None,
+    text_file: Path | None,
+    repo: Path,
+) -> None:
+    """Write a change request or a question on CANDIDATE_ID.
+
+    Changes neither the room's state nor its revision, and is never shared to
+    memory or written to the room's event log."""
+    body = _feedback_text(text, text_file)
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        record = coordinator.add_feedback(
+            candidate_id, kind, body, path=path, surface="cli"
+        )
+    except RoomError as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        coordinator.close()
+    label = "change request" if record["kind"] == "change" else "question"
+    anchor = record["anchor"]
+    echo(
+        f"Recorded {label} {_shown(record['feedback_id'])} on candidate "
+        f"{_shown(record['candidate_id'])}"
+        + (f" (file: {_shown(anchor['path'])})" if anchor else "")
+    )
+    echo(
+        "Send it with: "
+        + printable_command(
+            "syncmill", "room", "repair", args=[record["candidate_id"], "--preview"]
+        )
+    )
+
+
+@room_feedback_group.command("list")
+@click.argument("room_id")
+@click.option("--candidate", "candidate_id", default=None, metavar="CAND",
+              help="Only requests written on this candidate.")
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_feedback_list(room_id: str, candidate_id: str | None, repo: Path) -> None:
+    """List a room's feedback requests with their derived status."""
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        view = coordinator.store.feedback(room_id)
+    except RoomError as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        coordinator.close()
+    # Keyed as the checks are: a damaged store can hold a NULL id.
+    rows = {str(row.get("id")): row for row in view.rows}
+    shown = 0
+    for feedback_id, check in view.checks.items():
+        row_candidate = rows[feedback_id].get("candidate_id")
+        if candidate_id is not None and row_candidate != candidate_id:
+            continue
+        shown += 1
+        request = check.request
+        if request is None:
+            echo(
+                f"{_shown(feedback_id)}  {_shown(row_candidate)}  unknown: "
+                f"{_shown(check.reason)}"
+            )
+            continue
+        anchor = request["anchor"]
+        line = (
+            f"{_shown(feedback_id)}  {_shown(request['candidate_id'])}  "
+            f"{_shown(request['kind']):8} {_shown(_feedback_status_label(check.status)):13} "
+            + (f"file: {_shown(anchor['path'])}" if anchor else "file: none")
+        )
+        if request["carried_from"]:
+            line += f"  carried from {_shown(request['carried_from'])}"
+        echo(line)
+        if check.status == "unknown":
+            # A record that cannot be trusted shows why, never its text.
+            echo(f"    {_shown(check.reason)}")
+            continue
+        if check.resolution is not None and check.resolution["evaluated_candidate_id"]:
+            echo(f"    on candidate {_shown(check.resolution['evaluated_candidate_id'])}")
+        for text_line in printable_text(request["text"]).split("\n"):
+            echo(f"    | {text_line}")
+    if not shown:
+        echo(f"No feedback in room {_shown(room_id)}" + (
+            f" on candidate {_shown(candidate_id)}" if candidate_id else ""
+        ))
+    for warning in view.warnings:
+        echo(f"Warning: {_shown(warning)}")
+
+
+@room_feedback_group.command("resolve")
+@click.argument("feedback_id")
+@click.argument(
+    "status", type=click.Choice(["addressed", "not-addressed", "withdrawn"])
+)
+@click.option(
+    "--on", "on", default=None, metavar="CAND",
+    help="The later candidate of the same member you evaluated "
+    "(needed for addressed and not-addressed).",
+)
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_feedback_resolve(feedback_id: str, status: str, on: str | None, repo: Path) -> None:
+    """Record whether a later candidate met FEEDBACK_ID, or withdraw it.
+
+    Only you resolve a request: nothing reads an agent's output for a claim
+    of having addressed it."""
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        record, created = coordinator.resolve_feedback(
+            feedback_id, status.replace("-", "_"), on=on, surface="cli"
+        )
+    except RoomError as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        coordinator.close()
+    label = _feedback_status_label(record["status"])
+    where = (
+        f" on candidate {_shown(record['evaluated_candidate_id'])}"
+        if record["evaluated_candidate_id"]
+        else ""
+    )
+    if not created:
+        echo(f"Already recorded: {_shown(feedback_id)} {label}{where}; nothing changed")
+        return
+    echo(f"Recorded {_shown(feedback_id)} {label}{where}")
+
+
+@room_feedback_group.command("carry")
+@click.argument("feedback_id")
+@click.option("--to", "to", required=True, metavar="CAND",
+              help="A later completed candidate of the same member.")
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_feedback_carry(feedback_id: str, to: str, repo: Path) -> None:
+    """Write FEEDBACK_ID again on a later candidate, as a new open request.
+
+    Requests stay on the candidate they were written against; this is how one
+    moves on. The file anchor is kept only when the later candidate still
+    changes that file."""
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        carried = coordinator.carry_feedback(feedback_id, to, surface="cli")
+    except RoomError as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        coordinator.close()
+    record = carried.record
+    prefix = "Already carried" if not carried.created else "Carried"
+    echo(
+        f"{prefix} {_shown(feedback_id)} to candidate {_shown(record['candidate_id'])} "
+        f"as {_shown(record['feedback_id'])}"
+    )
+    source = carried.source_anchor
+    if source is None:
+        echo("File: none")
+    elif record["anchor"] is not None:
+        echo(f"File: {_shown(record['anchor']['path'])}, kept")
+    else:
+        echo(
+            f"File: none; {_shown(source['path'])} is not among the files candidate "
+            f"{_shown(record['candidate_id'])} changed"
+        )
 
 
 @room_group.command("promote")

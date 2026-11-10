@@ -792,7 +792,11 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room cand
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--include KIND:TARGET ... (--preview | --confirm TOKEN)] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room repair <candidate-id> --prompt "what to change" (--preview | --confirm TOKEN) [--cold]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback add <candidate-id> --kind change|question [--file PATH] (--text TEXT | --text-file PATH)
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback list <room-id> [--candidate <candidate-id>]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room repair <candidate-id> [--prompt "what to change"] [--feedback ID ...] (--preview | --confirm TOKEN) [--cold]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback resolve <feedback-id> addressed|not-addressed|withdrawn [--on <candidate-id>]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room feedback carry <feedback-id> --to <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # after you have lived with the applied change: record whether you accept it
@@ -1109,6 +1113,39 @@ their candidates stay as they were, and your source is not touched.
   the candidate's patch first, and that loses its ignored files, such as installed
   dependencies. A gate that relies on them can fail until the agent reinstalls them.
 - `--detach` and the TUI do not offer repair yet.
+
+Instead of one prompt, you can write review feedback on the candidate first: change
+requests, and questions you want answered, each optionally tied to a file the candidate
+changed. A repair then sends every open request on that candidate, plus `--prompt` if you
+give one; `--feedback ID` sends only the requests you name.
+
+```bash
+syncmill room feedback add <candidate-id> --kind change --file calc.py --text "keep the old name"
+syncmill room feedback add <candidate-id> --kind question --text "why a second cache?"
+syncmill room feedback list <room-id>
+syncmill room repair <candidate-id> --preview
+```
+
+Writing feedback calls no provider and changes neither the room's state nor its revision.
+Its text goes only to the repaired member's prompt: not to the round's stored prompt, the
+room's event log or shared memory (an agent may still quote it in its own output).
+`feedback list` shows each request's status, worked out from the records each time:
+
+- `open`: not sent yet, or only sent by repairs that failed. The next repair sends it again.
+- `sent`: a completed repair of this candidate received it.
+- `addressed`, `not-addressed`, `withdrawn`: what you recorded with `feedback resolve`.
+  Only you resolve a request; nothing reads an agent's output for a claim that it did.
+  `addressed` and `not-addressed` name the later candidate of the same member you
+  checked (`--on`).
+- `unknown`: a record that cannot be trusted. It is never read as an older status. If
+  the links between the room's feedback records are damaged (a record missing from the
+  middle, a resolution pointing at the wrong request), every request in the room reads
+  `unknown` and no more feedback can be written there.
+
+A request stays on the candidate it was written for. Once a repair produced a newer
+candidate, the old one cannot be repaired again: `feedback carry <id> --to <new-id>`
+writes the request again on the new candidate as an open request, and keeps the file only
+if the new candidate still changes it.
 
 When a provider reports token usage, `room candidates` and the TUI candidate
 views show it — e.g. `cache 85% (34.2k/40.1k)` — so you can see the cache

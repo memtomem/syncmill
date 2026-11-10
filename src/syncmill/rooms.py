@@ -330,8 +330,8 @@ class RepairPlan:
     agent_task_sha256: str
     lesson_ids: tuple[str, ...]
     gate: dict[str, Any]
-    #: Each entry binds a request's id, record digest and status. Requests
-    #: arrive with the feedback store, so a plan holds none yet.
+    #: Each entry binds a request's id, record digest and status, in
+    #: sequence order; the round's provenance names the same ids.
     feedback: tuple[dict[str, str], ...] = ()
     provider_calls: int = 1
 
@@ -370,13 +370,22 @@ def _text_sha256(value: str) -> str:
     return sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
 
 
-def render_repair_task(candidate_id: str, prompt: str) -> str:
-    """What a repair asks of its member. Deterministic, because the plan binds
-    its digest and a preview and its confirmation must agree on the bytes."""
+def render_repair_task(
+    candidate_id: str,
+    prompt: str | None,
+    requests: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+) -> str:
+    """What a repair asks of its member: the feedback requests, then the
+    optional free text. Deterministic, because the plan binds its digest and a
+    preview and its confirmation must agree on the bytes. Without requests it
+    is the opening lines and the prompt alone."""
+    parts = [render_feedback_batch(requests)] if requests else []
+    if prompt:
+        parts.append(prompt)
     return (
         f"Repair your candidate {candidate_id}. Your working tree holds exactly "
         "that candidate's patch. Ignored files, such as installed dependencies, "
-        f"may be missing.\n\n{prompt}"
+        "may be missing.\n\n" + "\n\n".join(parts)
     )
 
 
@@ -763,6 +772,531 @@ def room_outcome_status(
         return outcome("unknown", "latest judgment does not supersede the one before it")
     return outcome(check.record["verdict"], judgment=check.record)
 
+
+
+# ------------------------------------------------------------ feedback (#173)
+#
+# Review feedback a human writes on one candidate: a change request or a
+# question, optionally anchored to a file the candidate changed. Append-only,
+# like judgments: a request is never edited, and a later resolution supersedes
+# an earlier one. Status is derived from these rows and the room's rounds,
+# never stored, by the one validator below.
+
+FEEDBACK_KINDS = frozenset({"change", "question"})
+FEEDBACK_RESOLUTIONS = frozenset({"addressed", "not_addressed", "withdrawn"})
+#: Every status :func:`feedback_status` reports. ``unknown`` refuses to guess.
+FEEDBACK_STATUSES = (
+    "open",
+    "sent",
+    "addressed",
+    "not_addressed",
+    "withdrawn",
+    "unknown",
+)
+FEEDBACK_TEXT_MAX_BYTES = 8 * 1024
+_FEEDBACK_SCHEMA_VERSION = 1
+#: Listed, not derived from _TERMINAL_ROOM_STATES: a room that is running,
+#: applying or awaiting recovery takes no feedback until it settles.
+_FEEDBACK_WRITABLE_STATES = frozenset({"awaiting_decision", "selected"})
+_FEEDBACK_REQUEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "feedback_id",
+        "room_id",
+        "candidate_id",
+        "patch_sha256",
+        "kind",
+        "text",
+        "anchor",
+        "carried_from",
+        "surface",
+        "sequence",
+        "created_at",
+    }
+)
+_FEEDBACK_RESOLUTION_KEYS = frozenset(
+    {
+        "schema_version",
+        "feedback_id",
+        "room_id",
+        "request_id",
+        "status",
+        "evaluated_candidate_id",
+        "evaluated_patch_sha256",
+        "surface",
+        "sequence",
+        "created_at",
+    }
+)
+
+
+def normalize_feedback_text(value: object) -> str:
+    """Feedback text in stored form: control characters other than newline
+    and tab refused, ends stripped, at most 8 KiB. Empty is refused."""
+    text = _normalize_human_text(value, "feedback text", FEEDBACK_TEXT_MAX_BYTES)
+    if text is None:
+        raise RoomError("feedback text must not be empty")
+    return text
+
+
+@dataclasses.dataclass(frozen=True)
+class FeedbackCheck:
+    #: one of FEEDBACK_STATUSES
+    status: str
+    reason: str | None = None
+    #: The request's record, when it validates (also for ``unknown`` caused
+    #: by a damaged resolution, so a listing can still name its candidate).
+    request: dict[str, Any] | None = None
+    #: The resolution that decides the status, when one does.
+    resolution: dict[str, Any] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class FeedbackView:
+    """A room's feedback as read in one snapshot."""
+
+    room: dict[str, Any]
+    candidates: dict[str, dict[str, Any]]
+    #: Every room_feedback row, oldest first.
+    rows: list[dict[str, Any]]
+    #: Each request row's status, by id, in sequence order.
+    checks: dict[str, FeedbackCheck]
+    #: Repair rounds whose feedback ids do not name a request they repaired.
+    warnings: list[str]
+    #: Why the room's records cannot be believed as a set, or None.
+    problem: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class CarriedFeedback:
+    record: dict[str, Any]
+    created: bool
+    #: The source request's anchor, so a caller can say whether it was kept.
+    source_anchor: dict[str, str] | None
+
+
+def _feedback_record(raw: object) -> dict[str, Any] | str:
+    """A stored record decoded, or why it cannot be."""
+    if not isinstance(raw, str):
+        return "feedback record is not text"
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        return "feedback record is not valid JSON"
+    if not isinstance(record, dict):
+        return "feedback record is not an object"
+    version = record.get("schema_version")
+    if not _plain_int(version) or version != _FEEDBACK_SCHEMA_VERSION:
+        return f"unsupported feedback record version {version!r}"
+    return record
+
+
+def _feedback_common_problem(
+    row: dict[str, Any], record: dict[str, Any], room_id: object
+) -> str | None:
+    if record["feedback_id"] != row.get("id"):
+        return "feedback record id differs from its row"
+    if record["room_id"] != room_id or row.get("room_id") != room_id:
+        return "feedback record names a different room"
+    sequence = record["sequence"]
+    if not _plain_int(sequence) or sequence < 1 or sequence != row.get("sequence"):
+        return "feedback record sequence differs from its row"
+    surface = record["surface"]
+    if not isinstance(surface, str) or surface not in SELECTION_SURFACES:
+        return f"feedback record surface {surface!r} is unknown"
+    if not isinstance(record["created_at"], str) or not record["created_at"]:
+        return "feedback record created_at is malformed"
+    return None
+
+
+def _feedback_request_problem(
+    row: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    room_id: object,
+    candidates: dict[str, dict[str, Any]],
+) -> str | None:
+    """Why a stored request cannot be believed, or ``None``. Anchor membership
+    in the candidate's files was checked when it was written; candidate
+    artifacts are immutable, so only its shape is checked here."""
+    if row.get("record_type") != "request" or row.get("request_id") is not None:
+        return "feedback row is not a request"
+    if set(record) != _FEEDBACK_REQUEST_KEYS:
+        return "feedback request keys are not the v1 set"
+    problem = _feedback_common_problem(row, record, room_id)
+    if problem is not None:
+        return problem
+    candidate_id = record["candidate_id"]
+    if candidate_id != row.get("candidate_id"):
+        return "feedback request names a different candidate than its row"
+    candidate = candidates.get(candidate_id) if isinstance(candidate_id, str) else None
+    if candidate is None:
+        return "feedback request's candidate is not in this room"
+    if candidate.get("state") != "completed":
+        return "feedback request's candidate is not a completed candidate"
+    if record["patch_sha256"] != candidate.get("patch_sha256"):
+        return "feedback request's patch digest differs from the candidate's"
+    kind = record["kind"]
+    if not isinstance(kind, str) or kind not in FEEDBACK_KINDS:
+        return f"feedback request kind {kind!r} is unknown"
+    try:
+        if normalize_feedback_text(record["text"]) != record["text"]:
+            return "feedback request text is not in stored form"
+    except RoomError as exc:
+        return f"feedback request text is invalid: {exc}"
+    anchor = record["anchor"]
+    if anchor is not None and not (
+        isinstance(anchor, dict)
+        and set(anchor) == {"path"}
+        and isinstance(anchor["path"], str)
+        and anchor["path"]
+    ):
+        return "feedback request anchor is malformed"
+    carried = record["carried_from"]
+    if carried is not None and not _canonical_uuid(carried):
+        return "feedback request carried_from is malformed"
+    return None
+
+
+def _feedback_resolution_problem(
+    row: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    request_row: dict[str, Any],
+    request: dict[str, Any],
+    room_id: object,
+    candidates: dict[str, dict[str, Any]],
+) -> str | None:
+    """Why a stored resolution cannot decide its request's status, or ``None``.
+    The writer runs the same check on the record it is about to insert."""
+    if row.get("record_type") != "resolution":
+        return "feedback row is not a resolution"
+    if set(record) != _FEEDBACK_RESOLUTION_KEYS:
+        return "feedback resolution keys are not the v1 set"
+    problem = _feedback_common_problem(row, record, room_id)
+    if problem is not None:
+        return problem
+    if record["request_id"] != request["feedback_id"] or row.get(
+        "request_id"
+    ) != request["feedback_id"]:
+        return "feedback resolution names a different request"
+    if row.get("candidate_id") != request["candidate_id"]:
+        return "feedback resolution row names a different candidate than its request"
+    if record["sequence"] <= request_row.get("sequence", 0):
+        return "feedback resolution is not after its request"
+    status = record["status"]
+    if not isinstance(status, str) or status not in FEEDBACK_RESOLUTIONS:
+        return f"feedback resolution status {status!r} is unknown"
+    evaluated_id = record["evaluated_candidate_id"]
+    digest = record["evaluated_patch_sha256"]
+    if status == "withdrawn":
+        if evaluated_id is not None or digest is not None:
+            return "a withdrawal names an evaluated candidate"
+        return None
+    origin = candidates[request["candidate_id"]]
+    evaluated = candidates.get(evaluated_id) if isinstance(evaluated_id, str) else None
+    if evaluated is None:
+        return "feedback resolution's evaluated candidate is not in this room"
+    if evaluated.get("member_id") != origin.get("member_id"):
+        return "feedback resolution's evaluated candidate is another member's"
+    if not (
+        _plain_int(evaluated.get("round_number"))
+        and _plain_int(origin.get("round_number"))
+        and evaluated["round_number"] > origin["round_number"]
+    ):
+        return "feedback resolution's evaluated candidate is not from a later round"
+    if evaluated.get("state") != "completed":
+        return "feedback resolution's evaluated candidate is not a completed candidate"
+    if digest != evaluated.get("patch_sha256"):
+        return "feedback resolution's patch digest differs from the evaluated candidate's"
+    return None
+
+
+def _repair_rounds(
+    rounds: list[dict[str, Any]],
+    *,
+    member_ids: list[str],
+    candidates: dict[str, dict[str, Any]],
+) -> tuple[list[tuple[int, dict[str, Any]]], list[tuple[object, str]]]:
+    """Each round whose provenance is a recorded repair, as its number and
+    tree; and each round whose provenance is stored but cannot be believed,
+    as its number and raw text. A damaged repair record cannot say which
+    requests it sent, so a caller treats every id its text holds as named."""
+    found: list[tuple[int, dict[str, Any]]] = []
+    untrusted: list[tuple[object, str]] = []
+    for row in rounds:
+        number = row.get("number")
+        raw = row.get("provenance_json")
+        if not _plain_int(number):
+            if isinstance(raw, str):
+                untrusted.append((number, raw))
+            continue
+        check = round_provenance_status(
+            raw,
+            round_number=number,
+            member_ids=member_ids,
+            candidates=candidates,
+        )
+        if check.status == "recorded" and check.record is not None:
+            tree = check.record["tree"]
+            if tree.get("kind") == "repair":
+                found.append((number, tree))
+        elif check.status == "malformed" and isinstance(raw, str):
+            untrusted.append((number, raw))
+    return found, untrusted
+
+
+def _repair_round_completed(
+    number: int, tree: dict[str, Any], candidates: dict[str, dict[str, Any]]
+) -> bool:
+    return any(
+        row.get("round_number") == number
+        and row.get("member_id") == tree["member_id"]
+        and row.get("state") == "completed"
+        for row in candidates.values()
+    )
+
+
+def feedback_status(
+    request_row: dict[str, Any],
+    resolution_rows: list[dict[str, Any]],
+    *,
+    room_id: object,
+    candidates: dict[str, dict[str, Any]],
+    rounds: list[dict[str, Any]],
+    member_ids: list[str],
+) -> FeedbackCheck:
+    """One request's status, from durable records only.
+
+    ``resolution_rows`` are the rows whose ``request_id`` column names this
+    request, in any order. ``candidates`` and ``rounds`` are the room's, read
+    in the same snapshot. The latest resolution decides, and only when it
+    binds: a damaged latest record is ``unknown``, never an older status.
+    Without one, the request is ``sent`` once a repair round of its own
+    candidate names it and produced a completed candidate, else ``open``.
+    """
+    parsed = _feedback_record(request_row.get("record_json"))
+    if isinstance(parsed, str):
+        return FeedbackCheck("unknown", parsed)
+    problem = _feedback_request_problem(
+        request_row, parsed, room_id=room_id, candidates=candidates
+    )
+    if problem is None and candidates[parsed["candidate_id"]].get("member_id") not in member_ids:
+        problem = "feedback request's candidate belongs to no member of this room"
+    if problem is not None:
+        return FeedbackCheck("unknown", problem)
+    request = parsed
+    if resolution_rows:
+        # The room's record set was checked first (feedback_inventory_problem),
+        # so every sequence here is a distinct plain int.
+        latest_row = max(resolution_rows, key=lambda row: row["sequence"])
+        resolution = _feedback_record(latest_row.get("record_json"))
+        if isinstance(resolution, str):
+            return FeedbackCheck("unknown", f"latest resolution: {resolution}", request)
+        problem = _feedback_resolution_problem(
+            latest_row,
+            resolution,
+            request_row=request_row,
+            request=request,
+            room_id=room_id,
+            candidates=candidates,
+        )
+        if problem is not None:
+            return FeedbackCheck("unknown", f"latest resolution: {problem}", request)
+        return FeedbackCheck(resolution["status"], None, request, resolution)
+    repairs, untrusted = _repair_rounds(
+        rounds, member_ids=member_ids, candidates=candidates
+    )
+    for number, raw in untrusted:
+        if request["feedback_id"] in raw:
+            return FeedbackCheck(
+                "unknown",
+                f"round {number}'s record names this request but cannot be believed",
+                request,
+            )
+    sent = False
+    for number, tree in repairs:
+        if request["feedback_id"] not in tree["feedback_ids"]:
+            continue
+        if tree["parent_candidate_id"] != request["candidate_id"]:
+            return FeedbackCheck(
+                "unknown",
+                f"repair round {number} names this request but repaired another candidate",
+                request,
+            )
+        if _repair_round_completed(number, tree, candidates):
+            sent = True
+    return FeedbackCheck("sent" if sent else "open", None, request)
+
+
+def feedback_inventory_problem(
+    feedback_rows: list[dict[str, Any]], *, foreign_references: int = 0
+) -> str | None:
+    """Why a room's feedback records cannot be believed as a set, or ``None``.
+
+    Status hangs on how rows point at each other, and those links live in
+    columns a damaged store can change. So before any one request is read,
+    the set must be whole: canonical unique ids, sequences exactly 1..N
+    (the writer allocates them so; a gap is a deleted or moved row), each
+    row a request or a resolution, every resolution naming an earlier
+    request on its own candidate, in its column and its body alike, and no
+    row of another room naming one of these. Any failure makes every request
+    ``unknown``. A damaged body on an intact set stays the business of the
+    one request it belongs to. Removing the newest row leaves no gap and is
+    not seen, the limit judgments share.
+
+    ``feedback_rows`` are the room's rows in sequence order;
+    ``foreign_references`` counts other rooms' rows whose ``request_id``
+    names one of them."""
+    if foreign_references:
+        return "a feedback row of another room names a request of this room"
+    seen: dict[str, dict[str, Any]] = {}
+    for position, row in enumerate(feedback_rows, 1):
+        feedback_id = row.get("id")
+        if not _canonical_uuid(feedback_id):
+            return f"feedback row {position} has a malformed id"
+        if feedback_id in seen:
+            return f"feedback id {feedback_id} is stored twice"
+        if not _plain_int(row.get("sequence")) or row["sequence"] != position:
+            return "feedback sequences are not 1..N; a record is missing, moved or renumbered"
+        if not isinstance(row.get("candidate_id"), str):
+            return f"feedback {feedback_id} names no candidate"
+        record_type = row.get("record_type")
+        request_id = row.get("request_id")
+        if record_type == "request":
+            if request_id is not None:
+                return f"feedback request {feedback_id} names a request of its own"
+        elif record_type == "resolution":
+            target = seen.get(request_id) if isinstance(request_id, str) else None
+            if target is None or target.get("record_type") != "request":
+                return f"feedback resolution {feedback_id} names no earlier request"
+            if row["candidate_id"] != target["candidate_id"]:
+                return (
+                    f"feedback resolution {feedback_id} is filed under another "
+                    "candidate than its request"
+                )
+            body = _feedback_record(row.get("record_json"))
+            if (
+                isinstance(body, dict)
+                and "request_id" in body
+                and body["request_id"] != request_id
+            ):
+                return (
+                    f"feedback resolution {feedback_id} names one request in its row "
+                    "and another in its record"
+                )
+        else:
+            return f"feedback {feedback_id} is neither a request nor a resolution"
+        seen[feedback_id] = row
+    return None
+
+
+def feedback_statuses(
+    feedback_rows: list[dict[str, Any]],
+    *,
+    room_id: object,
+    candidates: dict[str, dict[str, Any]],
+    rounds: list[dict[str, Any]],
+    member_ids: list[str],
+    foreign_references: int = 0,
+) -> dict[str, FeedbackCheck]:
+    """:func:`feedback_status` for every request row of a room, by id.
+
+    The room's records are checked as a set first
+    (:func:`feedback_inventory_problem`). If the set fails, every row that
+    could be a request reads ``unknown``, so none is dropped from a listing
+    and none lets an older or default status through."""
+    problem = feedback_inventory_problem(
+        feedback_rows, foreign_references=foreign_references
+    )
+    if problem is not None:
+        reason = f"the room's feedback records cannot be trusted: {problem}"
+        return {
+            str(row.get("id")): FeedbackCheck("unknown", reason)
+            for row in feedback_rows
+            if row.get("record_type") != "resolution" or row.get("request_id") is None
+        }
+    resolutions: dict[object, list[dict[str, Any]]] = {}
+    for row in feedback_rows:
+        if row.get("request_id") is not None:
+            resolutions.setdefault(row.get("request_id"), []).append(row)
+    return {
+        str(row["id"]): feedback_status(
+            row,
+            resolutions.get(row["id"], []),
+            room_id=room_id,
+            candidates=candidates,
+            rounds=rounds,
+            member_ids=member_ids,
+        )
+        for row in feedback_rows
+        if row.get("request_id") is None
+    }
+
+
+def repair_feedback_problems(
+    rounds: list[dict[str, Any]],
+    feedback_rows: list[dict[str, Any]],
+    *,
+    candidates: dict[str, dict[str, Any]],
+    member_ids: list[str],
+) -> list[str]:
+    """Body-free warnings for repair rounds whose recorded feedback ids do not
+    name a request on the candidate they repaired. A request-side check never
+    sees an id that names no request, so this reads from the round's side."""
+    by_id = {row.get("id"): row for row in feedback_rows}
+    problems: list[str] = []
+    repairs, _ = _repair_rounds(rounds, member_ids=member_ids, candidates=candidates)
+    for number, tree in repairs:
+        for feedback_id in tree["feedback_ids"]:
+            row = by_id.get(feedback_id)
+            if row is None:
+                why = "which is not a request in this room"
+            elif row.get("record_type") != "request":
+                why = "which is a resolution, not a request"
+            elif row.get("candidate_id") != tree["parent_candidate_id"]:
+                why = "which is a request on another candidate"
+            else:
+                continue
+            problems.append(f"repair round {number} names feedback {feedback_id}, {why}")
+    return problems
+
+
+def _render_feedback_item(index: int, request: dict[str, Any]) -> str:
+    anchor = request.get("anchor")
+    prefix = ""
+    if anchor is not None:
+        path = anchor["path"]
+        # json.dumps escapes every non-ASCII character, so a quoted path
+        # passes _validate_prompt_text whatever a captured path holds.
+        shown = (
+            json.dumps(path)
+            if "]" in path or has_control_characters(path)
+            else path
+        )
+        prefix = f"[{shown}] "
+    lines = request["text"].split("\n")
+    head = f"{index}. {prefix}{lines[0]}"
+    return "\n".join([head, *("   " + line if line else "" for line in lines[1:])])
+
+
+def render_feedback_batch(requests: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> str:
+    """The request part of a repair's task, change requests first, each kind
+    in the order given. Deterministic: the plan binds its digest."""
+    sections: list[str] = []
+    for kind, heading in (
+        ("change", "Change requests:"),
+        ("question", "Questions (answer these in your response):"),
+    ):
+        items = [request for request in requests if request["kind"] == kind]
+        if items:
+            sections.append(
+                "\n".join(
+                    [heading]
+                    + [_render_feedback_item(i, item) for i, item in enumerate(items, 1)]
+                )
+            )
+    return "\n\n".join(sections)
 
 
 _PROVENANCE_SCHEMA_VERSION = 2
@@ -1656,6 +2190,24 @@ class RoomStore:
                 created_at TEXT NOT NULL,
                 UNIQUE(room_id, sequence)
             );
+            -- Review feedback on one candidate (#173). Append-only: a request
+            -- is never edited and a later resolution supersedes an earlier
+            -- one. request_id sits outside the JSON so that a resolution with
+            -- a damaged body can still be attributed. Status is derived on
+            -- read (feedback_status), never stored.
+            CREATE TABLE IF NOT EXISTS room_feedback (
+                id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL REFERENCES rooms(id),
+                candidate_id TEXT NOT NULL REFERENCES candidates(id),
+                record_type TEXT NOT NULL,
+                request_id TEXT REFERENCES room_feedback(id),
+                sequence INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(room_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_room_feedback_candidate
+                ON room_feedback(room_id, candidate_id);
             CREATE INDEX IF NOT EXISTS idx_rooms_state ON rooms(state, created_at);
             CREATE INDEX IF NOT EXISTS idx_candidates_room ON candidates(room_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_round_members ON round_members(round_id);
@@ -1942,6 +2494,10 @@ class RoomStore:
                     else:
                         eligible = True
                     if eligible:
+                        # Before candidates, which it references. One statement
+                        # covers its own request_id references: SQLite checks
+                        # immediate foreign keys at the end of the statement.
+                        conn.execute("DELETE FROM room_feedback WHERE room_id=?", (room_id,))
                         conn.execute("DELETE FROM candidates WHERE room_id=?", (room_id,))
                         conn.execute(
                             "DELETE FROM room_workspaces WHERE room_id=?", (room_id,)
@@ -2157,6 +2713,22 @@ class RoomStore:
         stored = cls._stored_session(conn, room, plan.member_id)
         if (None if stored is None else _text_sha256(stored)) != plan.session_sha256:
             return f"the member's provider session changed; {again}"
+        if plan.feedback:
+            view = cls._feedback_view(conn, room["id"])
+            raw = {row["id"]: str(row["record_json"]) for row in view.rows}
+            for item in plan.feedback:
+                check = view.checks.get(item["id"])
+                if (
+                    check is None
+                    or check.status != item["status"]
+                    or check.request is None
+                    or check.request["candidate_id"] != plan.candidate_id
+                    or _text_sha256(raw[item["id"]]) != item["record_sha256"]
+                ):
+                    return (
+                        f"feedback {item['id']} changed since this repair was "
+                        f"confirmed; {again}"
+                    )
         return None
 
     @staticmethod
@@ -3333,6 +3905,471 @@ class RoomStore:
                 raise RoomError("room apply state changed before finalization")
             self._event(conn, room_id, "apply.completed", {"run_id": run_id})
 
+    # ------------------------------------------------------------ feedback
+
+    @classmethod
+    def _feedback_view(cls, conn: sqlite3.Connection, room_id: str) -> FeedbackView:
+        row = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+        if row is None:
+            raise RoomError(f"unknown room: {room_id}")
+        room = cls._room(row)
+        member_ids = [
+            member["member_id"]
+            for member in room["members"]
+            if isinstance(member, dict) and "member_id" in member
+        ]
+        candidates = cls._candidate_rows(conn, room_id)
+        rounds = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM rounds WHERE room_id=? ORDER BY number", (room_id,)
+            ).fetchall()
+        ]
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM room_feedback WHERE room_id=? ORDER BY sequence",
+                (room_id,),
+            ).fetchall()
+        ]
+        foreign = int(
+            conn.execute(
+                """SELECT COUNT(*) FROM room_feedback WHERE room_id IS NOT ?
+                AND request_id IN (SELECT id FROM room_feedback WHERE room_id=?)""",
+                (room_id, room_id),
+            ).fetchone()[0]
+        )
+        problem = feedback_inventory_problem(rows, foreign_references=foreign)
+        return FeedbackView(
+            room=room,
+            candidates=candidates,
+            rows=rows,
+            checks=feedback_statuses(
+                rows,
+                room_id=room_id,
+                candidates=candidates,
+                rounds=rounds,
+                member_ids=member_ids,
+                foreign_references=foreign,
+            ),
+            warnings=([problem] if problem else [])
+            + repair_feedback_problems(
+                rounds, rows, candidates=candidates, member_ids=member_ids
+            ),
+            problem=problem,
+        )
+
+    def feedback(self, room_id: str) -> FeedbackView:
+        """The room's feedback and each request's status, read in one snapshot."""
+        with self._read_snapshot() as conn:
+            return self._feedback_view(conn, room_id)
+
+    def feedback_room(self, feedback_id: str) -> str:
+        """The room a feedback request belongs to."""
+        return self._feedback_room_of(self._conn, feedback_id)
+
+    def feedback_count(self, room_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM room_feedback WHERE room_id=?", (room_id,)
+        ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _feedback_room_of(conn: sqlite3.Connection, feedback_id: str) -> str:
+        row = conn.execute(
+            "SELECT room_id, record_type FROM room_feedback WHERE id=?", (feedback_id,)
+        ).fetchone()
+        if row is None:
+            raise RoomError(f"unknown feedback: {feedback_id}")
+        if row["record_type"] != "request":
+            raise RoomError(f"feedback {feedback_id} is a resolution, not a request")
+        return str(row["room_id"])
+
+    @staticmethod
+    def _feedback_writable(view: FeedbackView) -> None:
+        state = view.room["state"]
+        if state not in _FEEDBACK_WRITABLE_STATES:
+            raise RoomError(
+                f"room is {state}; feedback is written only while a room awaits a "
+                "decision or has a selected candidate"
+            )
+        if view.problem is not None:
+            raise RoomError(
+                f"the room's feedback records cannot be trusted ({view.problem}); "
+                "nothing more is written to them"
+            )
+
+    @staticmethod
+    def _trusted_request(view: FeedbackView, request_id: str) -> FeedbackCheck:
+        check = view.checks.get(request_id)
+        if check is None:
+            raise RoomError(f"unknown feedback: {request_id}")
+        if check.status == "unknown" or check.request is None:
+            raise RoomError(
+                f"feedback {request_id} cannot be trusted ({check.reason}); "
+                "inspect it with `syncmill room feedback list`"
+            )
+        return check
+
+    def _insert_feedback(
+        self,
+        conn: sqlite3.Connection,
+        view: FeedbackView,
+        *,
+        record_type: str,
+        candidate_id: str,
+        body: dict[str, Any],
+        request: tuple[dict[str, Any], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Validate a new record with the reader's own check, then insert it.
+        ``request`` is the (row, record) a resolution resolves."""
+        room_id = view.room["id"]
+        sequence = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM room_feedback WHERE room_id=?",
+                (room_id,),
+            ).fetchone()[0]
+        )
+        now = _now()
+        feedback_id = str(uuid4())
+        record = {
+            "schema_version": _FEEDBACK_SCHEMA_VERSION,
+            "feedback_id": feedback_id,
+            "room_id": room_id,
+            **body,
+            "sequence": sequence,
+            "created_at": now,
+        }
+        row = {
+            "id": feedback_id,
+            "room_id": room_id,
+            "candidate_id": candidate_id,
+            "record_type": record_type,
+            "request_id": None if request is None else request[1]["feedback_id"],
+            "sequence": sequence,
+        }
+        if request is None:
+            problem = _feedback_request_problem(
+                row, record, room_id=room_id, candidates=view.candidates
+            )
+        else:
+            problem = _feedback_resolution_problem(
+                row,
+                record,
+                request_row=request[0],
+                request=request[1],
+                room_id=room_id,
+                candidates=view.candidates,
+            )
+        if problem is not None:
+            raise RoomError(problem)
+        conn.execute(
+            """INSERT INTO room_feedback
+            (id,room_id,candidate_id,record_type,request_id,sequence,record_json,created_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                feedback_id,
+                room_id,
+                candidate_id,
+                record_type,
+                row["request_id"],
+                sequence,
+                json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                now,
+            ),
+        )
+        # Body-free: feedback text never enters room_events.
+        if request is None:
+            self._event(
+                conn,
+                room_id,
+                "feedback.requested",
+                {
+                    "feedback_id": feedback_id,
+                    "candidate_id": candidate_id,
+                    "kind": record["kind"],
+                    "anchored": record["anchor"] is not None,
+                    "carried_from": record["carried_from"],
+                    "sequence": sequence,
+                    "surface": record["surface"],
+                },
+            )
+        else:
+            self._event(
+                conn,
+                room_id,
+                "feedback.resolved",
+                {
+                    "feedback_id": feedback_id,
+                    "request_id": record["request_id"],
+                    "status": record["status"],
+                    "evaluated_candidate_id": record["evaluated_candidate_id"],
+                    "sequence": sequence,
+                    "surface": record["surface"],
+                },
+            )
+        return record
+
+    def add_feedback(
+        self,
+        candidate_id: str,
+        kind: str,
+        text: str,
+        *,
+        path: str | None,
+        files_changed: list[str],
+        verified_patch_sha256: str,
+        surface: str = "api",
+    ) -> dict[str, Any]:
+        """Append a request on one completed candidate. ``files_changed`` and
+        ``verified_patch_sha256`` come from the artifact the caller verified;
+        the candidate row must still carry that digest. Changes neither the
+        room's state nor its revision."""
+        if kind not in FEEDBACK_KINDS:
+            raise RoomError(
+                f"unknown feedback kind {kind!r}; use one of "
+                + ", ".join(sorted(FEEDBACK_KINDS))
+            )
+        if surface not in SELECTION_SURFACES:
+            raise RoomError(f"unknown feedback surface: {surface}")
+        text = normalize_feedback_text(text)
+        anchor: dict[str, str] | None = None
+        if path is not None:
+            if path not in files_changed:
+                raise RoomError(
+                    f"{path} is not a file this candidate changed; --file takes a path "
+                    "exactly as `syncmill room compare` lists it"
+                )
+            anchor = {"path": path}
+        with self._tx() as conn:
+            found = conn.execute(
+                "SELECT room_id FROM candidates WHERE id=?", (candidate_id,)
+            ).fetchone()
+            if found is None:
+                raise RoomError(f"unknown candidate: {candidate_id}")
+            view = self._feedback_view(conn, str(found["room_id"]))
+            self._feedback_writable(view)
+            candidate = view.candidates[candidate_id]
+            if candidate["state"] != "completed":
+                raise RoomError(
+                    f"candidate ended {candidate['state']}, so it holds no finished work "
+                    "to review; feedback is written on completed candidates"
+                )
+            if candidate["patch_sha256"] != verified_patch_sha256:
+                raise RoomError("candidate changed since its artifact was verified")
+            return self._insert_feedback(
+                conn,
+                view,
+                record_type="request",
+                candidate_id=candidate_id,
+                body={
+                    "candidate_id": candidate_id,
+                    "patch_sha256": candidate["patch_sha256"],
+                    "kind": kind,
+                    "text": text,
+                    "anchor": anchor,
+                    "carried_from": None,
+                    "surface": surface,
+                },
+            )
+
+    def resolve_feedback(
+        self,
+        request_id: str,
+        status: str,
+        *,
+        evaluated_candidate_id: str | None = None,
+        verified_patch_sha256: str | None = None,
+        surface: str = "api",
+    ) -> tuple[dict[str, Any], bool]:
+        """Append a human resolution of a request. Returns ``(record, created)``;
+        repeating the current resolution is a no-op returning it."""
+        if status not in FEEDBACK_RESOLUTIONS:
+            raise RoomError(
+                f"unknown resolution {status!r}; use one of "
+                + ", ".join(sorted(FEEDBACK_RESOLUTIONS))
+            )
+        if surface not in SELECTION_SURFACES:
+            raise RoomError(f"unknown feedback surface: {surface}")
+        if status == "withdrawn" and evaluated_candidate_id is not None:
+            raise RoomError("a withdrawal names no candidate; drop --on")
+        if status != "withdrawn" and evaluated_candidate_id is None:
+            raise RoomError(
+                "say which candidate you evaluated with --on CANDIDATE: a later "
+                "completed candidate of the same member"
+            )
+        with self._tx() as conn:
+            view = self._feedback_view(conn, self._feedback_room_of(conn, request_id))
+            self._feedback_writable(view)
+            check = self._trusted_request(view, request_id)
+            evaluated_digest: str | None = None
+            if evaluated_candidate_id is not None:
+                evaluated = view.candidates.get(evaluated_candidate_id)
+                if evaluated is None:
+                    raise RoomError(
+                        f"candidate {evaluated_candidate_id} is not a candidate of this room"
+                    )
+                if evaluated["patch_sha256"] != verified_patch_sha256:
+                    raise RoomError("candidate changed since its artifact was verified")
+                evaluated_digest = evaluated["patch_sha256"]
+            current = check.resolution
+            if (
+                current is not None
+                and current["status"] == status
+                and current["evaluated_candidate_id"] == evaluated_candidate_id
+            ):
+                return current, False
+            request_row = next(row for row in view.rows if row["id"] == request_id)
+            try:
+                record = self._insert_feedback(
+                    conn,
+                    view,
+                    record_type="resolution",
+                    candidate_id=check.request["candidate_id"],
+                    body={
+                        "request_id": request_id,
+                        "status": status,
+                        "evaluated_candidate_id": evaluated_candidate_id,
+                        "evaluated_patch_sha256": evaluated_digest,
+                        "surface": surface,
+                    },
+                    request=(request_row, check.request),
+                )
+            except RoomError as exc:
+                raise RoomError(f"cannot resolve on that candidate: {exc}") from exc
+            return record, True
+
+    def carry_feedback(
+        self,
+        request_id: str,
+        to_candidate_id: str,
+        *,
+        files_changed: list[str],
+        verified_patch_sha256: str,
+        surface: str = "api",
+    ) -> CarriedFeedback:
+        """Write a copy of a request on a later completed candidate of the same
+        member. The file anchor is kept only when ``files_changed`` (the
+        target's verified list) still holds its path. Carrying the same
+        request to the same candidate again returns the earlier copy."""
+        if surface not in SELECTION_SURFACES:
+            raise RoomError(f"unknown feedback surface: {surface}")
+        with self._tx() as conn:
+            view = self._feedback_view(conn, self._feedback_room_of(conn, request_id))
+            self._feedback_writable(view)
+            check = self._trusted_request(view, request_id)
+            source = check.request
+            if check.status == "withdrawn":
+                raise RoomError(f"feedback {request_id} was withdrawn; nothing to carry")
+            target = view.candidates.get(to_candidate_id)
+            if target is None:
+                raise RoomError(f"candidate {to_candidate_id} is not a candidate of this room")
+            if target["patch_sha256"] != verified_patch_sha256:
+                raise RoomError("candidate changed since its artifact was verified")
+            origin = view.candidates[source["candidate_id"]]
+            if target["member_id"] != origin["member_id"]:
+                raise RoomError(
+                    "feedback is carried to a later candidate of the member it was "
+                    "written for; write a new request with `room feedback add` instead"
+                )
+            if not (
+                _plain_int(target.get("round_number"))
+                and _plain_int(origin.get("round_number"))
+                and target["round_number"] > origin["round_number"]
+            ):
+                raise RoomError(
+                    f"candidate {to_candidate_id} is not from a later round than the "
+                    "request's candidate"
+                )
+            if target["state"] != "completed":
+                raise RoomError(
+                    f"candidate ended {target['state']}; feedback is carried to a "
+                    "completed candidate"
+                )
+            for other in view.checks.values():
+                if (
+                    other.request is not None
+                    and other.request["carried_from"] == request_id
+                    and other.request["candidate_id"] == to_candidate_id
+                ):
+                    if other.status == "unknown":
+                        raise RoomError(
+                            f"feedback {request_id} was already carried to that "
+                            f"candidate, and the copy cannot be trusted ({other.reason})"
+                        )
+                    return CarriedFeedback(other.request, False, source["anchor"])
+            anchor = source["anchor"]
+            if anchor is not None and anchor["path"] not in files_changed:
+                anchor = None
+            record = self._insert_feedback(
+                conn,
+                view,
+                record_type="request",
+                candidate_id=to_candidate_id,
+                body={
+                    "candidate_id": to_candidate_id,
+                    "patch_sha256": target["patch_sha256"],
+                    "kind": source["kind"],
+                    "text": source["text"],
+                    "anchor": anchor,
+                    "carried_from": request_id,
+                    "surface": surface,
+                },
+            )
+            return CarriedFeedback(record, True, source["anchor"])
+
+    def repair_batch(
+        self,
+        room_id: str,
+        candidate_id: str,
+        feedback_ids: list[str] | tuple[str, ...] | None,
+    ) -> list[tuple[dict[str, Any], str]]:
+        """The requests a repair of this candidate sends, as (record,
+        record_json) in sequence order: every ``open`` request on it, or
+        exactly ``feedback_ids``, each of which must be one of those."""
+        view = self.feedback(room_id)
+        if view.problem is not None:
+            raise RoomError(
+                f"the room's feedback records cannot be trusted ({view.problem}); "
+                "repair with --prompt only after they are fixed, or start a new room"
+            )
+        raw = {row["id"]: str(row["record_json"]) for row in view.rows}
+        if feedback_ids is None:
+            chosen = {
+                feedback_id
+                for feedback_id, check in view.checks.items()
+                if check.status == "open"
+                and check.request is not None
+                and check.request["candidate_id"] == candidate_id
+            }
+        else:
+            if len(set(feedback_ids)) != len(feedback_ids):
+                raise RoomError("a feedback id is listed twice")
+            for feedback_id in feedback_ids:
+                check = view.checks.get(feedback_id)
+                if check is None:
+                    raise RoomError(f"{feedback_id} is not a feedback request in this room")
+                if check.request is None or check.status == "unknown":
+                    raise RoomError(
+                        f"feedback {feedback_id} cannot be trusted ({check.reason})"
+                    )
+                if check.request["candidate_id"] != candidate_id:
+                    raise RoomError(
+                        f"feedback {feedback_id} is a request on candidate "
+                        f"{check.request['candidate_id']}, not on {candidate_id}"
+                    )
+                if check.status != "open":
+                    raise RoomError(
+                        f"feedback {feedback_id} is {check.status}; a repair sends open "
+                        "requests only"
+                    )
+            chosen = set(feedback_ids)
+        return [
+            (check.request, raw[feedback_id])
+            for feedback_id, check in view.checks.items()
+            if feedback_id in chosen and check.request is not None
+        ]
+
     def list_judgments(self, room_id: str) -> list[dict[str, Any]]:
         """The room's judgment rows, oldest first (raw; validate before use)."""
         rows = self._conn.execute(
@@ -3898,21 +4935,33 @@ class RoomCoordinator:
     def build_repair_plan(
         self,
         candidate_id: str,
-        prompt: str,
+        prompt: str | None,
         *,
+        feedback_ids: list[str] | tuple[str, ...] | None = None,
         cold: bool = False,
         lessons: list[RoundLesson] | tuple[RoundLesson, ...] | None = None,
     ) -> RepairPlan:
         """The plan for repairing one candidate as of now. Read-only: it starts
         nothing, and a repair that could only fail after the round's lease is
-        refused here instead, so such a repair cannot freeze the room."""
+        refused here instead, so such a repair cannot freeze the room.
+
+        It sends the candidate's ``open`` feedback requests, or exactly
+        ``feedback_ids``, and the optional free-text ``prompt``. The round
+        stores only the free text (or a fixed line naming the candidate):
+        feedback text stays out of ``rounds.prompt``, which apply shares."""
         room_id = str(self.store.get_candidate(candidate_id)["room_id"])
         problem = self.store.repair_parent_problem(room_id, candidate_id)
         if problem is not None:
             raise RoomError(problem)
-        if not prompt.strip():
-            raise RoomError("a repair needs a prompt saying what to change")
-        room = self.preflight_round(room_id, prompt)
+        free_text = prompt if prompt is not None and prompt.strip() else None
+        batch = self.store.repair_batch(room_id, candidate_id, feedback_ids)
+        if not batch and free_text is None:
+            raise RoomError(
+                f"nothing to repair: candidate {candidate_id} has no open feedback "
+                "and no prompt was given"
+            )
+        round_prompt = free_text if free_text is not None else f"Repair candidate {candidate_id}"
+        room = self.preflight_round(room_id, round_prompt)
         parent = self.store.candidate_rows(room_id)[candidate_id]
         member_id = parent["member_id"]
         try:
@@ -3929,7 +4978,9 @@ class RoomCoordinator:
                 "candidate's patch records an embedded repository, which a rebuild "
                 "cannot restore, so it cannot be repaired"
             )
-        agent_task = render_repair_task(candidate_id, prompt)
+        agent_task = render_repair_task(
+            candidate_id, free_text, [request for request, _ in batch]
+        )
         # round_lessons_fit answers True when there are no lessons, and an
         # oversized task would otherwise first fail after the lease is held.
         _validate_prompt_text(agent_task)
@@ -3958,11 +5009,20 @@ class RoomCoordinator:
             cold=cold,
             session_mode="resume" if conversations and stored and not cold else "cold",
             session_sha256=None if stored is None else _text_sha256(stored),
-            prompt=prompt,
+            prompt=round_prompt,
             agent_task=agent_task,
             agent_task_sha256=_text_sha256(agent_task),
             lesson_ids=tuple(lesson.id for lesson in selected),
             gate=_gate_settings_record(self.config.gate),
+            feedback=tuple(
+                {
+                    "id": request["feedback_id"],
+                    "kind": request["kind"],
+                    "record_sha256": _text_sha256(raw),
+                    "status": "open",
+                }
+                for request, raw in batch
+            ),
         )
 
     def _continued_parents(self, room: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
@@ -4939,6 +5999,74 @@ class RoomCoordinator:
             verdict,
             expected_patch_sha256=expected_patch_sha256,
             rationale=rationale,
+            surface=surface,
+        )
+
+    def _own_room(self, room_id: str) -> None:
+        recorded_room = self.store.get_room(room_id)
+        if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
+            raise RoomError("room belongs to a different repository")
+
+    def _verified_files(self, candidate_id: str) -> tuple[str, list[str]]:
+        """A candidate's verified patch digest and its manifest's changed files."""
+        self._own_room(str(self.store.get_candidate(candidate_id)["room_id"]))
+        digests = self.store.verify_candidate_artifact(candidate_id)
+        files = self.store.load_candidate_manifest(candidate_id).get("files_changed")
+        if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+            raise RoomError(f"candidate's changed-file list is malformed: {candidate_id}")
+        return digests["patch_sha256"], files
+
+    def add_feedback(
+        self,
+        candidate_id: str,
+        kind: str,
+        text: str,
+        *,
+        path: str | None = None,
+        surface: str = "api",
+    ) -> dict[str, Any]:
+        """Write a change request or a question on one candidate (#173)."""
+        digest, files = self._verified_files(candidate_id)
+        return self.store.add_feedback(
+            candidate_id,
+            kind,
+            text,
+            path=path,
+            files_changed=files,
+            verified_patch_sha256=digest,
+            surface=surface,
+        )
+
+    def resolve_feedback(
+        self,
+        request_id: str,
+        status: str,
+        *,
+        on: str | None = None,
+        surface: str = "api",
+    ) -> tuple[dict[str, Any], bool]:
+        self._own_room(self.store.feedback_room(request_id))
+        digest = None
+        if on is not None:
+            digest, _ = self._verified_files(on)
+        return self.store.resolve_feedback(
+            request_id,
+            status,
+            evaluated_candidate_id=on,
+            verified_patch_sha256=digest,
+            surface=surface,
+        )
+
+    def carry_feedback(
+        self, request_id: str, to_candidate_id: str, *, surface: str = "api"
+    ) -> CarriedFeedback:
+        self._own_room(self.store.feedback_room(request_id))
+        digest, files = self._verified_files(to_candidate_id)
+        return self.store.carry_feedback(
+            request_id,
+            to_candidate_id,
+            files_changed=files,
+            verified_patch_sha256=digest,
             surface=surface,
         )
 
