@@ -1,0 +1,33 @@
+{
+  "status": "completed",
+  "agent_id": "kimi-code",
+  "output": "kimi (fake) fix.",
+  "error": null,
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "files_changed": [
+    "calc.py"
+  ],
+  "gate": {
+    "passed": true,
+    "score": 1.0,
+    "checks": [
+      {
+        "command": "python3 -c \"from calc import add; assert add(2, 3) == 5\"",
+        "passed": true,
+        "exit_code": 0,
+        "output": "",
+        "duration_seconds": 0.02
+      }
+    ]
+  },
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "bundle_version": 3,
+  "workflow_id": "wf-4e8e7fcd823e4b05",
+  "node_id": "fix",
+  "lease_id": "806172f1ce0b4475ba7c8c01844b21d0",
+  "attempt": 1,
+  "spec_sha256": "977294d3defa4f3167fefdc2a3c8150025d683c5e39bb848336df5919c134283",
+  "usage": null
+}
