@@ -3063,10 +3063,10 @@ class SyncmillTuiApp(App[None]):
         room_id, store_root = target
         try:
             room = self._rooms.store.get_room(room_id)
-            # Prefill with the PREVIOUS round's prompt (creation prompt on a
-            # fresh room) — the modal is where per-round instructions land now.
-            rounds = self._rooms.store.list_rounds(room_id)
-            default_prompt = rounds[-1]["prompt"] if rounds else room["prompt"]
+            # Prefill with the PREVIOUS all-member round's prompt (creation
+            # prompt on a fresh room) — the modal is where per-round
+            # instructions land now.
+            default_prompt, passed_over_repair = self._rooms.next_round_prompt(room_id)
             eligible = [
                 row
                 for row in self._rooms.store.list_candidates(room_id)
@@ -3076,6 +3076,11 @@ class SyncmillTuiApp(App[None]):
         except (*_ROOM_POLL_ERRORS, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
+        if passed_over_repair:
+            self.notify(
+                "The last round repaired one member, so this shows the last prompt "
+                "written for every member."
+            )
         self.push_screen(
             RoomRoundModal(room, default_prompt, eligible, lessons),
             lambda fields, room_id=room_id, store_root=store_root, shown=lessons.lessons: (

@@ -1011,3 +1011,30 @@ def test_text_typed_into_a_dialog_editor_stays_visible(tmp_path, git_repo, size,
             assert "visible words" in shown
 
     drive(scenario())
+
+
+def test_the_round_dialog_does_not_offer_a_repairs_prompt_to_every_member(git_repo, tmp_path):
+    coordinator = _coordinator(git_repo, tmp_path)
+    room = coordinator.create("the room prompt", ["claude", "codex"])
+    coordinator.run_round(room["id"], "for every member")
+    parent = next(
+        row for row in coordinator.store.list_candidates(room["id"]) if row["member_id"] == "claude"
+    )
+    plan = coordinator.build_repair_plan(parent["id"], "fix your own file")
+    coordinator.run_round(room["id"], plan.prompt, target=plan)
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room["id"]
+            app._confirm_room_round()
+            await pilot.pause()
+            assert isinstance(app.screen, RoomRoundModal)
+            assert app.screen._default_prompt == "for every member"
+            assert any("repaired one member" in n.message for n in app._notifications)
+
+    asyncio.run(scenario())
+    coordinator.close()
+

@@ -14,6 +14,7 @@ from syncmill.rooms import (
     RoomCoordinator,
     RoomError,
     RoomStore,
+    round_expected_members,
     round_provenance_status,
 )
 import syncmill.rooms as rooms_module
@@ -443,3 +444,146 @@ def test_no_configured_gate_is_recorded_as_none(git_repo, tmp_path):
         assert _provenance(coordinator, room["id"], 1)["gate"] == {"kind": "none"}
     finally:
         coordinator.close()
+
+
+# ----------------------------------------------------------------- repair (v3)
+
+_REPAIR_ROWS = {
+    "parent": {
+        "member_id": "a",
+        "state": "completed",
+        "round_number": 1,
+        "patch_sha256": DIGEST,
+        "eligible": 1,
+    },
+    "failed-later": {"member_id": "a", "state": "failed", "round_number": 2, "patch_sha256": "b" * 64},
+    "peer": {"member_id": "b", "state": "completed", "round_number": 1, "patch_sha256": "c" * 64},
+    "not-completed": {"member_id": "a", "state": "timeout", "round_number": 1, "patch_sha256": DIGEST},
+}
+_FEEDBACK = "11111111-1111-4111-8111-111111111111"
+
+
+def _repair_tree(**changes) -> dict:
+    tree = {
+        "kind": "repair",
+        "member_id": "a",
+        "parent_candidate_id": "parent",
+        "parent_patch_sha256": DIGEST,
+        "parent_round_number": 1,
+        "feedback_ids": [],
+        "agent_task_sha256": "d" * 64,
+    }
+    tree.update(changes)
+    return tree
+
+
+def _repair_check(tree=None, *, version=3, lineage="repair", round_number=3, candidates=None):
+    return _check(
+        _record(tree or _repair_tree(), lineage=lineage, version=version),
+        round_number=round_number,
+        candidates=_REPAIR_ROWS if candidates is None else candidates,
+    )
+
+
+def test_a_repair_record_is_believed_past_a_later_failed_attempt():
+    check = _repair_check()
+    assert check.status == "recorded", check.reason
+    assert _repair_check(_repair_tree(feedback_ids=[_FEEDBACK])).status == "recorded"
+
+
+def test_a_repair_record_with_a_commands_gate_is_believed():
+    gate = {"kind": "commands", "commands": ["true"], "timeout_seconds": 5, "env_allowlist": None}
+    check = _check(
+        _record(_repair_tree(), lineage="repair", version=3, gate=gate),
+        round_number=3,
+        candidates=_REPAIR_ROWS,
+    )
+    assert check.status == "recorded", check.reason
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"member_id": "stranger"},
+        {"member_id": 1},
+        {"member_id": "b"},
+        {"parent_candidate_id": "unknown"},
+        {"parent_candidate_id": ["parent"]},
+        {"parent_candidate_id": "peer"},
+        {"parent_candidate_id": "not-completed"},
+        {"parent_patch_sha256": "e" * 64},
+        {"parent_patch_sha256": "short"},
+        {"parent_round_number": 2},
+        {"parent_round_number": True},
+        {"feedback_ids": "x"},
+        {"feedback_ids": ["not-a-uuid"]},
+        {"feedback_ids": [_FEEDBACK, _FEEDBACK]},
+        {"agent_task_sha256": "short"},
+        {"agent_task_sha256": None},
+        {"extra": 1},
+    ],
+    ids=lambda changes: next(iter(changes)) + "=" + repr(next(iter(changes.values())))[:16],
+)
+def test_a_malformed_repair_tree_is_not_believed(changes):
+    check = _repair_check(_repair_tree(**changes))
+    assert check.status == "malformed"
+
+
+def test_a_repair_tree_missing_a_key_is_not_believed():
+    tree = _repair_tree()
+    del tree["feedback_ids"]
+    assert _repair_check(tree).status == "malformed"
+
+
+def test_a_repair_parent_must_come_before_its_round():
+    assert _repair_check(round_number=1).status == "malformed"
+    same_round = {"parent": {**_REPAIR_ROWS["parent"], "round_number": 3}}
+    check = _repair_check(_repair_tree(parent_round_number=3), candidates=same_round)
+    assert check.status == "malformed"
+    assert "earlier round" in check.reason
+
+
+def test_a_repair_parent_must_be_its_members_newest_completed_candidate():
+    rows = {
+        **_REPAIR_ROWS,
+        "newer": {"member_id": "a", "state": "completed", "round_number": 2, "patch_sha256": "f" * 64},
+    }
+    check = _repair_check(candidates=rows)
+    assert check.status == "malformed"
+    assert "newest completed" in check.reason
+    # A later round's candidate does not change what this round's record meant.
+    later = {
+        **_REPAIR_ROWS,
+        "later": {"member_id": "a", "state": "completed", "round_number": 3, "patch_sha256": "f" * 64},
+    }
+    assert _repair_check(candidates=later).status == "recorded"
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_a_repair_cannot_be_recorded_below_version_3(version):
+    check = _repair_check(version=version)
+    assert check.status == "malformed"
+    assert "cannot be recorded" in check.reason
+
+
+@pytest.mark.parametrize("lineage", ["continue-own", "fresh", "branch-from"])
+def test_version_3_is_only_for_a_repair(lineage):
+    check = _check(
+        _record({"kind": "snapshot"}, lineage=lineage, version=3), candidates=_REPAIR_ROWS
+    )
+    assert check.status == "malformed"
+
+
+def test_a_repair_tree_cannot_hide_under_another_lineage():
+    assert _repair_check(lineage="continue-own").status == "malformed"
+    assert _repair_check(tree={"kind": "snapshot"}).status == "malformed"
+
+
+def test_expected_members_are_the_target_only_for_a_believed_repair():
+    members = [{"member_id": "a", "provider_id": "x"}, {"member_id": "b", "provider_id": "y"}]
+    assert round_expected_members(members, _repair_check()) == members[:1]
+    malformed = _repair_check(_repair_tree(member_id="stranger"))
+    assert round_expected_members(members, malformed) == members
+    assert round_expected_members(members, _check(None)) == members
+    all_members = _check(_record({"kind": "snapshot"}), round_number=1)
+    assert round_expected_members(members, all_members) == members

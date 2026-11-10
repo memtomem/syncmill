@@ -3059,6 +3059,10 @@ class _FakeRoundRooms:
         self.preflights.append((room_id, prompt, lineage, base_candidate_id))
         return {}
 
+    def next_round_prompt(self, room_id):
+        rounds = self.store.list_rounds(room_id)
+        return (rounds[-1]["prompt"] if rounds else "creation prompt"), False
+
     def resumes_with_lesson_history(self, room_id, *, lineage):
         self.history_asked.append((room_id, lineage))
         value = self.history.get(lineage, False)

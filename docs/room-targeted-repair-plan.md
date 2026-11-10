@@ -1,7 +1,9 @@
 # Targeted room repair: design for #173
 
-Status: **APPROVED** 2026-11-09, not implemented. Baseline: main @ `132e6c4`. The proposed
-answers in section 14 are the approved ones. Implementation follows #171 on the roadmap.
+Status: **APPROVED** 2026-11-09. PR 1 (section 9) is implemented; the rest is not. Baseline:
+main @ `132e6c4`, before #273 changed what a retained worktree holds. Where that moved a
+decision, the section says so. The proposed answers in section 14 are the approved ones, except
+where decision 5 says otherwise.
 Issue: [#173](https://github.com/memtomem/syncmill/issues/173). Semantic boundary:
 [ADR-0005](adr/adr-0005-evidence-first-review.md).
 
@@ -24,18 +26,29 @@ Non-goals:
 
 All of these ran on fake agents in a sandbox, on the locked environment.
 
-**A retained worktree does not hold its candidate's bytes.** `run_round` captures the
-patch and then runs the gate in the same worktree. With a gate that writes a file:
+**A retained worktree did not hold its candidate's bytes, at this baseline.** `run_round`
+captured the patch and then ran the gate in the same worktree. With a gate that writes a file:
 
 | Round | Patch digest | `files_changed` | Gate |
 | --- | --- | --- | --- |
 | 1 | `e04af41017` | `calc.py` | passed |
 | 2 (the agent changed nothing) | `f1a6bd1257` | `calc.py`, `gate-debris.txt` | passed |
 
-Round 2's candidate carries a file no agent wrote, and applying it put that file in the
-source. This is an existing defect, [#268](https://github.com/memtomem/syncmill/issues/268).
-A `python3 -m unittest` gate did not leak `__pycache__` in the same setup, because macOS's
-system Python writes bytecode to `sys.pycache_prefix`.
+Round 2's candidate carried a file no agent wrote, and applying it put that file in the
+source. This was [#268](https://github.com/memtomem/syncmill/issues/268). A `python3 -m unittest`
+gate did not leak `__pycache__` in the same setup, because macOS's system Python writes bytecode
+to `sys.pycache_prefix`.
+
+**#273 fixed that, and it changes what a repair must do.** Measured after it, with fake agents, one
+member, and an agent writing `calc.py`, `.gitignore` (`.venv/`) and `.venv/agent-dep`:
+
+| The gate writes | Tree digest equals the candidate's | `.venv/agent-dep` | `workspace.rebuilt` |
+| --- | --- | --- | --- |
+| only an ignored file | yes | kept | no |
+| `gate-debris.txt` | yes | gone | yes, at the end of that round |
+
+So a retained worktree now holds its candidate unless a later failed or timed-out attempt changed
+it, and section 5.2 rebuilds only then.
 
 **A candidate's tree can be rebuilt at the same path.** The worktree held an agent commit,
 a binary change, a mode change, a delete, a rename, a symlink change, a file with no
@@ -61,8 +74,25 @@ round 2 asks for the codeword without stating it. The control round passes `--fr
 | Codex | `resume`, codeword returned | unchanged | `UNKNOWN` |
 
 In both resumed runs, `note.txt` held both rounds' lines, a file left in the old checkout was
-gone, and the rebuilt digest equalled the candidate's. Kimi Code was not measured, and this
-used existing `room round` with the rebuild run by a script, since no targeted round exists yet.
+gone, and the rebuilt digest equalled the candidate's. This used existing `room round` with the
+rebuild run by a script, since no targeted round existed yet.
+
+**`room repair` itself, with real providers.** Claude Code 2.1.319, Codex CLI 0.167.0 and Kimi Code 2.5.2,
+in one-member rooms with a gate, on macOS, 8 provider launches in all. Round 1's prompt holds a
+random codeword. A file is then left in the checkout, so the repair must rebuild it:
+
+| Provider | Session | `workspace.rebuilt` | That file at launch, or in the patch | Codeword | Time |
+| --- | --- | --- | --- | --- | --- |
+| Claude | `resume` | 1 | no | returned | 12.1 s |
+| Codex | `resume` | 1 | no | returned | 21.4 s |
+| Kimi Code | `resume` | 1 | no | returned | 24.4 s |
+
+Each repair was one launch of that provider, and its candidate passed the gate.
+
+- A further Claude repair with a matching checkout: no `workspace.rebuilt`, and an ignored file
+  left in the checkout was still there.
+- Codex with an unknown stored session id: a `failed` candidate in 2.5 s and no fallback to a new
+  conversation. The room stayed `awaiting_decision`, and `--cold --preview` on the parent worked.
 
 **Hooks.** With `post-index-change` and `post-checkout` hooks in the control repository:
 
@@ -203,33 +233,37 @@ Checked in `preflight_round` and again inside `start_round`'s transaction:
 
 ### 5.2 Starting tree
 
-After the lease is held and before any prompt is built, the target's checkout is rebuilt
-from the parent's patch, at the path and branch its `room_workspaces` row records:
+After the lease is held and before any prompt is built, the target's checkout is compared with
+the parent's patch through `capture_changes`. If they match, the checkout is kept. If they differ,
+which is what a failed attempt since the parent leaves, or if the capture fails, `rebuild_worktree`
+replaces it at the path and branch its `room_workspaces` row records:
 
 ```text
+rehearse the patch on a scratch checkout, then remove it
 cleanup_worktree(control, worktree)
-git -c core.hooksPath=/dev/null worktree add -b <branch> <path> <base>
-git -c core.hooksPath=/dev/null apply --binary -   (skipped for an empty patch)
-capture_changes(worktree, base)  must have the parent's digest
+git worktree add -b <branch> <path> <base>
+git apply --binary -   (skipped for an empty patch)
+capture_changes(worktree, base)  must have the parent's patch
 ```
 
-The `worktree add` and `apply` steps move out of `WorktreePool.acquire` into one helper that
-both call, so repair and `branch-from` share a recipe. A mismatch or any failure goes to the
-existing recovery path before a provider starts. Nothing is lost, since the parent's patch is
-in its artifact.
+`branch-from` shares the `worktree add` and `apply` steps through `_checkout_from_patch`. A
+mismatch or any failure goes to the existing recovery path before a provider starts. Nothing is
+lost, since the parent's patch is in its artifact.
 
-**The cost: ignored files do not survive.** Installed dependencies and caches an agent or gate
-left in the checkout are gone, as they are after `branch-from`. A gate that relies on them can
-fail on the repair until the agent reinstalls them. The preview states this.
+**The cost of a rebuild: ignored files do not survive it.** Installed dependencies and caches an
+agent or gate left in the checkout are gone, as they are after `branch-from`. A gate that relies on
+them can fail on the repair until the agent reinstalls them. A kept checkout holds them, so the
+preview and the prompt say these files may be missing, and neither says which: the prompt's
+digest is bound by the plan, so it stays one string.
 
 **What the digest check proves.** The tree is patch-equivalent to the parent as
 `capture_changes` sees it, and that is all `apply` ever consumes. It does not prove byte
 equality for content a clean or smudge filter hides from Git. Filters come from repository
 configuration an agent could write, and the rebuild does not defend against that, matching the
 stated trust model: the state root blocks traversal and redirection, not a same-credential
-actor. The flag stops hooks during `worktree add` and `apply` only. It does not make the control
-repository trusted, and the final `capture_changes` still runs hooks until that is fixed
-separately.
+actor. An earlier draft passed `-c core.hooksPath=/dev/null` to `worktree add` and `apply`. #273
+dropped that: `capture_changes` still runs hooks, so partial coverage only looks safer, and all
+hook work belongs to #269.
 
 Only the target's checkout is touched, and its path is unchanged, which keeps provider sessions
 affine to it. Every member's workspace metadata is still validated, but only the target must be
@@ -264,8 +298,8 @@ of memory:
 - The agent's task section is rendered at round start from the plan's feedback records:
 
 ```text
-Repair your candidate CAND. Your working tree was rebuilt from exactly that
-candidate's patch. Ignored files, such as installed dependencies, are not there.
+Repair your candidate CAND. Your working tree holds exactly that candidate's
+patch. Ignored files, such as installed dependencies, may be missing.
 
 Change requests:
 1. [calc.py] ...
@@ -275,8 +309,9 @@ Questions (answer these in your response):
 ```
 
 The rendering is deterministic, and its digest is recorded (section 5.5), so a preview,
-its confirmation and the worker agree on the bytes. A batch that does not fit
-`_ROOM_PROMPT_MAX_BYTES` beside the selected lessons is refused at preview, never cut.
+its confirmation and the worker agree on the bytes. A task or batch that does not fit
+`_ROOM_PROMPT_MAX_BYTES` beside the selected lessons is refused at preview, never cut, including
+with no lessons at all: such a task would otherwise first fail after the lease.
 Lessons work as they do in `room round`, including `--skip-lesson` and `--no-lessons`.
 
 By default the batch is the candidate's `open` requests. `--feedback ID` (repeatable)
@@ -340,7 +375,9 @@ SHA-256 of the canonical JSON, following `room_raw.preview_token`:
 - candidate id, patch and output digests
 - member, provider, and the provider's effective execution settings as a digest of its
   `agent_config`, which covers timeouts and turn limits
-- session mode and a digest of the stored session id
+- session mode, a digest of the stored session id, `--cold`, and whether conversations are on.
+  With conversations off and a stored session, `--cold` and no `--cold` share a mode and a digest
+  but differ in whether the session is dropped
 - each feedback id with its record digest and derived status
 - the rendered task digest, lesson ids, and gate settings
 - a provider call count of 1
@@ -408,7 +445,8 @@ Each PR is usable alone and gets the implementation cross-review.
    detached path with its `repair.refused` event (section 6).
 5. **Hunk anchors,** only if #190's evidence asks for them.
 
-Implementation stays behind #171 under the roadmap's order; this design need not.
+The maintainer started implementation on 2026-11-09, once #171's first delivery had shipped. What
+is left on #171 (a Linux smoke, the human pilot, a TUI entry) does not block this.
 
 ## 10. Compatibility
 
@@ -422,11 +460,10 @@ Implementation stays behind #171 under the roadmap's order; this design need not
 
 ## 11. Separate from this design
 
-Both are existing behaviour, and this design fixes neither.
+This design fixes neither.
 
-- **[#268](https://github.com/memtomem/syncmill/issues/268): gate debris.** A gate's files enter
-  a `continue-own` round's next patch, and every `run` strategy's winner patch. Repair is immune
-  because it rebuilds first.
+- **[#268](https://github.com/memtomem/syncmill/issues/268): gate debris.** Fixed by #273, after
+  this design was written.
 - **[#269](https://github.com/memtomem/syncmill/issues/269): repository-local hooks run during
   capture.** `isolated_git_env` strips ambient configuration but not hooks in the control
   repository, so `capture_changes` runs them after an agent's turn.
@@ -487,6 +524,8 @@ Both are existing behaviour, and this design fixes neither.
    `recovery_required` like any round, so a good earlier candidate can no longer be selected. A
    lease-safe recovery back to `awaiting_decision` would help every round type, which makes it
    its own change rather than part of this one.
-5. **Ignored files on repair.** Proposed: accept the loss, matching `branch-from`, and state it
+5. **Ignored files on repair.** Approved: accept the loss, matching `branch-from`, and state it
    in the preview and the agent's prompt. Claude and Codex resume across the rebuild (section 2).
-   Kimi Code still needs measuring before PR 1 merges.
+   So does Kimi Code, measured for PR 1. #273 narrowed this: the loss now happens only when a
+   rebuild does (section 5.2), so a smoke of the resume must force a mismatch first, since an
+   ordinary retained tree is kept.
