@@ -150,26 +150,28 @@ def main() -> None:
     # A tmux socket path may not exceed ~104 bytes: a short directory of its own.
     sockets = Path(tempfile.mkdtemp(prefix="smss.", dir="/tmp"))
     socket_path = sockets / "s"
+    box = Path(tempfile.mkdtemp()).resolve()
     stopped = False
     try:
         hook_files[0].write_text(CRASH_HOOK, encoding="utf-8")
         hook_files[1].write_text(f"import {HOOK_MODULE}\n", encoding="utf-8")
-        with tempfile.TemporaryDirectory() as tmp:
-            try:
-                _generate(Path(tmp).resolve(), real_tmux, socket_path, syncmill, version, out)
-            finally:
-                # Before the box goes: the agents run inside it.
-                stopped = _stop_private_server(real_tmux, socket_path)
+        try:
+            _generate(box, real_tmux, socket_path, syncmill, version, out)
+        finally:
+            # Before the box goes: the agents run inside it.
+            stopped = _stop_private_server(real_tmux, socket_path)
     finally:
         for path in hook_files:
             path.unlink(missing_ok=True)
         if stopped:
+            shutil.rmtree(box, ignore_errors=True)
             shutil.rmtree(sockets, ignore_errors=True)
-        else:
-            sys.stderr.write(
-                f"the private tmux server may still run; stop it with "
-                f"`tmux -S {socket_path} kill-server`\n"
-            )
+    if not stopped:
+        # Nothing is removed while agents may still run in the box.
+        sys.exit(
+            f"the private tmux server did not stop; stop it with "
+            f"`tmux -S {socket_path} kill-server`, then remove {box} and {sockets}"
+        )
 
 
 def _stop_private_server(real_tmux: str, socket_path: Path) -> bool:

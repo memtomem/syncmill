@@ -473,13 +473,17 @@ def test_close_the_conversation_of_a_released_checkpoint(release, tmp_path, monk
     frozen = Frozen(release, "checkpointed", tmp_path, monkeypatch)
     run_id, run_dir = _checkpoint(frozen)
     before = json.loads((run_dir / "manifest.json").read_text())
+    stamp = "2031-01-01T00:00:00+00:00"
+    monkeypatch.setattr("syncmill.artifacts._now", lambda: stamp)
     closed = frozen.cli("conversations", "close", run_id)
     assert closed.exit_code == 0, closed.output
     after = json.loads((run_dir / "manifest.json").read_text())
     # Closing needs no provider session: only the flag and the stamp move.
     changed = {k for k in {*before, *after} if before.get(k) != after.get(k)}
     assert changed == {"conversation_closed", "updated_at"}
-    assert (after["conversation_closed"], after["state"]) == (True, "pending")
+    assert (after["conversation_closed"], after["state"], after["updated_at"]) == (
+        True, "pending", stamp
+    )
     assert frozen.document()["checkpoints"] == [run_id]
 
 
@@ -548,6 +552,8 @@ def test_the_released_config_loads_as_written(release, tmp_path, monkeypatch):
     written = tomllib.loads((repo / "syncmill.toml").read_text())
     _, config = load_project_config(repo)
     assert config.project.id == written["project"]["id"] == bindings["marker"]["id"]
+    assert config.config_version == written["config_version"]
+    assert config.project.memory_dir == written["project"]["memory_dir"]
     assert config.default_strategy == written["default_strategy"]
     assert config.gate.commands == written["gate"]["commands"]
     assert Path(config.repo_root).resolve() == repo.resolve()
