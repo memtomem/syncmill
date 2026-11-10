@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "goal": "fix add",
+  "nodes": [
+    {
+      "id": "draft",
+      "agent": "codex",
+      "prompt": "draft the fix",
+      "needs": [],
+      "timeout_seconds": null,
+      "max_attempts": 1
+    },
+    {
+      "id": "fix",
+      "agent": "kimi-code",
+      "prompt": "apply the fix",
+      "needs": [
+        "draft"
+      ],
+      "timeout_seconds": null,
+      "max_attempts": 1
+    }
+  ],
+  "final_node": "fix"
+}

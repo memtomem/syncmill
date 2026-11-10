@@ -1,0 +1,27 @@
+{
+  "status": "completed",
+  "agent_id": "codex",
+  "output": "codex (fake) fix.",
+  "error": null,
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "files_changed": [
+    "calc.py"
+  ],
+  "gate": null,
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "bundle_version": 3,
+  "workflow_id": "wf-3a0e23f792ce42d7",
+  "node_id": "draft",
+  "lease_id": "40d12bc54e174ed59233a2ab26cb6e52",
+  "attempt": 1,
+  "spec_sha256": "977294d3defa4f3167fefdc2a3c8150025d683c5e39bb848336df5919c134283",
+  "usage": {
+    "total_input_tokens": 1,
+    "output_tokens": 1,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": null,
+    "total_cost_usd": null
+  }
+}
