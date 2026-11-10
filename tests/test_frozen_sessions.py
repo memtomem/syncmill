@@ -36,7 +36,7 @@ from syncmill.cli import cli
 from syncmill.worktree import fingerprint_version, repository_fingerprint
 
 FROZEN = Path(__file__).parent / "fixtures" / "persisted" / "sessions"
-RELEASES = sorted(p.name for p in FROZEN.iterdir() if p.is_dir())
+RELEASES = sorted(p.parent.name for p in FROZEN.glob("v*/bindings.json"))
 
 #: scenario -> (state, revision) the release left its session in.
 SCENARIOS = {
@@ -99,6 +99,8 @@ class Frozen:
         monkeypatch.setenv("SYNCMILL_PROJECT__ID", self.facts["project_id"])
         stored = self.facts["source_fingerprint"]
         self.fingerprint = repository_fingerprint(self.repo, like=stored)
+        # Recomputed in the stored value's own version, never upgraded.
+        assert fingerprint_version(self.fingerprint) == fingerprint_version(stored) == 1
         self._install()
 
     def _rebound(self, data: bytes, *, paths: int) -> bytes:
@@ -443,6 +445,11 @@ def test_apply_a_released_checkpoint(release, tmp_path, monkeypatch, no_tmux):
     applied = frozen.cli("apply", run_id)
     assert applied.exit_code == 0, applied.output
     assert (frozen.repo / "calc.py").read_text() == FIXED
+    manifest = store.load(run_id).manifest
+    assert manifest["state"] == "applied"
+    [receipt] = (store.root / run_id / "applications").glob("*.json")
+    assert json.loads(receipt.read_text())["run_id"] == run_id
+    assert json.loads(receipt.read_text())["apply_id"] == manifest["apply_id"]
     assert frozen.document()["checkpoints"] == [run_id]
 
 

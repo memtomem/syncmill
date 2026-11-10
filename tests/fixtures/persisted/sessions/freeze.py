@@ -150,17 +150,40 @@ def main() -> None:
     # A tmux socket path may not exceed ~104 bytes: a short directory of its own.
     sockets = Path(tempfile.mkdtemp(prefix="smss.", dir="/tmp"))
     socket_path = sockets / "s"
+    stopped = False
     try:
         hook_files[0].write_text(CRASH_HOOK, encoding="utf-8")
         hook_files[1].write_text(f"import {HOOK_MODULE}\n", encoding="utf-8")
         with tempfile.TemporaryDirectory() as tmp:
-            _generate(Path(tmp).resolve(), real_tmux, socket_path, syncmill, version, out)
+            try:
+                _generate(Path(tmp).resolve(), real_tmux, socket_path, syncmill, version, out)
+            finally:
+                # Before the box goes: the agents run inside it.
+                stopped = _stop_private_server(real_tmux, socket_path)
     finally:
         for path in hook_files:
             path.unlink(missing_ok=True)
-        subprocess.run([real_tmux, "-S", str(socket_path), "kill-server"],
-                       capture_output=True)
-        shutil.rmtree(sockets, ignore_errors=True)
+        if stopped:
+            shutil.rmtree(sockets, ignore_errors=True)
+        else:
+            sys.stderr.write(
+                f"the private tmux server may still run; stop it with "
+                f"`tmux -S {socket_path} kill-server`\n"
+            )
+
+
+def _stop_private_server(real_tmux: str, socket_path: Path) -> bool:
+    """Kill the private server and prove it is gone: a server that answers
+    `list-sessions` afterwards still runs agents."""
+    subprocess.run([real_tmux, "-S", str(socket_path), "kill-server"], capture_output=True)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        probe = subprocess.run([real_tmux, "-S", str(socket_path), "list-sessions"],
+                               capture_output=True)
+        if probe.returncode != 0:
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def _generate(box: Path, real_tmux: str, socket_path: Path, syncmill: Path, version: str,
