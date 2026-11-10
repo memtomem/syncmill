@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "run_id": "0cee9417-5b05-42bb-8bde-7c63723a586d",
+  "project_id": "frozen-sessions-closed",
+  "parent_run_id": null,
+  "created_at": "2026-11-10T01:17:59.181256+00:00",
+  "updated_at": "2026-11-10T01:17:59.182352+00:00",
+  "state": "pending",
+  "repo_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmpfeuw_bsz/repo",
+  "source_fingerprint": "c605ecdc0a3f4df5822c04269e4815c7d3395a26938e4dce93fe3fb0ef1a0d59",
+  "snapshot_commit": "64956ea9ad256d624b9622f28900d3c6eb25c138",
+  "task_id": "54f7402f-ca50-4eb5-b01a-d7208f3a0892",
+  "prompt": "Interactive session checkpoint 74f2b6e8-d34b-4223-b0b8-81ba8a984566",
+  "strategy": "interactive",
+  "agents": [
+    "codex"
+  ],
+  "plan": {
+    "origin": "isolated-session",
+    "session_id": "74f2b6e8-d34b-4223-b0b8-81ba8a984566"
+  },
+  "agent_id": "codex",
+  "files_changed": [
+    "calc.py"
+  ],
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "provider_session_id": null,
+  "conversation_id": null
+}

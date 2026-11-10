@@ -1,0 +1,10 @@
+config_version = 2
+repo_root = "."
+default_strategy = "route"
+
+[project]
+id = "7d66bc69-1bf8-442c-8332-22fddc302ded"
+memory_dir = ".syncmill/memory"
+
+[gate]
+commands = []

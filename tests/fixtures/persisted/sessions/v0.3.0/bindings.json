@@ -1,0 +1,72 @@
+{
+  "release": "0.3.0",
+  "box_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp6z2ca2fi",
+  "tree": {
+    "calc.py": "def add(a, b):\n    return a - b\n",
+    "syncmill.toml": "config_version = 2\nrepo_root = \".\"\ndefault_strategy = \"route\"\n\n[project]\nid = \"7d66bc69-1bf8-442c-8332-22fddc302ded\"\nmemory_dir = \".syncmill/memory\"\n\n[gate]\ncommands = []\n"
+  },
+  "marker": {
+    "id": "7d66bc69-1bf8-442c-8332-22fddc302ded",
+    "mode": "0o600"
+  },
+  "scenarios": {
+    "open": {
+      "project_id": "frozen-sessions-open",
+      "session_id": "dc058eaf-be75-4c09-bdad-c0c1fff90ce1",
+      "agent_id": "codex",
+      "state": "open",
+      "revision": 1,
+      "source_fingerprint": "53c966b60bfbf5b8ce599a63f3798c468fb862b463df5c15f488a176b1d04c0a",
+      "checkpoints": []
+    },
+    "checkpointed": {
+      "project_id": "frozen-sessions-checkpointed",
+      "session_id": "2be035d6-c596-4a41-89e9-899f58d83405",
+      "agent_id": "codex",
+      "state": "open",
+      "revision": 2,
+      "source_fingerprint": "53c966b60bfbf5b8ce599a63f3798c468fb862b463df5c15f488a176b1d04c0a",
+      "checkpoints": [
+        "9981a2fe-6428-4fa0-bc06-cbde114bba0b"
+      ]
+    },
+    "closed": {
+      "project_id": "frozen-sessions-closed",
+      "session_id": "5d175919-72c9-4c03-a994-e8a2e91650aa",
+      "agent_id": "codex",
+      "state": "closed",
+      "revision": 4,
+      "source_fingerprint": "53c966b60bfbf5b8ce599a63f3798c468fb862b463df5c15f488a176b1d04c0a",
+      "checkpoints": [
+        "070b81f0-44cf-414e-9d06-1b98a5a9bf68"
+      ]
+    },
+    "creating": {
+      "project_id": "frozen-sessions-creating",
+      "session_id": "3f0564ec-577d-4af7-8377-2c0588ded520",
+      "agent_id": "codex",
+      "state": "creating",
+      "revision": 0,
+      "source_fingerprint": "53c966b60bfbf5b8ce599a63f3798c468fb862b463df5c15f488a176b1d04c0a",
+      "checkpoints": []
+    },
+    "closing": {
+      "project_id": "frozen-sessions-closing",
+      "session_id": "0928a925-a3d4-4707-98f7-1d5b1214234c",
+      "agent_id": "codex",
+      "state": "closing",
+      "revision": 2,
+      "source_fingerprint": "53c966b60bfbf5b8ce599a63f3798c468fb862b463df5c15f488a176b1d04c0a",
+      "checkpoints": []
+    },
+    "recovery-required": {
+      "project_id": "frozen-sessions-recovery-required",
+      "session_id": "e4a9c0f5-5819-4afb-a208-a2d8e1cf7475",
+      "agent_id": "codex",
+      "state": "recovery_required",
+      "revision": 3,
+      "source_fingerprint": "53c966b60bfbf5b8ce599a63f3798c468fb862b463df5c15f488a176b1d04c0a",
+      "checkpoints": []
+    }
+  }
+}

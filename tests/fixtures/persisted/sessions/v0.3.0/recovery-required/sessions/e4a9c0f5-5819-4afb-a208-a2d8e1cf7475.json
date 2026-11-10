@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "session_id": "e4a9c0f5-5819-4afb-a208-a2d8e1cf7475",
+  "project_id": "frozen-sessions-recovery-required",
+  "repo_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp6z2ca2fi/repo",
+  "agent_id": "codex",
+  "state": "recovery_required",
+  "tmux_name": "syncmill-p-frozen-s-codex-e4a9c0f5",
+  "run_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp6z2ca2fi/state/workspaces/session-e4a9c0f5-5819-4afb-a208-a2d8e1cf7475",
+  "control_repo": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp6z2ca2fi/state/workspaces/session-e4a9c0f5-5819-4afb-a208-a2d8e1cf7475/control",
+  "worktree_path": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp6z2ca2fi/state/workspaces/session-e4a9c0f5-5819-4afb-a208-a2d8e1cf7475/worktrees/codex-session--0",
+  "worktree_branch": "syncmill/codex/session--0",
+  "base_commit": "86ca80d99c70edd6ddc07ee769f6c2b4d8a72cbf",
+  "source_fingerprint": "53c966b60bfbf5b8ce599a63f3798c468fb862b463df5c15f488a176b1d04c0a",
+  "source_head": "14038757ec6e6a6a192990e4a9d05ccdd002e46e",
+  "checkpoints": [],
+  "revision": 3,
+  "created_at": "2026-11-10T01:18:09.472679+00:00",
+  "updated_at": "2026-11-10T01:18:10.071579+00:00"
+}
