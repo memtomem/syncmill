@@ -17,7 +17,11 @@ legacy identity fields remain readable without migration or read-time writes.
 Unsafe access raises `ArtifactError`; listings continue to omit invalid records, and `list_detailed` reports each omitted directory or symlink entry as a `SkippedRun` (the raw name plus a fixed reason category — never a path or manifest content; render names through `printable_name`, since run ids may carry control characters) so `runs list`/`conversations list` (a stderr notice) and the TUI Artifacts pane (`DEGRADED: N unreadable`) never present a corrupt-only store as a healthy empty one (#170). A skipped entry is never repaired, reset or pruned, and a runs root replaced mid-enumeration (`ESTALE` on the root) still raises instead of being misfiled as per-run damage.
 Use `read_result` for result sidecars instead of reopening `RunArtifact.path`.
 Apply/check/rollback pass the same digest-verified patch bytes to Git over stdin,
-including non-UTF8 data, rather than reopening a mutable patch path. Existing
+including non-UTF8 data, rather than reopening a mutable patch path. Every
+`git apply` argv comes from `worktree.git_apply_argv`, which fixes
+`--whitespace=nowarn` so the user's `apply.whitespace` can neither rewrite the
+bytes (`fix`) nor refuse them (`error`); working-tree conversions such as
+`core.autocrlf` still apply, as to any checkout of that repository. Existing
 CAS, lock ordering, rollback and manual-recovery semantics remain in force.
 
 The configured state root and its ancestors are trusted. This boundary prevents

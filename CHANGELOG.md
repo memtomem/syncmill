@@ -118,6 +118,14 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Your Git `apply.whitespace` setting no longer rewrites or refuses the stored
+  patch in `apply`, its `--verify` check or its rollback. With
+  `apply.whitespace=fix`, Git stripped trailing whitespace from the lines it
+  added and still reported success, so your source got something other than the
+  reviewed patch, and a rollback could leave the source unrestored and the run
+  frozen for manual recovery. With `error`, a patch that adds such a line was
+  refused. The same holds for a continued run's or Room member's checkout rebuilt
+  from a stored patch.
 - A detached job whose control socket cannot be created is now refused at launch
   (#275). `apply --detach` printed `detached artifact-apply job ...` and exited 0
   while the job died at once, for example when `TMPDIR` made the socket path too long
