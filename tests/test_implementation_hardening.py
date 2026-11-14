@@ -55,7 +55,7 @@ def test_private_patch_index_roundtrips_and_preserves_real_index(git_repo, tmp_p
     (git_repo / 'line\nbreak.txt').write_bytes(b'\xffnot utf8\n')
     before = (git_repo / '.git/index').read_bytes()
     (git_repo / '.git/index.lock').touch()
-    captured = W.capture_changes(git_repo)
+    captured = W.capture_changes(git_repo, git_dir=None)
     assert (git_repo / '.git/index').read_bytes() == before
     assert set(captured.files) == {'remove.txt', 'binary', 'line\nbreak.txt'}
     target = tmp_path / 'target'
@@ -78,7 +78,7 @@ def test_patch_command_failure_is_never_empty_patch(git_repo, monkeypatch, comma
 
     monkeypatch.setattr(W, '_run_git', failing)
     with pytest.raises(W.PatchCaptureError, match='capture timeout'):
-        W.capture_changes(git_repo)
+        W.capture_changes(git_repo, git_dir=None)
 
 
 def test_supervisor_retains_failed_capture_and_does_not_share(git_repo, tmp_path, monkeypatch):
@@ -119,7 +119,7 @@ def test_missing_patch_rejected_but_explicit_noop_saved(git_repo, tmp_path):
     with pytest.raises(ArtifactError, match='mandatory patch'):
         store.save(run_id='missing', **kwargs)
     assert not (store.root / 'missing').exists()
-    result.patch = W.capture_changes(git_repo).patch
+    result.patch = W.capture_changes(git_repo, git_dir=None).patch
     assert result.patch == ''
     assert store.save(run_id='noop', **kwargs).manifest['state'] == 'no_changes'
 

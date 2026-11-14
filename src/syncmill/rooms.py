@@ -66,6 +66,7 @@ from syncmill.worktree import (
     like_stored,
     rebuild_worktree,
     repository_fingerprint,
+    trusted_admin_dir,
 )
 
 
@@ -5162,6 +5163,11 @@ class RoomCoordinator:
                 require_live=True,
                 live_members=None if target is None else {target.member_id},
             )
+            live = (
+                {value["member_id"] for value, _, _ in validated}
+                if target is None
+                else {target.member_id}
+            )
             retained_worktrees = {
                 value["member_id"]: Worktree(
                     path=worktree_path,
@@ -5169,8 +5175,15 @@ class RoomCoordinator:
                     agent_id=value["member_id"],
                     is_git=True,
                     base_commit=value["base_commit"],
+                    # Bound from the control side, never from the worktree's
+                    # own `.git`, which the member's agent can rewrite (#269).
+                    git_dir=(
+                        trusted_admin_dir(control_repo, worktree_path)
+                        if value["member_id"] in live
+                        else None
+                    ),
                 )
-                for value, _, worktree_path in validated
+                for value, control_repo, worktree_path in validated
             }
             source_fingerprint = room["source_fingerprint"]
             snapshot_commit = room["snapshot_commit"]
@@ -5465,7 +5478,11 @@ class RoomCoordinator:
                 zip(members, results, worktrees), 1
             ):
                 base = worktree.base_commit
-                changes = capture_changes(worktree.path, base)
+                if worktree.git_dir is None:
+                    # Every room worktree comes from a control repository; an
+                    # unbound one would let Git read the member's own `.git`.
+                    raise RoomError(f"room worktree {worktree.path} has no trusted Git binding")
+                changes = capture_changes(worktree.path, base, git_dir=worktree.git_dir)
                 files, patch = list(changes.files), changes.patch
                 report = (
                     gate.evaluate(worktree)
@@ -5559,7 +5576,11 @@ class RoomCoordinator:
         something else is never reused.
         """
         try:
-            unchanged = capture_changes(worktree.path, worktree.base_commit).patch == patch
+            if worktree.git_dir is None:
+                raise RoomError(f"room worktree {worktree.path} has no trusted Git binding")
+            unchanged = capture_changes(
+                worktree.path, worktree.base_commit, git_dir=worktree.git_dir
+            ).patch == patch
         except PatchCaptureError:
             unchanged = False
         if unchanged:
@@ -5841,22 +5862,33 @@ class RoomCoordinator:
                     for path in (run_root, control_repo, control_git, worktrees_root, worktree_path)
                 ):
                     raise RoomError("retained room workspace is missing or invalid")
+                # The binding comes from the control side (#269); the worktree's
+                # own marker, which the member's agent can rewrite, is only
+                # compared with it so a tampered workspace still fails closed.
+                # Nothing read from the marker is used to run Git.
+                try:
+                    expected = trusted_admin_dir(control_repo, worktree_path)
+                except WorkspaceError as exc:
+                    raise RoomError(
+                        "retained room workspace Git binding is invalid"
+                    ) from exc
                 if git_marker.is_symlink() or not git_marker.is_file():
                     raise RoomError("retained room workspace Git binding is invalid")
                 try:
                     marker = git_marker.read_text(encoding="utf-8").strip()
-                    marker_prefix = "gitdir: "
-                    if not marker.startswith(marker_prefix):
-                        raise ValueError("invalid gitdir marker")
-                    gitdir = self._resolved_owned_path(marker[len(marker_prefix) :])
-                except (OSError, UnicodeError, ValueError) as exc:
+                except (OSError, UnicodeError) as exc:
                     raise RoomError(
                         "retained room workspace Git binding is invalid"
                     ) from exc
-                if (
-                    gitdir.parent != control_git / "worktrees"
-                    or not gitdir.is_dir()
-                ):
+                marker_prefix = "gitdir: "
+                if not marker.startswith(marker_prefix):
+                    raise RoomError("retained room workspace Git binding is invalid")
+                # Git writes a relative target under worktree.useRelativePaths,
+                # relative to the worktree.
+                target_dir = os.path.normpath(
+                    os.path.join(worktree_path, marker[len(marker_prefix) :])
+                )
+                if target_dir != os.path.normpath(expected):
                     raise RoomError("retained room workspace Git binding is invalid")
             validated.append((value, control_repo, worktree_path))
         return room, validated

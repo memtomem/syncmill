@@ -34,6 +34,7 @@ from syncmill.session import (
 )
 from syncmill.worktree import (
     PatchCaptureError,
+    WorkspaceError,
     capture_changes,
     Worktree,
     WorktreePool,
@@ -43,6 +44,7 @@ from syncmill.worktree import (
     fingerprint_version,
     like_stored,
     repository_fingerprint,
+    trusted_admin_dir,
 )
 
 try:  # Isolated interactive sessions are POSIX/tmux today; keep import graceful.
@@ -91,12 +93,22 @@ class IsolatedSessionError(RuntimeError):
     """A project-scoped isolated session operation failed."""
 
 
-def _strict_checkpoint_patch(workdir: Path, base_commit: str) -> tuple[list[str], str]:
-    """Capture a complete binary patch without touching the session's real index."""
+def _strict_checkpoint_patch(
+    workdir: Path, base_commit: str, control_repo: Path
+) -> tuple[list[str], str]:
+    """Capture a complete binary patch without touching the session's real index.
+
+    Git is bound to the worktree's admin directory found from the control side,
+    never to the worktree's own ``.git``: the interactive agent may still be
+    running and rewriting it (#269).
+    """
     try:
-        changes = capture_changes(workdir, base_commit)
+        git_dir = trusted_admin_dir(control_repo, workdir)
+        changes = capture_changes(workdir, base_commit, git_dir=git_dir)
     except PatchCaptureError as exc:
         raise IsolatedSessionError(str(exc)) from exc
+    except WorkspaceError as exc:
+        raise IsolatedSessionError(f"isolated worktree Git binding is invalid: {exc}") from exc
     return list(changes.files), changes.patch
 
 
@@ -389,7 +401,9 @@ class IsolatedSessionStore:
             if not workdir.is_dir():
                 raise IsolatedSessionError("isolated worktree is missing")
             base = value["base_commit"]
-            files, patch = _strict_checkpoint_patch(workdir, base)
+            files, patch = _strict_checkpoint_patch(
+                workdir, base, Path(value["control_repo"])
+            )
             task = Task(prompt=f"Interactive session checkpoint {session_id}")
             result = TaskResult(
                 task_id=task.id,

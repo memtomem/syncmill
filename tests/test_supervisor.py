@@ -269,7 +269,7 @@ def test_route_winner_files_changed_from_its_own_worktree(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
         "syncmill.strategies.base.capture_changes",
-        lambda p, base=None: CapturedChanges(tuple(sorted({"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"})), ""),
+        lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"})), ""),
     )
     r = _run_route([a, b], FakeMemory(), pool=pool)
     assert r.files_changed == ["codex_only.py"]
@@ -339,7 +339,7 @@ def test_route_gate_failure_skips_files_changed(monkeypatch):
     # a rejected result must not carry a files_changed diff (it wasn't accepted)
     a = FakeAgent("claude", status=TaskStatus.COMPLETED)
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"should_not_appear.py"})), ""))
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"should_not_appear.py"})), ""))
     r = _run_route([a], FakeMemory(), gate=FakeGate(passes=False), pool=pool)
     assert r.status is TaskStatus.FAILED
     assert r.files_changed == []
@@ -692,7 +692,7 @@ def test_pipeline_shares_single_worktree_across_stages():
 
 def test_pipeline_sets_files_changed_on_final(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
     a = FakeAgent("claude", output="s1")
     b = FakeAgent("codex", output="s2")
     r = _run_pipeline([a, b], FakeMemory(), pool=pool)
@@ -718,7 +718,7 @@ def test_pipeline_gates_only_the_final_stage():
 
 def test_pipeline_final_gate_failure_fails_the_chain(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
     a = FakeAgent("claude", output="s1")
     b = FakeAgent("codex", output="s2")
     r = _run_pipeline([a, b], FakeMemory(), gate=FakeGate(passes=False), pool=pool)
@@ -732,7 +732,7 @@ def test_pipeline_no_gate_collects_files(monkeypatch):
     # explicit gate=None (disabled): the final result is untouched and its diff
     # is collected, exactly as before gates existed.
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
     a = FakeAgent("claude", output="s1")
     b = FakeAgent("codex", output="s2")
     r = _run_pipeline([a, b], FakeMemory(), gate=None, pool=pool)
@@ -836,7 +836,7 @@ def test_compete_winner_pairing_survives_out_of_order_completion(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
         "syncmill.strategies.base.capture_changes",
-        lambda p, base=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
+        lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
     )
     r = _run_compete([a, b], FakeMemory(), pool=pool)
     assert r.agent_id == "claude"  # priority winner, despite finishing last
@@ -873,7 +873,7 @@ def test_compete_winner_files_changed_from_its_own_worktree(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
         "syncmill.strategies.base.capture_changes",
-        lambda p, base=None: CapturedChanges(tuple(sorted({"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"})), ""),
+        lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"})), ""),
     )
     r = _run_compete([a, b], FakeMemory(), pool=pool)
     assert r.files_changed == ["codex_only.py"]
@@ -1021,7 +1021,7 @@ def stub_gate_capture(monkeypatch):
     """``_gate_accepts`` captures before gating, and these worktrees are not repos."""
     monkeypatch.setattr(
         "syncmill.strategies.base.capture_changes",
-        lambda path, base=None: CapturedChanges((), ""),
+        lambda path, base=None, *, git_dir=None: CapturedChanges((), ""),
     )
 
 
@@ -1550,7 +1550,7 @@ def test_council_winner_files_changed_from_its_own_worktree(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
         "syncmill.strategies.base.capture_changes",
-        lambda p, base=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
+        lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
     )
     r = _run_council([a, b], FakeMemory(), pool=pool)
     assert r.agent_id == "claude"
@@ -2123,7 +2123,7 @@ def test_decompose_winner_files_changed_from_its_own_worktree(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
         "syncmill.strategies.base.capture_changes",
-        lambda p, base=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
+        lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
     )
     r = _run_decompose([a, b], FakeMemory(), pool=pool)
     assert r.agent_id == "claude"
@@ -2429,7 +2429,7 @@ def patched_worktree(monkeypatch):
         return pool
 
     monkeypatch.setattr(S, "WorktreePool", make_pool)
-    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"changed.py"})), ""))
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"changed.py"})), ""))
     return {"pool": pool, "created": created}
 
 
@@ -2963,13 +2963,13 @@ def test_close_closes_memory():
 def test_capture_detects_modified_and_untracked(git_repo):
     (git_repo / "README.md").write_text("# changed\n")
     (git_repo / "new.txt").write_text("hi\n")
-    changed = set(capture_changes(git_repo).files)
+    changed = set(capture_changes(git_repo, git_dir=None).files)
     assert "README.md" in changed
     assert "new.txt" in changed
 
 
 def test_capture_clean_repo_empty(git_repo):
-    captured = capture_changes(git_repo)
+    captured = capture_changes(git_repo, git_dir=None)
     assert captured.files == ()
     # "" = the agent changed nothing (a failure raises PatchCaptureError).
     assert captured.patch == ""
@@ -2978,12 +2978,12 @@ def test_capture_clean_repo_empty(git_repo):
 def test_capture_respects_gitignore(git_repo):
     (git_repo / ".gitignore").write_text("ignored.log\n")
     (git_repo / "ignored.log").write_text("secret\n")
-    assert "ignored.log" not in set(capture_changes(git_repo).files)
+    assert "ignored.log" not in set(capture_changes(git_repo, git_dir=None).files)
 
 
 def test_capture_non_git_dir_raises(tmp_path):
     with pytest.raises(PatchCaptureError):
-        capture_changes(tmp_path)
+        capture_changes(tmp_path, git_dir=None)
 
 
 def test_capture_patch_applies_to_fresh_clone(git_repo, tmp_path):
@@ -2992,7 +2992,7 @@ def test_capture_patch_applies_to_fresh_clone(git_repo, tmp_path):
     # of the same HEAD — the exact recovery flow --emit-patch promises.
     (git_repo / "README.md").write_text("# changed\n")
     (git_repo / "new.txt").write_text("hi\n")
-    patch = capture_changes(git_repo).patch
+    patch = capture_changes(git_repo, git_dir=None).patch
     assert patch and "new.txt" in patch and "README.md" in patch
 
     clone = tmp_path / "clone"
@@ -3018,7 +3018,7 @@ def test_capture_preserves_the_live_index(git_repo):
         ["git", "diff", "--cached", "--name-only"], cwd=str(git_repo),
         capture_output=True, text=True, check=True,
     ).stdout
-    capture_changes(git_repo)
+    capture_changes(git_repo, git_dir=None)
     after = subprocess.run(
         ["git", "diff", "--cached", "--name-only"], cwd=str(git_repo),
         capture_output=True, text=True, check=True,
@@ -3129,11 +3129,11 @@ def test_route_winner_carries_patch(monkeypatch):
     # the strategy layer attaches the winner's patch via the single
     # _collect_files_changed seam (lookup-site: syncmill.strategies.base)
     monkeypatch.setattr(
-        "syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"a.py"})), "")
+        "syncmill.strategies.base.capture_changes", lambda p, base=None, *, git_dir=None: CapturedChanges(tuple(sorted({"a.py"})), "")
     )
     monkeypatch.setattr(
         "syncmill.strategies.base.capture_changes",
-        lambda p, base=None: CapturedChanges(("a.py",), "FAKE PATCH")
+        lambda p, base=None, *, git_dir=None: CapturedChanges(("a.py",), "FAKE PATCH")
     )
     agent = FakeAgent("claude", status=TaskStatus.COMPLETED)
     r = _run_route([agent], FakeMemory(), pool=FakeWorktreePool(is_git=True))

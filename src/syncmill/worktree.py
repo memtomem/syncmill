@@ -137,6 +137,11 @@ class Worktree:
     is_git: bool
     is_temp: bool = False
     base_commit: str | None = None
+    #: The worktree's admin directory in the control repository, resolved from
+    #: the control side (:func:`trusted_admin_dir`). Git run on the worktree after
+    #: an agent's turn uses it instead of the worktree's own ``.git`` file, which
+    #: the agent can rewrite. In memory only; ``None`` on the legacy in-repo path.
+    git_dir: Path | None = None
 
 
 class WorkspaceError(RuntimeError):
@@ -164,13 +169,78 @@ class CapturedChanges:
     patch: str
 
 
-def capture_changes(workdir: Path, base_commit: str | None = None) -> CapturedChanges:
+def trusted_admin_dir(control_repo: Path, worktree_path: Path) -> Path:
+    """The admin directory of ``worktree_path`` in ``control_repo``, found from
+    the control side alone.
+
+    A linked worktree names its admin directory in its own ``.git`` file, and
+    the agent working in the worktree can rewrite that file to point Git at a
+    directory it planted, whose config then names programs Git runs
+    (``core.fsmonitor``, a clean filter, ``diff.external``) (#269). So the binding
+    is read the other way: each admin directory's ``gitdir`` file names the
+    worktree marker it belongs to, and the control repository is outside the
+    agent's reach. Nothing under ``worktree_path`` is opened, stat'ed or
+    resolved: its parent is the syncmill-owned worktrees root, and the
+    comparison is on normalized path strings, so a symlink planted in the
+    worktree cannot alias another worktree's marker.
+    """
+    admin_root = Path(os.path.realpath(control_repo / ".git" / "worktrees"))
+    expected = os.path.normpath(
+        os.path.join(os.path.realpath(worktree_path.parent), worktree_path.name, ".git")
+    )
+    try:
+        entries = list(os.scandir(admin_root))
+    except OSError as exc:
+        raise WorkspaceError(f"cannot read worktree admin directories: {exc}") from exc
+    matches: list[Path] = []
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        try:
+            raw = (Path(entry.path) / "gitdir").read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        backlink = raw if os.path.isabs(raw) else os.path.join(entry.path, raw)
+        if os.path.normpath(backlink) == expected:
+            matches.append(Path(entry.path))
+    if len(matches) != 1:
+        raise WorkspaceError(
+            f"worktree {worktree_path} has {len(matches)} admin directories in the "
+            "control repository, expected exactly one"
+        )
+    return matches[0]
+
+
+def pinned_git_env(
+    workdir: Path,
+    git_dir: Path | None,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """``isolated_git_env`` for Git run on ``workdir``, bound to ``git_dir``.
+
+    With a ``git_dir`` (see :func:`trusted_admin_dir`), ``GIT_DIR`` and
+    ``GIT_WORK_TREE`` are set after the ambient routing variables are stripped,
+    so Git never reads the worktree's own ``.git`` file. ``None`` keeps ordinary
+    discovery: only the legacy in-repo worktrees, which have no control side.
+    """
+    env = isolated_git_env(overrides)
+    if git_dir is not None:
+        env["GIT_DIR"] = str(git_dir)
+        env["GIT_WORK_TREE"] = str(workdir)
+    return env
+
+
+def capture_changes(
+    workdir: Path, base_commit: str | None = None, *, git_dir: Path | None
+) -> CapturedChanges:
     """Capture a binary patch with a private index; never alter the live index."""
     require_supported_platform()
     base = base_commit or "HEAD"
     try:
         with tempfile.TemporaryDirectory(prefix="syncmill-patch-") as directory:
-            env = isolated_git_env({"GIT_INDEX_FILE": str(Path(directory) / "index")})
+            env = pinned_git_env(
+                workdir, git_dir, {"GIT_INDEX_FILE": str(Path(directory) / "index")}
+            )
 
             def run(*args: str) -> bytes:
                 proc = _run_git(
@@ -611,6 +681,7 @@ def _checkout_from_patch(
     )
     if proc.returncode != 0:
         raise command_error(WorkspaceError, "worktree creation failed", proc.stderr)
+    worktree.git_dir = trusted_admin_dir(control_repo, worktree.path)
     if patch:
         proc = _run_git(
             ["git", "apply", "--binary", "-"],
@@ -629,7 +700,9 @@ def _checkout_from_patch(
 
 def _checkout_verified(control_repo: Path, worktree: Worktree, patch: bytes) -> None:
     _checkout_from_patch(control_repo, worktree, patch)
-    rebuilt = capture_changes(worktree.path, worktree.base_commit).patch
+    rebuilt = capture_changes(
+        worktree.path, worktree.base_commit, git_dir=worktree.git_dir
+    ).patch
     if rebuilt.encode("utf-8", errors="surrogateescape") != patch:
         raise WorkspaceError(f"worktree {worktree.path} does not reproduce its patch")
 

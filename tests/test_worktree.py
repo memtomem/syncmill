@@ -321,7 +321,7 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
             present = {p.name for p in wt.path.iterdir() if p.is_file()}
             assert present & agent_files == {a._fname}  # only its OWN file
             # per-worktree diff, via the production capture seam
-            assert set(capture_changes(wt.path).files) == {a._fname}
+            assert set(capture_changes(wt.path, git_dir=wt.git_dir).files) == {a._fname}
     finally:
         removed = pool.cleanup_all()
     assert removed == 3
