@@ -1444,22 +1444,9 @@ def round_provenance_status(
         if set(tree) != {"kind"}:
             return malformed("provenance tree keys are not the v1 set")
     elif kind == "branch":
-        if set(tree) != {"kind", "base_candidate_id", "base_patch_sha256", "base_round_number"}:
-            return malformed("provenance tree keys are not the v1 set")
-        base_id = tree["base_candidate_id"]
-        base = candidates.get(base_id) if isinstance(base_id, str) else None
-        if base is None:
-            return malformed("branch base candidate is not a candidate of this room")
-        base_round = tree["base_round_number"]
-        if not _plain_int(base_round) or base_round != base.get("round_number"):
-            return malformed("branch base round differs from the candidate's")
-        if base_round >= round_number:
-            return malformed("branch base is not from an earlier round")
-        if not base.get("eligible"):
-            return malformed("branch base candidate is not eligible")
-        digest = tree["base_patch_sha256"]
-        if not _sha256_hex(digest) or digest != base.get("patch_sha256"):
-            return malformed("branch base digest differs from the candidate's")
+        reason = _branch_tree_problem(tree, round_number, candidates)
+        if reason is not None:
+            return malformed(reason)
     elif kind == "repair":
         reason = _repair_tree_problem(tree, round_number, member_ids, candidates)
         if reason is not None:
@@ -1496,6 +1483,100 @@ def round_provenance_status(
     return ProvenanceCheck("recorded", record=record)
 
 
+def _branch_tree_problem(
+    tree: dict[str, Any],
+    round_number: int,
+    candidates: dict[str, dict[str, Any]],
+) -> str | None:
+    """Why a branch tree cannot be believed, or ``None``: its base must be an
+    eligible candidate of this room from an earlier round, with the recorded
+    number and digest. ``run_round`` checks a proposed tree with this before
+    it removes any workspace, so it never starts what this would reject."""
+    if set(tree) != {"kind", "base_candidate_id", "base_patch_sha256", "base_round_number"}:
+        return "provenance tree keys are not the v1 set"
+    base_id = tree["base_candidate_id"]
+    base = candidates.get(base_id) if isinstance(base_id, str) else None
+    if base is None:
+        return "branch base candidate is not a candidate of this room"
+    base_round = tree["base_round_number"]
+    if not _plain_int(base_round) or base_round != base.get("round_number"):
+        return "branch base round differs from the candidate's"
+    if base_round >= round_number:
+        return "branch base is not from an earlier round"
+    if not base.get("eligible"):
+        return "branch base candidate is not eligible"
+    digest = tree["base_patch_sha256"]
+    if not _sha256_hex(digest) or digest != base.get("patch_sha256"):
+        return "branch base digest differs from the candidate's"
+    return None
+
+
+def _newer_completed(
+    candidates: dict[str, dict[str, Any]],
+    member_id: str,
+    *,
+    after: int,
+    before: int,
+) -> list[dict[str, Any]] | None:
+    """The member's completed candidates from rounds after ``after`` and before
+    ``before``, or ``None`` when one of its completed candidates has no
+    recorded round (the order is then unknown). The one definition of "a newer
+    completed candidate" for the repair guard and the repair record validator.
+    """
+    newer = []
+    for row in candidates.values():
+        if row.get("member_id") != member_id or row.get("state") != "completed":
+            continue
+        number = row.get("round_number")
+        if not _plain_int(number):
+            return None
+        if after < number < before:
+            newer.append(row)
+    return newer
+
+
+def _repair_parent_tree_problem(
+    *,
+    member_id: object,
+    parent_id: object,
+    parent_round: object,
+    parent_patch_sha256: object,
+    round_number: int,
+    member_ids: list[str],
+    candidates: dict[str, dict[str, Any]],
+) -> str | None:
+    """Why a repair parent cannot be believed for round ``round_number``, or
+    ``None``: it must be a completed candidate of a room member, from an
+    earlier round, with the recorded number and digest, and that member's
+    newest completed candidate. A completed candidate of the member whose
+    round is not recorded makes the order unknown, so nothing can be its
+    newest. The record validator and the repair guard both decide with this.
+    """
+    if not isinstance(member_id, str) or member_id not in member_ids:
+        return "repair member is not a member of this room"
+    parent = candidates.get(parent_id) if isinstance(parent_id, str) else None
+    if parent is None or parent.get("member_id") != member_id:
+        return "repair parent is not that member's candidate"
+    if parent.get("state") != "completed":
+        return "repair parent is not a completed candidate"
+    if not _plain_int(parent_round) or parent_round != parent.get("round_number"):
+        return "repair parent round differs from the candidate's"
+    if parent_round >= round_number:
+        return "repair parent is not from an earlier round"
+    if not _sha256_hex(parent_patch_sha256) or parent_patch_sha256 != parent.get(
+        "patch_sha256"
+    ):
+        return "repair parent digest differs from the candidate's"
+    newer = _newer_completed(
+        candidates, member_id, after=parent_round, before=round_number
+    )
+    if newer is None:
+        return "repair parent's order among that member's candidates is unknown"
+    if newer:
+        return "repair parent is not that member's newest completed candidate"
+    return None
+
+
 def _repair_tree_problem(
     tree: dict[str, Any],
     round_number: int,
@@ -1506,32 +1587,17 @@ def _repair_tree_problem(
     of the room and that member's newest completed candidate as of this round."""
     if set(tree) != _REPAIR_TREE_KEYS:
         return "provenance tree keys are not the v3 repair set"
-    member_id = tree["member_id"]
-    if not isinstance(member_id, str) or member_id not in member_ids:
-        return "repair member is not a member of this room"
-    parent_id = tree["parent_candidate_id"]
-    parent = candidates.get(parent_id) if isinstance(parent_id, str) else None
-    if parent is None or parent.get("member_id") != member_id:
-        return "repair parent is not that member's candidate"
-    if parent.get("state") != "completed":
-        return "repair parent is not a completed candidate"
-    parent_round = tree["parent_round_number"]
-    if not _plain_int(parent_round) or parent_round != parent.get("round_number"):
-        return "repair parent round differs from the candidate's"
-    if parent_round >= round_number:
-        return "repair parent is not from an earlier round"
-    digest = tree["parent_patch_sha256"]
-    if not _sha256_hex(digest) or digest != parent.get("patch_sha256"):
-        return "repair parent digest differs from the candidate's"
-    for row in candidates.values():
-        number = row.get("round_number")
-        if (
-            row.get("member_id") == member_id
-            and row.get("state") == "completed"
-            and _plain_int(number)
-            and parent_round < number < round_number
-        ):
-            return "repair parent is not that member's newest completed candidate"
+    reason = _repair_parent_tree_problem(
+        member_id=tree["member_id"],
+        parent_id=tree["parent_candidate_id"],
+        parent_round=tree["parent_round_number"],
+        parent_patch_sha256=tree["parent_patch_sha256"],
+        round_number=round_number,
+        member_ids=member_ids,
+        candidates=candidates,
+    )
+    if reason is not None:
+        return reason
     feedback = tree["feedback_ids"]
     if not isinstance(feedback, list) or not all(_canonical_uuid(f) for f in feedback):
         return "repair feedback ids are not canonical uuids"
@@ -2677,20 +2743,30 @@ class RoomStore:
         number = parent["round_number"]
         if not _plain_int(number):
             return "candidate's round is not recorded"
-        newer = [
-            value
-            for value in rows.values()
-            if value["member_id"] == parent["member_id"]
-            and value["state"] == "completed"
-            and _plain_int(value["round_number"])
-            and value["round_number"] > number
-        ]
+        next_round = int(room["round_count"]) + 1
+        newer = _newer_completed(
+            rows, parent["member_id"], after=number, before=next_round
+        )
         if newer:
             newest = max(newer, key=lambda value: value["round_number"])
             return (
                 f"candidate {newest['id']} is its member's newer completed candidate; "
                 "repair that one, or use `room round --lineage branch-from` for this one"
             )
+        # The rule the round's provenance record will be validated by, on the
+        # record this repair would write: whatever the checks above let
+        # through, the guard never starts a repair that record would reject.
+        problem = _repair_parent_tree_problem(
+            member_id=parent["member_id"],
+            parent_id=candidate_id,
+            parent_round=number,
+            parent_patch_sha256=parent["patch_sha256"],
+            round_number=next_round,
+            member_ids=[m["member_id"] for m in json.loads(room["members_json"])],
+            candidates=rows,
+        )
+        if problem is not None:
+            return problem
         workspace = conn.execute(
             "SELECT base_commit FROM room_workspaces WHERE room_id=? AND member_id=?",
             (room["id"], parent["member_id"]),
@@ -3409,10 +3485,14 @@ class RoomStore:
     @staticmethod
     def _list_candidates(conn: sqlite3.Connection, room_id: str) -> list[dict[str, Any]]:
         # round_number rides along so callers (the resume-aware delta prefix)
-        # can filter by round without a per-candidate get_round query.
+        # can filter by round without a per-candidate get_round query. It is
+        # NULL when the candidate's round is not a round of this room (gone,
+        # or another room's): the candidate stays listed, and every reader
+        # that orders by round treats it as a round that is not recorded,
+        # never as another round's number.
         rows = conn.execute(
             """SELECT c.*, r.number AS round_number FROM candidates c
-            JOIN rounds r ON r.id = c.round_id
+            LEFT JOIN rounds r ON r.id = c.round_id AND r.room_id = c.room_id
             WHERE c.room_id=? ORDER BY c.created_at,c.attempt""",
             (room_id,),
         ).fetchall()
@@ -3428,6 +3508,13 @@ class RoomStore:
 
     def candidate_rows(self, room_id: str) -> dict[str, dict[str, Any]]:
         return self._candidate_rows(self._conn, room_id)
+
+    def round_room_id(self, round_id: object) -> str | None:
+        """The room a round belongs to, or ``None`` when there is no such round."""
+        row = self._conn.execute(
+            "SELECT room_id FROM rounds WHERE id=?", (round_id,)
+        ).fetchone()
+        return None if row is None else row["room_id"]
 
     def get_candidate(self, candidate_id: str) -> dict[str, Any]:
         row = self._conn.execute(
@@ -3643,6 +3730,11 @@ class RoomStore:
         ).resolve()
         if Path(row["artifact_path"]).resolve() != expected_path:
             raise RoomError(f"candidate artifact path mismatch: {candidate_id}")
+        # The manifest binds the candidate to its row; this binds the row to
+        # a round of the same room. A round that is gone or belongs to another
+        # room leaves the candidate with no round to stand in.
+        if self.round_room_id(row["round_id"]) != row["room_id"]:
+            raise RoomError(f"candidate round binding mismatch: {candidate_id}")
         return row, expected_path
 
     def _validate_candidate_bindings(
@@ -4823,6 +4915,9 @@ class RoomCoordinator:
             if row["room_id"] != room_id or not row["eligible"]:
                 raise RoomError("base candidate must be eligible and belong to the room")
             self.store.load_candidate(str(base_candidate_id))
+            self._branch_tree(
+                room_id, str(base_candidate_id), int(room["round_count"]) + 1
+            )
         round_prompt = prompt or room["prompt"]
         _validate_prompt_text(round_prompt)
         # A fork that cannot actually resume a conversation would silently run
@@ -5036,6 +5131,26 @@ class RoomCoordinator:
             ),
         )
 
+    def _branch_tree(
+        self, room_id: str, base_candidate_id: str, round_number: int
+    ) -> dict[str, Any]:
+        """The provenance tree a branch-from round records, checked with the
+        validator that will read it; ``RoomError`` when it would be rejected."""
+        rows = self.store.candidate_rows(room_id)
+        base = rows.get(base_candidate_id)
+        if base is None:
+            raise RoomError("base candidate must be eligible and belong to the room")
+        tree = {
+            "kind": "branch",
+            "base_candidate_id": base_candidate_id,
+            "base_patch_sha256": base["patch_sha256"],
+            "base_round_number": base["round_number"],
+        }
+        problem = _branch_tree_problem(tree, round_number, rows)
+        if problem is not None:
+            raise RoomError(f"cannot branch from {base_candidate_id}: {problem}")
+        return tree
+
     def _continued_parents(self, room: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
         """Each member's candidate in the previous round: the attempt whose
         retained worktree a continue-own round continues. ``None`` when that
@@ -5240,13 +5355,11 @@ class RoomCoordinator:
                 if row["room_id"] != room_id or not row["eligible"]:
                     raise RoomError("base candidate must be eligible and belong to the room")
                 seed_patch = self.store.load_candidate(str(base_candidate_id))["patch"]
-                base_row = self.store.candidate_rows(room_id)[str(base_candidate_id)]
-                tree = {
-                    "kind": "branch",
-                    "base_candidate_id": str(base_candidate_id),
-                    "base_patch_sha256": base_row["patch_sha256"],
-                    "base_round_number": base_row["round_number"],
-                }
+                # Before _cleanup_workspaces: a base the round's record would
+                # reject must leave the existing workspaces in place.
+                tree = self._branch_tree(
+                    room_id, str(base_candidate_id), int(room["round_count"]) + 1
+                )
             if existing:
                 self._cleanup_workspaces(room_id)
                 # The records (and their run roots) are gone — refresh so no
@@ -5312,7 +5425,7 @@ class RoomCoordinator:
             # never erase the accepted round's sessions. `fresh` clears too, not
             # just `--fresh-session`: leaving the ids behind lets a cold attempt
             # that reports no new session resurrect the PRE-fresh conversation
-            # on the next continue-own round, while `last_round_by_member` has
+            # on the next continue-own round, while the delta watermark has
             # already advanced — a delta prompt against a session that never saw
             # those rounds. A successful cold turn repopulates them below.
             if fresh_session or lineage == "fresh":
@@ -5374,18 +5487,14 @@ class RoomCoordinator:
             # before its last round's prompt was built — re-sending them is pure
             # uncached input. Its delta is peers' outputs from its last round
             # onward, minus its own candidates. A cold member (no seeded
-            # session) still gets the full checkpoint.
-            last_round_by_member: dict[str, int] = {}
-            for row in self.store.list_candidates(room_id):
-                number = row.get("round_number")
-                # COMPLETED turns only: a failed/timed-out member never
-                # consumed that round's prompt, but its stored session id
-                # survives — advancing the watermark would make the next
-                # resume omit peer outputs its conversation never received.
-                if isinstance(number, int) and row.get("state") == "completed":
-                    last_round_by_member[row["member_id"]] = max(
-                        last_round_by_member.get(row["member_id"], 0), number
-                    )
+            # session) still gets the full checkpoint. The watermark is the
+            # member's last round with a COMPLETED candidate (a failed or
+            # timed-out member never consumed that round's prompt, but its
+            # stored session id survives — advancing the watermark would make
+            # the next resume omit peer outputs its conversation never
+            # received), read with the function the record is validated by.
+            round_number = int(round_row["number"])
+            candidate_rows = self.store.candidate_rows(room_id)
             # Shared-memory context is member-independent — search once per
             # round, strictly BEFORE the fan-out (the shared-loop rule), and
             # apply it only to the AGENT prompts (the stored rounds.prompt row
@@ -5408,19 +5517,25 @@ class RoomCoordinator:
             conversation: dict[str, dict[str, Any]] = {}
             for member in members:
                 member_id = member["member_id"]
-                last_seen = last_round_by_member.get(member_id)
+                last_seen = last_completed_round(
+                    candidate_rows, member_id, before=round_number
+                )
                 seeded = bool(seed_sessions.get(member_id))
                 if seeded and last_seen is not None:
                     agent_prompt, included, omitted = self._checkpoint(
                         room_id,
                         round_task,
+                        round_number=round_number,
                         exclude_member=member_id,
                         min_round_number=last_seen,
                         lessons=delivered_lessons,
                     )
                 else:
                     agent_prompt, included, omitted = self._checkpoint(
-                        room_id, round_task, lessons=delivered_lessons
+                        room_id,
+                        round_task,
+                        round_number=round_number,
+                        lessons=delivered_lessons,
                     )
                 composed, delivered = self._memory_prefixed(memory_context, agent_prompt)
                 # Final-argv guarantee: the checkpoint embeds candidate OUTPUTS
@@ -5700,6 +5815,7 @@ class RoomCoordinator:
         room_id: str,
         prompt: str,
         *,
+        round_number: int,
         exclude_member: str | None = None,
         min_round_number: int | None = None,
         lessons: list[str] | tuple[str, ...] = (),
@@ -5707,6 +5823,7 @@ class RoomCoordinator:
         return self._checkpoint(
             room_id,
             prompt,
+            round_number=round_number,
             exclude_member=exclude_member,
             min_round_number=min_round_number,
             lessons=lessons,
@@ -5717,6 +5834,7 @@ class RoomCoordinator:
         room_id: str,
         prompt: str,
         *,
+        round_number: int,
         exclude_member: str | None = None,
         min_round_number: int | None = None,
         lessons: list[str] | tuple[str, ...] = (),
@@ -5735,6 +5853,11 @@ class RoomCoordinator:
         before that round's prompt was built has been seen; its peers' outputs
         FROM that round onward are the genuinely new information).
 
+        ``round_number`` is the round being built. The candidates come from
+        :func:`checkpoint_eligible`, the function the conversation record is
+        validated with, so the record this prompt produces always lists
+        exactly the candidates its validator expects.
+
         ``lessons`` are approved lesson texts that already fit beside the
         prompt (:func:`round_lessons_fit`). They go after the excerpts, with
         the task, and the excerpts are budgeted around them; every fallback
@@ -5743,20 +5866,18 @@ class RoomCoordinator:
         prompt_bytes = prompt.encode("utf-8", errors="surrogateescape")
         if len(prompt_bytes) > _ROOM_PROMPT_MAX_BYTES:
             raise RoomError("room prompt exceeds the safe process argument byte limit")
-        candidates = [
-            row
-            for row in self.store.list_candidates(room_id)
-            if (exclude_member is None or row["member_id"] != exclude_member)
-            and (
-                min_round_number is None
-                or (
-                    isinstance(row.get("round_number"), int)
-                    and row["round_number"] >= min_round_number
-                )
+        rows = {row["id"]: row for row in self.store.list_candidates(room_id)}
+        ordered = [
+            rows[candidate_id]
+            for candidate_id in checkpoint_eligible(
+                rows,
+                round_number=round_number,
+                exclude_member=exclude_member,
+                min_round_number=min_round_number,
             )
         ]
         bare = _bare_prompt(prompt, lessons)
-        if not candidates:
+        if not ordered:
             return bare, [], False
         preamble = _CHECKPOINT_PREAMBLE_WITH_LESSONS if lessons else _CHECKPOINT_PREAMBLE
         suffix = f"\n\n{_task_section(prompt, lessons)}"
@@ -5766,10 +5887,6 @@ class RoomCoordinator:
             # would cross the argv boundary.
             return bare, [], True
 
-        ordered = sorted(
-            candidates,
-            key=lambda value: (value["created_at"], value["member_id"], value["id"]),
-        )
         available = _ROOM_PROMPT_MAX_BYTES - len(fixed_bytes)
         separator = b"\n\n"
         marker = _CHECKPOINT_TRUNCATION_MARKER.encode()

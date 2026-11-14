@@ -1078,6 +1078,19 @@ def build_room_comparison(
     for candidate in store.list_candidates(room_id):
         by_round.setdefault(str(candidate["round_id"]), []).append(candidate)
         candidate_rows[str(candidate["id"])] = candidate
+    # A candidate whose round is not one of this room's (gone, or another
+    # room's) belongs to no round group; say so rather than let it vanish.
+    room_round_ids = {str(round_row.get("id")) for round_row in rounds}
+    for candidate in candidate_rows.values():
+        if str(candidate["round_id"]) not in room_round_ids:
+            damaged.append(
+                {
+                    "round_id": str(candidate["round_id"]),
+                    "reason": (
+                        f"candidate {candidate['id']} names a round outside this room"
+                    ),
+                }
+            )
     members = room.get("members")
     member_ids = (
         [m["member_id"] for m in members if isinstance(m, dict) and "member_id" in m]

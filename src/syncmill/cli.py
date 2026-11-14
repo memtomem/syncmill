@@ -3339,8 +3339,20 @@ def room_candidates(room_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
         coordinator.store.get_room(room_id)
+        damaged = 0
         for candidate in coordinator.store.list_candidates(room_id):
-            manifest = coordinator.store.load_candidate(candidate["id"])
+            try:
+                manifest = coordinator.store.load_candidate(candidate["id"])
+            except RoomError as exc:
+                # One unreadable candidate (its artifact, or its round
+                # binding) is reported on its own line; the rest still list,
+                # and the command fails at the end rather than passing silently.
+                damaged += 1
+                echo(
+                    f"{_shown(candidate['id'])}  {_shown(candidate['member_id']):10} "
+                    f"damaged: {_shown(str(exc))}"
+                )
+                continue
             # The read model's verdict: a candidate that never completed is
             # "not run", and a null gate is "no gate report" — never one `n/a`.
             gate = _gate_verdict(
@@ -3356,6 +3368,10 @@ def room_candidates(room_id: str, repo: Path) -> None:
                 f"{_shown(candidate['state']):9} gate:{gate_label:14} "
                 f"patch:{_shown(manifest['patch_bytes'])}B"
                 + (f"  {usage}" if usage else "")
+            )
+        if damaged:
+            raise click.ClickException(
+                f"{damaged} candidate(s) in room {_shown(room_id)} could not be read"
             )
     # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
     # click.echo — re-raise it so Click's own EPIPE handling silences it,

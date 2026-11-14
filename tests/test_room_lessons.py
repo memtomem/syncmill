@@ -73,8 +73,8 @@ def frozen(git_repo, tmp_path, monkeypatch):
 
 def test_lessons_sit_after_the_untrusted_checkpoint_next_to_the_task(frozen):
     coordinator, room_id = frozen
-    prompt, included, omitted = coordinator._checkpoint(room_id, "next", lessons=TEXTS)
-    plain, plain_included, _ = coordinator._checkpoint(room_id, "next")
+    prompt, included, omitted = coordinator._checkpoint(room_id, "next", round_number=3, lessons=TEXTS)
+    plain, plain_included, _ = coordinator._checkpoint(room_id, "next", round_number=3)
     assert included == plain_included and not omitted
     assert prompt.startswith(rooms_module._CHECKPOINT_PREAMBLE_WITH_LESSONS)
     assert "Continue to follow only the task" not in prompt
@@ -91,19 +91,19 @@ def test_lessons_sit_after_the_untrusted_checkpoint_next_to_the_task(frozen):
 def test_without_candidates_the_lessons_still_lead_the_task(frozen):
     coordinator, room_id = frozen
     prompt, included, omitted = coordinator._checkpoint(
-        room_id, "next", min_round_number=9, lessons=TEXTS
+        room_id, "next", round_number=3, min_round_number=9, lessons=TEXTS
     )
     assert (prompt, included, omitted) == (TAIL, [], False)
-    assert coordinator._checkpoint(room_id, "next", min_round_number=9) == ("next", [], False)
+    assert coordinator._checkpoint(room_id, "next", round_number=3, min_round_number=9) == ("next", [], False)
 
 
 def test_the_checkpoint_makes_room_for_the_lessons(frozen, monkeypatch):
     coordinator, room_id = frozen
-    full, every, _ = coordinator._checkpoint(room_id, "next")
+    full, every, _ = coordinator._checkpoint(room_id, "next", round_number=3)
     # Room for the whole checkpoint, not for the checkpoint plus the lessons.
     cap = len(full.encode()) + 10
     monkeypatch.setattr(rooms_module, "_ROOM_PROMPT_MAX_BYTES", cap)
-    prompt, included, omitted = coordinator._checkpoint(room_id, "next", lessons=TEXTS)
+    prompt, included, omitted = coordinator._checkpoint(room_id, "next", round_number=3, lessons=TEXTS)
     assert omitted and included == every[len(every) - len(included):]
     assert len(included) < len(every)
     assert len(prompt.encode()) <= cap
@@ -113,10 +113,10 @@ def test_the_checkpoint_makes_room_for_the_lessons(frozen, monkeypatch):
 def test_multibyte_lessons_are_budgeted_in_bytes(frozen, monkeypatch):
     coordinator, room_id = frozen
     korean = ["작은 diff를 선호한다 " * 40, "벤더 코드는 고치지 않는다 " * 40]
-    full, _, _ = coordinator._checkpoint(room_id, "next")
+    full, _, _ = coordinator._checkpoint(room_id, "next", round_number=3)
     cap = len(full.encode()) + 10
     monkeypatch.setattr(rooms_module, "_ROOM_PROMPT_MAX_BYTES", cap)
-    prompt, _, omitted = coordinator._checkpoint(room_id, "next", lessons=korean)
+    prompt, _, omitted = coordinator._checkpoint(room_id, "next", round_number=3, lessons=korean)
     assert omitted
     assert len(prompt.encode()) <= cap  # a character count would overshoot
     assert prompt.endswith("--- CURRENT USER TASK ---\nnext")
@@ -143,7 +143,7 @@ def test_every_excerpt_fallback_keeps_the_lessons_and_the_task(frozen, monkeypat
     )
     with patch("_ROOM_PROMPT_MAX_BYTES", cap), patch("_prompt_arg_units", units):
         assert round_lessons_fit("next", TEXTS)
-        prompt, included, omitted = coordinator._checkpoint(room_id, "next", lessons=TEXTS)
+        prompt, included, omitted = coordinator._checkpoint(room_id, "next", round_number=3, lessons=TEXTS)
     # The excerpts are dropped together with their ids; eligible ones existed.
     assert (prompt, included, omitted) == (TAIL, [], True)
 

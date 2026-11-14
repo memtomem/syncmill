@@ -1336,6 +1336,7 @@ def test_checkpoint_prompt_has_deterministic_utf8_aggregate_byte_cap(
             "id": f"candidate-{index:03d}",
             "created_at": f"2026-01-01T00:00:{index:02d}+00:00",
             "member_id": f"member-{index % 3}",
+            "round_number": 1,
         }
         for index in range(40)
     ]
@@ -1359,10 +1360,10 @@ def test_checkpoint_prompt_has_deterministic_utf8_aggregate_byte_cap(
         coordinator.store, "load_candidate_checkpoint", load_checkpoint
     )
     try:
-        first = coordinator._prompt_with_checkpoint("room", "현재 작업🙂")
+        first = coordinator._prompt_with_checkpoint("room", "현재 작업🙂", round_number=2)
         first_loaded = list(loaded)
         loaded.clear()
-        second = coordinator._prompt_with_checkpoint("room", "현재 작업🙂")
+        second = coordinator._prompt_with_checkpoint("room", "현재 작업🙂", round_number=2)
 
         encoded = first.encode("utf-8")
         assert len(encoded) <= rooms_module._ROOM_PROMPT_MAX_BYTES
@@ -2648,18 +2649,18 @@ def test_delta_prefix_filters_by_round_and_member_directly(git_repo, tmp_path):
         coordinator.run_round(room["id"], "one")
         coordinator.run_round(room["id"], "two")
 
-        full = coordinator._prompt_with_checkpoint(room["id"], "next")
+        full = coordinator._prompt_with_checkpoint(room["id"], "next", round_number=3)
         assert full.count("[claude |") == 2 and full.count("[codex |") == 2
 
         delta = coordinator._prompt_with_checkpoint(
-            room["id"], "next", exclude_member="claude", min_round_number=2
+            room["id"], "next", round_number=3, exclude_member="claude", min_round_number=2
         )
         assert "[claude |" not in delta
         assert delta.count("[codex |") == 1
 
         # Nothing new for the member → the bare prompt, no checkpoint framing.
         bare = coordinator._prompt_with_checkpoint(
-            room["id"], "next", exclude_member="claude", min_round_number=3
+            room["id"], "next", round_number=3, exclude_member="claude", min_round_number=3
         )
         assert bare == "next"
     finally:
