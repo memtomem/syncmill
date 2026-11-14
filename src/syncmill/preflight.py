@@ -40,6 +40,12 @@ from syncmill.config import ToolgraphConfig
 # recognise it.
 from syncmill.planning import unmapped_principal_id
 
+#: What the preflight runner keeps of each stream. Syncmill never reads the
+#: binary's stdout (the verdict is the ``--out`` artifact, which toolgraph also
+#: echoes there) and shows only a short stderr snippet, so the rest is drained
+#: and dropped rather than held in memory.
+_OUTPUT_TAIL_CHARS = 4000
+
 logger = logging.getLogger(__name__)
 
 PREFLIGHT_FILE = "preflight.json"
@@ -199,7 +205,7 @@ def _invoke_control_toolgraph(
     try:
         proc = _sync_run(  # owned-group runner: a timeout kills the whole tree
             argv, capture_output=True, text=True, errors="replace",
-            timeout=cfg.timeout_seconds,
+            timeout=cfg.timeout_seconds, tail_chars=_OUTPUT_TAIL_CHARS,
         )
     except FileNotFoundError:
         return (
@@ -859,7 +865,7 @@ def _invoke_toolgraph(
     try:
         proc = _sync_run(  # owned-group runner: a timeout kills the whole tree
             argv, capture_output=True, text=True, errors="replace",
-            timeout=cfg.timeout_seconds,
+            timeout=cfg.timeout_seconds, tail_chars=_OUTPUT_TAIL_CHARS,
         )
     except FileNotFoundError:
         return "error", f"toolgraph binary {cfg.command[0]!r} not found in PATH"
@@ -978,6 +984,7 @@ def _run_preflight_inner(
                 # strict mode blocks on regardless of `unavailable_policy`.
                 errors="replace",
                 timeout=cfg.timeout_seconds,
+                tail_chars=_OUTPUT_TAIL_CHARS,
             )
         except FileNotFoundError:
             warnings.append(f"toolgraph binary {cfg.command[0]!r} not found in PATH")

@@ -708,7 +708,9 @@ class Board:
         """Atomically claim the next dispatchable item for ``run_id``, or ``None``.
 
         Dispatchable = ``planned``, not ``human_required``, and every ``depends_on``
-        item is ``done``. Items are considered in FIFO order (``created_at``). The
+        item is ``done``. An unreadable ``depends_on`` (:func:`_parse_deps`) is
+        unsatisfied: the row is skipped with a warning, so it neither dispatches
+        nor blocks the items behind it. Items are considered in FIFO order (``created_at``). The
         whole select-then-claim runs in one ``BEGIN IMMEDIATE`` transaction, so it
         is as atomic as :meth:`claim`.
 
@@ -741,7 +743,19 @@ class Board:
             done_ids: set = set()
             looked_up: set = set()
 
-            def _deps_done(deps: list) -> bool:
+            def _deps_done(row: sqlite3.Row) -> bool:
+                deps = _parse_deps(row["depends_on"])
+                if deps is None:
+                    # Unsatisfied, never dispatched: a prerequisite list that
+                    # cannot be read cannot be proven done. Skipping the row
+                    # rather than raising keeps one damaged item from
+                    # blocking every other item's automatic claim.
+                    logger.warning(
+                        "board item %s has an unreadable depends_on; automatic "
+                        "dispatch skips it (fix the item, or claim it by id)",
+                        _p(str(row["id"])),
+                    )
+                    return False
                 unknown = [d for d in deps if d not in looked_up]
                 for start in range(0, len(unknown), 500):
                     chunk = unknown[start : start + 500]
@@ -758,7 +772,7 @@ class Board:
                 return self._deps_satisfied(deps, done_ids)
 
             chosen = next(
-                (r for r in rows if _deps_done(json.loads(r["depends_on"]))),
+                (r for r in rows if _deps_done(r)),
                 None,
             )
             if chosen is None:
@@ -768,8 +782,7 @@ class Board:
             self._conn.execute("COMMIT")
             return item
         except Exception as exc:
-            # Broad on purpose: a non-sqlite error mid-transaction (e.g. a corrupt
-            # `depends_on` JSON failing `json.loads` above → ValueError) must still
+            # Broad on purpose: a non-sqlite error mid-transaction must still
             # roll back the open BEGIN IMMEDIATE — otherwise the RESERVED lock leaks
             # and the next op fails with "cannot start a transaction within a
             # transaction". Surfaces as BoardError, like get()/list() already do.
@@ -1946,6 +1959,25 @@ def _row_to_decision(row: sqlite3.Row) -> Decision:
         project_id=row["project_id"],
         provenance=_load_provenance(row["provenance_json"]),
     )
+
+
+def _parse_deps(raw: object) -> list[str] | None:
+    """A stored ``depends_on`` as dispatch reads it, or ``None`` when damaged.
+
+    Only a JSON list of strings is a dependency list. Anything else is
+    damaged, including shapes that iterate without error: an empty ``{}`` or
+    ``""`` would make every dependency vacuously done, and ``"abc"`` would be
+    read as the three ids ``a``, ``b`` and ``c``.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(value, list) or not all(isinstance(d, str) for d in value):
+        return None
+    return value
 
 
 def _load_list(raw: str) -> list[str]:

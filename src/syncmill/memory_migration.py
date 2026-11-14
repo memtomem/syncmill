@@ -440,11 +440,22 @@ def _atomic_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+            # Durable before it is published: apply, verify and rollback
+            # decide from these files, and a rename that reaches the disk
+            # ahead of the data can leave an empty state file after a crash.
+            fh.flush()
+            os.fsync(fh.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+    # And the rename itself, so a crash cannot bring back the previous state.
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _artifact(migration_id: str) -> Path:
