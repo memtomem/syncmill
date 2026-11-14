@@ -33,7 +33,7 @@ from syncmill.rooms import (
     round_expected_members,
     round_provenance_status,
 )
-from syncmill.worktree import capture_changes
+from syncmill.worktree import capture_changes, trusted_admin_dir
 
 from test_rooms import WritingAgent
 
@@ -116,7 +116,11 @@ class Harness:
 
     def live_patch(self, member: str) -> str:
         value = self.workspace(member)
-        return capture_changes(Path(value["path"]), value["base_commit"]).patch
+        return capture_changes(
+            Path(value["path"]),
+            value["base_commit"],
+            git_dir=trusted_admin_dir(Path(value["control_repo"]), Path(value["path"])),
+        ).patch
 
     def repair(self, candidate_id: str, prompt: str = "fix it", *, cold=False, lessons=None):
         plan = self.coordinator.build_repair_plan(candidate_id, prompt, cold=cold, lessons=lessons)
@@ -306,8 +310,11 @@ def test_a_failed_attempts_changes_are_gone_when_the_repair_is_retried(make):
             (workdir / "partial.txt").write_text("half done\n", encoding="utf-8")
         if number == 3:
             seen["partial"] = (workdir / "partial.txt").exists()
+            value = room_box["room"].workspace("claude")
             seen["patch"] = capture_changes(
-                workdir, room_box["room"].workspace("claude")["base_commit"]
+                workdir,
+                value["base_commit"],
+                git_dir=trusted_admin_dir(Path(value["control_repo"]), workdir),
             ).patch
 
     claude = Member("claude", on_call=observe, fail_calls={2})
@@ -339,8 +346,11 @@ def test_a_gate_that_writes_a_file_does_not_reach_the_repair(make):
 
     def observe(number, workdir):
         if number == 2:
+            value = room_box["room"].workspace("claude")
             seen["patch"] = capture_changes(
-                workdir, room_box["room"].workspace("claude")["base_commit"]
+                workdir,
+                value["base_commit"],
+                git_dir=trusted_admin_dir(Path(value["control_repo"]), workdir),
             ).patch
 
     room = make(
@@ -436,7 +446,7 @@ def _no_change(room: Harness, revision: int, rounds: int) -> None:
 def test_a_repair_with_nothing_to_do_is_refused(make, prompt):
     room = make(Member("claude"))
     room.round()
-    with pytest.raises(RoomError, match="needs a prompt"):
+    with pytest.raises(RoomError, match="nothing to repair"):
         room.coordinator.build_repair_plan(room.candidate("claude")["id"], prompt)
 
 

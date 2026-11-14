@@ -42,6 +42,7 @@ from syncmill.worktree import (
     WorkspaceError,
     _run_git,
     capture_repository_snapshot,
+    git_apply_argv,
     fingerprint_matches,
     fingerprint_version,
 )
@@ -1366,7 +1367,7 @@ class ArtifactStore:
         patch_data = self.patch(run_id)
         check_apply = _run_patch_git(
             patch_data,
-            ["git", "apply", "--check", "--binary", "-"],
+            git_apply_argv("--check"),
             cwd=str(repo_root), env=git_env, capture_output=True, text=True,
             timeout=_APPLY_GIT_TIMEOUT_SECONDS,
         )
@@ -1401,7 +1402,7 @@ class ArtifactStore:
                 )
             check_apply = _run_patch_git(
                 patch_data,
-                ["git", "apply", "--check", "--binary", "-"],
+                git_apply_argv("--check"),
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                 timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
@@ -1454,7 +1455,7 @@ class ArtifactStore:
         try:
             apply_patch = _run_patch_git(
                 patch_data,
-                ["git", "apply", "--binary", "-"],
+                git_apply_argv(),
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                 timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
@@ -1472,15 +1473,14 @@ class ArtifactStore:
             try:
                 undo = _run_patch_git(
                     patch_data,
-                    ["git", "apply", "--reverse", "--check", "--binary",
-                     "-"],
+                    git_apply_argv("--reverse", "--check"),
                     cwd=str(repo_root), env=git_env, capture_output=True,
                     text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
                 if undo.returncode == 0:
                     _run_patch_git(
                         patch_data,
-                        ["git", "apply", "--reverse", "--binary", "-"],
+                        git_apply_argv("--reverse"),
                         cwd=str(repo_root), env=git_env, capture_output=True,
                         text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                     )
@@ -1555,14 +1555,14 @@ class ArtifactStore:
             try:
                 rollback = _run_patch_git(
                     patch_data,
-                    ["git", "apply", "--reverse", "--check", "--binary", "-"],
+                    git_apply_argv("--reverse", "--check"),
                     cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                     timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
                 if rollback.returncode == 0:
                     rollback = _run_patch_git(
                         patch_data,
-                        ["git", "apply", "--reverse", "--binary", "-"],
+                        git_apply_argv("--reverse"),
                         cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                         timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                     )
@@ -1645,7 +1645,7 @@ class ArtifactStore:
             try:
                 worktree = pool.acquire("apply-verify")
                 restored = _run_git(
-                    ["git", "apply", "--binary", "-"],
+                    git_apply_argv(),
                     cwd=str(worktree.path), env=isolated_git_env(),
                     input=patch, capture_output=True,
                     timeout=_APPLY_GIT_TIMEOUT_SECONDS,
@@ -1804,7 +1804,7 @@ class ArtifactStore:
         try:
             probe = _run_patch_git(
                 patch_data,
-                ["git", "apply", "--reverse", "--check", "--binary", "-"],
+                git_apply_argv("--reverse", "--check"),
                 cwd=str(repo_root),
                 env=isolated_git_env(),
                 capture_output=True,

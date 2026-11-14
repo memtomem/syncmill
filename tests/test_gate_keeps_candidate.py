@@ -25,6 +25,7 @@ from syncmill.worktree import (
     Worktree,
     capture_changes,
     rebuild_worktree,
+    trusted_admin_dir,
 )
 from conftest import FakeAgent, FakeGate, FakeMemory, FakeRegistry
 
@@ -435,14 +436,17 @@ def _linked_worktree(git_repo: Path, tmp_path: Path) -> tuple[Worktree, str]:
         check=True,
         capture_output=True,
     )
-    return Worktree(path, "linked-branch", "member", True, base_commit=base), base
+    return Worktree(
+        path, "linked-branch", "member", True, base_commit=base,
+        git_dir=trusted_admin_dir(git_repo, path),
+    ), base
 
 
 def test_rebuild_restores_the_patch_and_drops_everything_else(git_repo, tmp_path):
     worktree, base = _linked_worktree(git_repo, tmp_path)
     (worktree.path / "kept.txt").write_text("kept\n", encoding="utf-8")
     (worktree.path / "binary.dat").write_bytes(bytes(range(256)))
-    patch = capture_changes(worktree.path, base).patch
+    patch = capture_changes(worktree.path, base, git_dir=worktree.git_dir).patch
 
     (worktree.path / "debris.txt").write_text("debris\n", encoding="utf-8")
     (worktree.path / "nested").mkdir()
@@ -450,7 +454,7 @@ def test_rebuild_restores_the_patch_and_drops_everything_else(git_repo, tmp_path
 
     rebuild_worktree(git_repo, worktree, patch.encode("utf-8", "surrogateescape"))
 
-    assert capture_changes(worktree.path, base).patch == patch
+    assert capture_changes(worktree.path, base, git_dir=worktree.git_dir).patch == patch
     assert not (worktree.path / "debris.txt").exists()
     assert not (worktree.path / "nested").exists()
 
@@ -461,7 +465,7 @@ def test_rebuild_handles_an_empty_patch(git_repo, tmp_path):
 
     rebuild_worktree(git_repo, worktree, b"")
 
-    assert capture_changes(worktree.path, base).patch == ""
+    assert capture_changes(worktree.path, base, git_dir=worktree.git_dir).patch == ""
     assert not (worktree.path / "debris.txt").exists()
 
 
@@ -487,7 +491,7 @@ def test_rebuild_leaves_the_checkout_and_no_scratch_when_the_patch_will_not_appl
 def test_rebuild_refuses_a_patch_that_does_not_reproduce_itself(git_repo, tmp_path):
     worktree, base = _linked_worktree(git_repo, tmp_path)
     (worktree.path / "work.txt").write_text("work\n", encoding="utf-8")
-    patch = capture_changes(worktree.path, base).patch
+    patch = capture_changes(worktree.path, base, git_dir=worktree.git_dir).patch
     # Applies cleanly, but capture would not produce these bytes.
     altered = ("# a leading comment git apply ignores\n" + patch).encode()
     (worktree.path / "not-in-the-patch.txt").write_text("kept\n", encoding="utf-8")

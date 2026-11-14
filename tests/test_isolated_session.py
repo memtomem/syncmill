@@ -539,10 +539,10 @@ def test_checkpoint_and_close_are_serialized(monkeypatch, git_repo, tmp_path):
     original_capture = isolated._strict_checkpoint_patch
     errors: list[BaseException] = []
 
-    def slow_capture(workdir: Path, base: str):
+    def slow_capture(workdir: Path, base: str, control_repo: Path):
         entered.set()
         assert release.wait(5)
-        return original_capture(workdir, base)
+        return original_capture(workdir, base, control_repo)
 
     monkeypatch.setattr(isolated, "_strict_checkpoint_patch", slow_capture)
 

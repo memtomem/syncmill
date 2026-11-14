@@ -1,6 +1,6 @@
 # Targeted room repair: design for #173
 
-Status: **APPROVED** 2026-11-09. PR 1 (section 9) is implemented; the rest is not. Baseline:
+Status: **APPROVED** 2026-11-09. PR 1 and PR 2 (section 9) are implemented; the rest is not. Baseline:
 main @ `132e6c4`, before #273 changed what a retained worktree holds. Where that moved a
 decision, the section says so. The proposed answers in section 14 are the approved ones, except
 where decision 5 says otherwise.
