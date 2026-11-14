@@ -3165,7 +3165,7 @@ def test_a_failed_patch_capture_keeps_the_node_workspace(
     """
     from syncmill.worktree import PatchCaptureError
 
-    def boom(path, base=None):
+    def boom(path, base=None, *, git_dir):
         raise PatchCaptureError("patch capture failed: simulated git failure")
 
     monkeypatch.setattr("syncmill.strategies.base.capture_changes", boom)

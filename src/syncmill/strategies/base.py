@@ -37,7 +37,6 @@ from syncmill.agents import (
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.git_env import isolated_git_env
 from syncmill.memory import SyncmillMemory
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
@@ -48,6 +47,7 @@ from syncmill.worktree import (
     WorktreePool,
     _run_git,
     capture_changes,
+    pinned_git_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -311,7 +311,11 @@ def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
             raise PatchCaptureError(result.capture_error)
         return
     if worktree.is_git and result.status == TaskStatus.COMPLETED:
-        changes = capture_changes(worktree.path, getattr(worktree, "base_commit", None))
+        changes = capture_changes(
+            worktree.path,
+            getattr(worktree, "base_commit", None),
+            git_dir=getattr(worktree, "git_dir", None),
+        )
         result.files_changed = list(changes.files)
         result.patch = changes.patch
 
@@ -339,7 +343,7 @@ def _bounded_head(text: str, max_bytes: int) -> str:
 
 
 def _git_stdout_head(
-    cmd: list[str], workdir: Path, max_bytes: int
+    cmd: list[str], workdir: Path, max_bytes: int, *, git_dir: Path | None = None
 ) -> tuple[bytes, bool] | None:
     """Read at most ``max_bytes`` of a git command's stdout, then stop it.
 
@@ -350,10 +354,11 @@ def _git_stdout_head(
     ``(head, truncated)``, or ``None`` on any failure/timeout — best-effort,
     like every diff helper here.
     """
+    env = pinned_git_env(workdir, git_dir)
     if os.name != "posix":
         proc = _run_git(
             cmd, capture_output=True, cwd=str(workdir),
-            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
+            env=env, timeout=_GIT_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0:
             return None
@@ -362,7 +367,7 @@ def _git_stdout_head(
     proc = subprocess.Popen(
         cmd,
         cwd=str(workdir),
-        env=isolated_git_env(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -419,7 +424,11 @@ def _git_stdout_head(
 
 
 def _git_diff_excerpt(
-    workdir: Path, base_commit: str | None = None, *, max_bytes: int = 12_000
+    workdir: Path,
+    base_commit: str | None = None,
+    *,
+    max_bytes: int = 12_000,
+    git_dir: Path | None = None,
 ) -> str | None:
     """Truncation-aware diff excerpt for the judge prompt (#116).
 
@@ -434,7 +443,7 @@ def _git_diff_excerpt(
     try:
         add = _run_git(
             ["git", "add", "-A"], capture_output=True, cwd=str(workdir),
-            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
+            env=pinned_git_env(workdir, git_dir), timeout=_GIT_TIMEOUT_SECONDS,
         )
         if add.returncode != 0:
             return None
@@ -447,6 +456,7 @@ def _git_diff_excerpt(
             ["git", "diff", "--cached", "--no-color", "--stat", base],
             workdir,
             stat_budget,
+            git_dir=git_dir,
         )
         if stat_head is None:
             return None
@@ -456,7 +466,8 @@ def _git_diff_excerpt(
             stat_text += _EXCERPT_TRUNCATION_MARKER + "\n"
         diff_budget = max(1, max_bytes - len(stat_bytes))
         head = _git_stdout_head(
-            ["git", "diff", "--cached", "--no-color", base], workdir, diff_budget
+            ["git", "diff", "--cached", "--no-color", base], workdir, diff_budget,
+            git_dir=git_dir,
         )
         if head is None:
             return None
@@ -1018,6 +1029,7 @@ def _select_winner(
                 excerpt = _git_diff_excerpt(
                     worktree.path, getattr(worktree, "base_commit", None),
                     max_bytes=12_000,
+                    git_dir=getattr(worktree, "git_dir", None),
                 )
             else:
                 excerpt = None

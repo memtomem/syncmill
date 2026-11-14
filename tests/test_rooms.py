@@ -482,7 +482,7 @@ def test_completed_patch_capture_failure_is_preserved_but_not_eligible(
     )
     from syncmill.worktree import PatchCaptureError
 
-    def fail(*args):
+    def fail(*args, git_dir):
         raise PatchCaptureError("injected patch failure")
 
     monkeypatch.setattr(rooms_module, "capture_changes", fail)
