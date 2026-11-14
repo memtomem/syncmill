@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes its running matrix. Each push
+# to main gets a group of its own: a shared group would let a third push replace
+# the pending second run even without cancel-in-progress, and every merged
+# commit keeps a complete result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Pin the uv toolchain so CI and the release build resolve identically.
 # Keep in lockstep with the same pin in release.yml (Dependabot cannot bump
 # a `with:` input).
@@ -17,9 +25,10 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: ${{ env.UV_VERSION }}
           python-version: "3.12"
@@ -27,27 +36,40 @@ jobs:
       - run: uv sync --locked --group dev
       - run: uv run ruff check .
 
+  # The full hermetic suite on every supported Python, plus macOS (a supported
+  # platform) on the oldest one.
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      - run: uv sync --locked --group dev
-      - run: uv run pytest -q
+      # Runner macOS system Python may omit SQLite extension loading, which the
+      # real memtomem store needs (same as memory-backend-real below).
+      - if: runner.os == 'macOS'
+        run: uv sync --locked --group dev --managed-python
+      - if: runner.os != 'macOS'
+        run: uv sync --locked --group dev
+      - run: uv run pytest -q --durations=25
 
   posix-process:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: ${{ env.UV_VERSION }}
           python-version: "3.12"
@@ -56,7 +78,7 @@ jobs:
       - run: sudo apt-get install -y tmux
       - run: tmux -V && grep PRETTY_NAME /etc/os-release
       - run: uv sync --locked --group dev
-      - run: SYNCMILL_TEST_TUI_PROCESS=1 SYNCMILL_TEST_TUI_PTY=1 SYNCMILL_TEST_TMUX=1 uv run pytest -q tests/test_tui_jobs.py tests/test_tui_pty.py tests/test_isolated_session_tmux.py
+      - run: SYNCMILL_TEST_TUI_PROCESS=1 SYNCMILL_TEST_TUI_PTY=1 SYNCMILL_TEST_TMUX=1 uv run pytest -q tests/test_tui_jobs.py tests/test_tui_pty.py tests/test_isolated_session_tmux.py tests/test_workflow_durable.py
 
   # Real tmux (incl. the PTY attach/detach state machine) on both Linux and
   # macOS — the room viewer's tmux surface cannot be covered hermetically.
@@ -66,9 +88,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: ${{ env.UV_VERSION }}
           python-version: "3.12"
@@ -87,9 +110,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Setup, then the memtomem 0.4 upgrade test (up to 900s on a cold uv cache)
+    # and the remaining real-store tests.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: ${{ env.UV_VERSION }}
           python-version: "3.12"

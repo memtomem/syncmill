@@ -2033,6 +2033,7 @@ def _controlled_path(tmp_path: Path) -> str:
 
 @pytest.mark.skipif(os.environ.get("SYNCMILL_TEST_SELFBENCH_REAL") != "1",
                     reason="set SYNCMILL_TEST_SELFBENCH_REAL=1 to run real syncmill")
+@pytest.mark.timeout(900)  # the bench gives the real run a 600s budget
 @pytest.mark.parametrize(
     ("case", "expected"),
     [

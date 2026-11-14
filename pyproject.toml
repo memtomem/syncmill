@@ -73,11 +73,15 @@ dev = [
     # strings, escaped backticks, reference-style links). Declared explicitly,
     # not leaned on as a transitive of textual's rich.
     "markdown-it-py>=3",
+    "pytest-timeout>=2.4.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# A hung test fails instead of holding the run. The slowest test takes about
+# 5s locally (`--durations`), so 120s leaves room for slow CI runners.
+timeout = 120
 markers = [
     "integration: opt-in tests that exercise optional real backends",
 ]
