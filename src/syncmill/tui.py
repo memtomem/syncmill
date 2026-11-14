@@ -1133,12 +1133,13 @@ class SyncmillTuiApp(App[None]):
         self,
         waiter: ReadyWaiter,
         prepare: Callable[[Outcome], tuple[str, SeverityLevel]],
-        after: Callable[[], None] | None = None,
     ) -> None:
         """Wait for a held waiter in a thread worker. ``prepare`` turns the
         outcome into a notification on that thread (it may read log files);
-        only the finished notification, then ``after``, run on the Textual
-        thread, and nothing does once the app is going away."""
+        only the finished notification runs on the Textual thread, and not
+        once the app is going away. It touches no widget: the screen can be
+        gone before unmount sets the cancel flag. A failure here is a lost
+        notification, never a reason to exit the app."""
 
         def work() -> None:
             try:
@@ -1155,25 +1156,18 @@ class SyncmillTuiApp(App[None]):
             except Exception as exc:  # a worker error would exit the app
                 message, severity = f"could not read why the worker stopped: {exc}", "error"
             try:
-                self.call_from_thread(self._deliver_readiness, message, severity, after)
+                self.call_from_thread(self._deliver_readiness, message, severity)
             except RuntimeError:
                 pass  # the app stopped between the check and the call
 
-        self.run_worker(work, thread=True, group="readiness")
+        self.run_worker(work, thread=True, group="readiness", exit_on_error=False)
 
-    def _deliver_readiness(
-        self,
-        message: str,
-        severity: SeverityLevel,
-        after: Callable[[], None] | None = None,
-    ) -> None:
+    def _deliver_readiness(self, message: str, severity: SeverityLevel) -> None:
         # Textual keeps its loop through unmount, so a call can still land
         # after teardown began: the flag, not call_from_thread, drops it.
         if self._readiness_cancel.is_set():
             return
         self.notify(message, severity=severity)
-        if after is not None:
-            after()
 
     def _await_job(self, launched: LaunchedJob, op: str) -> None:
         job_id = launched.row["job_id"][:8]
@@ -3280,7 +3274,7 @@ class SyncmillTuiApp(App[None]):
                 "error",
             )
 
-        self._await_readiness(started.waiter, prepare, self._refresh_rooms)
+        self._await_readiness(started.waiter, prepare)
         self._refresh_rooms()
 
     def action_judge(self) -> None:

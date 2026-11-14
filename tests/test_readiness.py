@@ -841,7 +841,6 @@ def test_tui_survives_a_diagnostic_that_raises(tmp_path, git_repo, monkeypatch):
 
 def test_tui_exit_closes_pending_waiters_and_drops_late_outcomes(tmp_path, git_repo, monkeypatch):
     notes: list[str] = []
-    after: list[bool] = []
 
     async def scenario():
         app = _tui(tmp_path, git_repo)
@@ -861,10 +860,10 @@ def test_tui_exit_closes_pending_waiters_and_drops_late_outcomes(tmp_path, git_r
         signal_ready(jobs.write_fd)
         time.sleep(0.5)
         # A delivery that still lands after unmount is dropped by the flag.
-        app._deliver_readiness("late", "information", lambda: after.append(True))
+        app._deliver_readiness("late", "information")
 
     _drive(scenario())
-    assert notes == [] and after == []
+    assert notes == []
 
 
 def test_tui_exit_closes_a_waiter_whose_thread_never_started(tmp_path, git_repo, monkeypatch):
@@ -1060,3 +1059,30 @@ def test_a_detached_workflow_whose_session_close_fails_says_it_started(
     assert res.exit_code != 0
     assert "detached workflow-run job 01234567 started, but closing" in res.output
     assert waiters[0]._fd is None
+
+
+def test_a_failing_readiness_delivery_never_exits_the_tui(tmp_path, git_repo, monkeypatch):
+    """CI caught the screen gone before unmount set the cancel flag: whatever
+    the delivery raises, the readiness worker must not take the app down."""
+    from textual.css.query import NoMatches
+
+    async def scenario():
+        app = _tui(tmp_path, git_repo)
+        jobs = _ReadyJobs(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._jobs = jobs
+
+            def gone(*args, **kwargs):
+                raise NoMatches("No nodes match '#room-list'")
+
+            monkeypatch.setattr(app, "notify", gone)
+            app._launch_job(_BOARD_FIELDS, None)
+            signal_ready(jobs.write_fd)
+            # wait_for_complete() would re-raise the worker's error itself.
+            await _until(pilot, lambda: all(w.is_finished for w in app.workers))
+            await pilot.pause(0.2)
+            assert app.is_running
+            assert app.return_code is None
+
+    _drive(scenario())
