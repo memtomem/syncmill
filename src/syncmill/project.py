@@ -20,6 +20,8 @@ import tomlkit.exceptions
 from syncmill import teamfile
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import isolated_git_env
+from syncmill.artifacts import _git_timed_out
+from syncmill.worktree import _run_git
 
 
 logger = logging.getLogger(__name__)
@@ -51,12 +53,14 @@ def git_root(path: Path) -> Path:
     ``--repo`` path as a configuration problem.
     """
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=str(path), env=isolated_git_env(), capture_output=True, text=True,
         )
     except OSError as exc:
         raise ProjectError(f"cannot inspect as a Git repository: {path} ({exc})") from exc
+    if _git_timed_out(proc):
+        raise ProjectError(f"git timed out inspecting {path}")
     if proc.returncode != 0:
         raise ProjectError(f"not a Git repository: {path}")
     return Path(proc.stdout.strip()).resolve()
@@ -249,7 +253,7 @@ def _index_supply(root: Path) -> str | None:
     argv = ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"]
     argv.extend(_alias_pathspecs(root, _MARKER_DIR))
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             argv, cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
     except OSError:
@@ -369,7 +373,7 @@ def _head_entries(root: Path, treeish: str) -> list[tuple[str, str]] | None:
 def _git_query(root: Path, args: list[str]) -> subprocess.CompletedProcess | None:
     """Run a read-only git query, or ``None`` when it could not run at all."""
     try:
-        return subprocess.run(
+        return _run_git(
             ["git", *args], cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
     except OSError:
@@ -551,7 +555,7 @@ def _require_ignored_state_root(
     relative_text = relative.as_posix().rstrip("/")
     probes = (relative_text, f"{relative_text}/", f"{relative_text}/.syncmill-probe")
     for probe in probes:
-        ignored = subprocess.run(
+        ignored = _run_git(
             ["git", "check-ignore", "-q", "--no-index", "--", probe],
             cwd=str(repository),
             env=env,
@@ -918,7 +922,7 @@ def _path_is_ignored(root: Path, relative: str) -> bool:
     would append one more identical line.
     """
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "check-ignore", "-q", "--no-index", "--", relative],
             cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
@@ -1052,7 +1056,7 @@ def _write_init_artifacts(
 
 def _extend_info_exclude(root: Path) -> None:
     """Append syncmill's rules to `.git/info/exclude` (machine-local)."""
-    exclude_probe = subprocess.run(
+    exclude_probe = _run_git(
         ["git", "rev-parse", "--git-path", "info/exclude"],
         cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
     )

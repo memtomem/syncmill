@@ -478,7 +478,7 @@ def test_marker_is_distrusted_when_git_cannot_answer(git_repo, monkeypatch):
     def boom(*args, **kwargs):
         raise OSError("no git")
 
-    monkeypatch.setattr("syncmill.project.subprocess.run", boom)
+    monkeypatch.setattr("syncmill.project._run_git", boom)
     assert project_id(git_repo) == _path_hash_id(git_repo)
 
 
@@ -651,14 +651,14 @@ def test_trackedness_survives_an_undecodable_sibling_name(git_repo, monkeypatch)
         b"100644 bb 0\t.syncmill/project.json\x00"
     )
 
-    real_run = sp.run  # captured BEFORE patching: `sp` is the patched module
+    from syncmill.worktree import _run_git as real_run
 
     def fake_run(argv, **kwargs):
         if argv[:2] == ["git", "ls-files"]:
             return sp.CompletedProcess(argv, 0, stdout=listing, stderr=b"")
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr("syncmill.project.subprocess.run", fake_run)
+    monkeypatch.setattr("syncmill.project._run_git", fake_run)
     # The marker's own path is in the listing, so it is tracked and rejected —
     # the point is that the undecodable sibling did not crash the read.
     assert project_id(git_repo) == _path_hash_id(git_repo)
@@ -787,14 +787,14 @@ def test_init_refuses_to_write_when_the_index_cannot_be_read(git_repo, monkeypat
     import subprocess as sp
 
     _write_marker(git_repo, "local-machine-id")
-    real_run = sp.run  # captured BEFORE patching: `sp` is the patched module
+    from syncmill.worktree import _run_git as real_run
 
     def fake_run(argv, **kwargs):
         if argv[:2] == ["git", "ls-files"]:
             return sp.CompletedProcess(argv, 128, stdout=b"", stderr=b"broken index")
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr("syncmill.project.subprocess.run", fake_run)
+    monkeypatch.setattr("syncmill.project._run_git", fake_run)
     with pytest.raises(ProjectError, match="status could not be read"):
         _init(git_repo)
 

@@ -995,3 +995,34 @@ def test_apply_closes_both_adapters_when_one_close_fails(migration_env, monkeypa
     with pytest.raises(RuntimeError, match="close failed"):
         run_async(mm.apply_migration(config, migration_id))
     assert sorted(closed) == ["mem0", "memtomem"]
+
+
+def test_atomic_json_is_durable_before_and_after_it_is_published(tmp_path, monkeypatch):
+    """Order matters, not just the count: the data reaches the disk before the
+    rename, and the rename reaches it before the writer returns."""
+    import stat as stat_mod
+
+    events: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        mode = os.fstat(fd).st_mode
+        kind = "file" if stat_mod.S_ISREG(mode) else "dir" if stat_mod.S_ISDIR(mode) else "?"
+        if kind == "file":
+            # The bytes are already in the file being synced.
+            events.append(f"fsync-file:{os.fstat(fd).st_size > 0}")
+        else:
+            events.append(f"fsync-{kind}")
+        real_fsync(fd)
+
+    def replace(src, dst):
+        events.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(mm.os, "fsync", fsync)
+    monkeypatch.setattr(mm.os, "replace", replace)
+    target = tmp_path / "state.json"
+    mm._atomic_json(target, {"status": "applied"})
+    assert events == ["fsync-file:True", "replace", "fsync-dir"]
+    assert json.loads(target.read_text()) == {"status": "applied"}
+    assert stat_mod.S_IMODE(target.stat().st_mode) == 0o600

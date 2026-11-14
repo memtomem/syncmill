@@ -587,3 +587,61 @@ def test_control_non_utf8_stderr_is_reported_as_the_exit(tmp_path):
                         control_plan={"nodes": []})
     assert out.should_block is False
     assert out.warnings == ["control preflight exited 1: cannot open /tmp/caf�.json"]
+
+
+# ── output bound ────────────────────────────────────────────────────────────
+
+
+def _loud_toolgraph(tmp_path: Path) -> str:
+    """A real binary that floods both streams and then fails."""
+    script = tmp_path / "toolgraph"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "chunk = b'x' * 65536\n"
+        "for _ in range(64):\n"
+        "    os.write(1, chunk)\n"
+        "    os.write(2, chunk)\n"
+        "os.write(2, b'\\nfinal error\\n')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+@pytest.mark.parametrize("path", ["advisory", "strict", "control"])
+def test_the_runner_keeps_a_bounded_tail_of_each_stream(tmp_path, monkeypatch, path):
+    """4 MiB on each stream comes back as at most the tail the snippet needs."""
+    import syncmill.preflight as pf
+
+    real = pf._sync_run
+    kept: list[tuple[int, int]] = []
+
+    def spy(*args, **kwargs):
+        proc = real(*args, **kwargs)
+        kept.append((len(proc.stdout), len(proc.stderr)))
+        return proc
+
+    monkeypatch.setattr(pf, "_sync_run", spy)
+    tool = _loud_toolgraph(tmp_path)
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    if path == "advisory":
+        out = run_preflight(_cfg(command=[tool]), run_id="r1", agent_ids=["codex"],
+                            out_dir=None)
+        prefix = "preflight exited 1: "
+    elif path == "strict":
+        cfg = _strict_cfg(command=[tool], agent_map={"codex": "codex"},
+                          unavailable_policy="warn")
+        out = run_preflight(cfg, run_id="r1", agent_ids=["codex"], out_dir=out_dir)
+        prefix = "preflight exited 1: "
+    else:
+        cfg = _cfg(command=[tool], control_plan_enabled=True,
+                   candidate_tools=["alpha::read"], control_plan_command=[tool])
+        out = run_preflight(cfg, run_id="r1", agent_ids=["codex"], out_dir=None,
+                            control_plan={"nodes": []})
+        prefix = "control preflight exited 1: "
+    assert kept and all(o <= pf._OUTPUT_TAIL_CHARS and e <= pf._OUTPUT_TAIL_CHARS
+                        for o, e in kept), kept
+    assert any(w.startswith(prefix) for w in out.warnings), out.warnings

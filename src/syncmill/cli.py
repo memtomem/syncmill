@@ -193,6 +193,7 @@ from syncmill.terminal import (
 )
 from syncmill.worktree import (
     WorkspaceError,
+    _run_git,
     capture_repository_snapshot,
     cleanup_orphaned_worktrees,
     discard_retained_workspace,
@@ -853,7 +854,7 @@ def _gate_for_this_run(commands: list[str] | None):
 
 
 def _dirty_count(root: Path) -> int:
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "status", "--porcelain"], cwd=str(root),
         capture_output=True, text=True, env=isolated_git_env(),
     )
@@ -1315,7 +1316,7 @@ def subprocess_status_dirty(root: Path) -> bool:
     reported an unreadable or rejected repository ("dubious ownership") as
     having nothing to preserve.
     """
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "status", "--porcelain"], cwd=str(root),
         capture_output=True, text=True, env=isolated_git_env(),
     )

@@ -1349,27 +1349,93 @@ def test_scratch_ledger_upgrade_backfills_history_and_is_idempotent(tmp_path, cl
         reopened.close()
 
 
-def test_next_runnable_corrupt_depends_on_raises_board_error_no_dangling_txn(tmp_path):
-    # FIX: a corrupt depends_on JSON surfaces as BoardError (like get/list) AND rolls
-    # back the BEGIN IMMEDIATE — else the lock leaks and the next op fails with
-    # "cannot start a transaction within a transaction".
-    import sqlite3
+def test_next_runnable_error_mid_scan_raises_board_error_no_dangling_txn(
+    tmp_path, monkeypatch
+):
+    # A non-sqlite error inside the claim transaction surfaces as BoardError
+    # AND rolls back the BEGIN IMMEDIATE, else the lock leaks and the next op
+    # fails with "cannot start a transaction within a transaction".
+    import syncmill.board as board_mod
+
+    bd = Board(str(tmp_path / "b.db"))
+    try:
+        bd.add("x", depends_on=[str(uuid.uuid4())])
+
+        def boom(raw):
+            raise ValueError("injected")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(board_mod, "_parse_deps", boom)
+            with pytest.raises(BoardError, match="injected"):
+                bd.next_runnable("r1")
+        # rolled back cleanly → a fresh BEGIN IMMEDIATE op works (no dangling txn)
+        assert bd.recover_stale_running() == 0
+    finally:
+        bd.close()
+
+
+_DAMAGED_DEPENDS_ON = {
+    "invalid-json": "[oops",
+    "null": "null",
+    "int": "5",
+    "nested-list": '[["a"]]',
+    "deep": "[" * 100000 + "]" * 100000,
+    "empty-object": "{}",
+    "empty-string": '""',
+    "string": '"abc"',
+    "object": '{"x": 1}',
+    "list-of-int": "[1]",
+}
+
+
+@pytest.mark.parametrize("raw", list(_DAMAGED_DEPENDS_ON.values()), ids=list(_DAMAGED_DEPENDS_ON))
+def test_next_runnable_skips_an_unreadable_depends_on_and_claims_the_rest(
+    tmp_path, caplog, raw
+):
+    # One damaged row neither blocks every other item's claim nor gets claimed
+    # itself, including the shapes that iterate without error: an empty {} or
+    # "" made every dependency vacuously done, and "abc" / {"x": 1} were read
+    # as ids a, b, c / x, which are all done here.
     db = str(tmp_path / "b.db")
     bd = Board(db)
-    it = bd.add("x")
-    bd.close()
-    raw = sqlite3.connect(db)
-    raw.execute("UPDATE work_items SET depends_on='not json' WHERE id=?", (it.id,))
-    raw.commit()
-    raw.close()
-    bd2 = Board(db)
     try:
-        with pytest.raises(BoardError):
-            bd2.next_runnable("r1")
-        # rolled back cleanly → a fresh BEGIN IMMEDIATE op works (no dangling txn)
-        assert bd2.recover_stale_running() == 0
+        head = bd.add("damaged head", goal="g")
+        tail = bd.add("healthy tail", goal="g")
+        for done_id in ("a", "b", "c", "x", "1"):
+            done = bd.add(f"done {done_id}")
+            bd._conn.execute(
+                "UPDATE work_items SET id=?, state='done' WHERE id=?", (done_id, done.id)
+            )
+        bd._conn.execute("UPDATE work_items SET depends_on=? WHERE id=?", (raw, head.id))
+        with caplog.at_level("WARNING", logger="syncmill.board"):
+            claimed = bd.next_runnable("r1")
+        assert claimed is not None and claimed.id == tail.id
+        # Read raw: get() renders depends_on through _load_list, whose repr of
+        # a deeply nested list overflows on 3.14 (json.loads accepts it there).
+        state = bd._conn.execute(
+            "SELECT state FROM work_items WHERE id=?", (head.id,)
+        ).fetchone()["state"]
+        assert state == WorkState.PLANNED.value
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert [head.id in r.getMessage() for r in warnings] == [True]
+        # The goal-scoped claim takes the same path.
+        assert bd.next_runnable("r2", goal="g") is None
     finally:
-        bd2.close()
+        bd.close()
+
+
+def test_next_runnable_still_dispatches_a_valid_dependency_list(tmp_path, caplog):
+    bd = Board(str(tmp_path / "b.db"))
+    try:
+        dep = bd.add("dep")
+        item = bd.add("item", depends_on=[dep.id])
+        bd._conn.execute("UPDATE work_items SET state='done' WHERE id=?", (dep.id,))
+        with caplog.at_level("WARNING", logger="syncmill.board"):
+            claimed = bd.next_runnable("r1")
+        assert claimed is not None and claimed.id == item.id
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    finally:
+        bd.close()
 
 
 # ── __init__ closes the connection on open failure (W7) ──────────────────────
