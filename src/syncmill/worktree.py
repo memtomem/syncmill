@@ -129,6 +129,22 @@ def _run_git(cmd, **kwargs):
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
+def git_apply_argv(*flags: str) -> list[str]:
+    """Argv that applies a stored patch from stdin, immune to ``apply.whitespace``.
+
+    Every patch syncmill applies (to the source, a verify clone, a rebuilt
+    checkout, or in reverse to roll one back) is bytes it captured itself
+    and the caller has reviewed or digest-checked. Without an explicit
+    ``--whitespace``, ``git apply`` follows the user's ``apply.whitespace``:
+    ``fix`` rewrites the whitespace on lines it adds (forward, or the lines
+    a reverse restores) and still exits 0, while ``error`` refuses the patch.
+    Each one breaks "apply what was reviewed", so the option is fixed here.
+    Working-tree conversions (``core.autocrlf``, ``eol`` and filter
+    attributes) still apply, as they do to any checkout of that repository.
+    """
+    return ["git", "apply", *flags, "--binary", "--whitespace=nowarn", "-"]
+
+
 @dataclass
 class Worktree:
     path: Path
@@ -684,7 +700,7 @@ def _checkout_from_patch(
     worktree.git_dir = trusted_admin_dir(control_repo, worktree.path)
     if patch:
         proc = _run_git(
-            ["git", "apply", "--binary", "-"],
+            git_apply_argv(),
             cwd=str(worktree.path), env=env,
             input=patch, capture_output=True,
         )

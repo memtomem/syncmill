@@ -120,7 +120,7 @@ Request flow (`CLI → Supervisor.run`, in `supervisor.py`):
 Rules that must hold:
 
 - Project/run ids are single path components; directories below the root are not symlinks; artifact files are regular, singly linked files. Unsafe access raises `ArtifactError`. An explicit manifest `run_id`/`project_id` must match its location (missing legacy fields stay readable, no read-time writes).
-- Read result sidecars with `read_result`, never by reopening `RunArtifact.path`. Apply/check/rollback pass the same digest-verified patch bytes to Git over stdin.
+- Read result sidecars with `read_result`, never by reopening `RunArtifact.path`. Apply/check/rollback pass the same digest-verified patch bytes to Git over stdin, with argv from `worktree.git_apply_argv` (`--whitespace=nowarn`; `test_apply_whitespace.py` guards literal `["git", "apply", ...]`).
 - `list_detailed` reports each omitted directory or symlink entry as a `SkippedRun` (regular files such as `.apply.lock` are ignored, not skipped) (raw name + fixed reason category; render with `printable_name`) so listings never show a corrupt-only store as healthy-empty; skipped entries are never repaired or pruned. A runs root replaced mid-enumeration (`ESTALE`) raises.
 - The state root and its ancestors are trusted: this blocks traversal and symlink redirection, not a same-credential actor.
 
