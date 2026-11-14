@@ -1410,7 +1410,12 @@ def test_next_runnable_skips_an_unreadable_depends_on_and_claims_the_rest(
         with caplog.at_level("WARNING", logger="syncmill.board"):
             claimed = bd.next_runnable("r1")
         assert claimed is not None and claimed.id == tail.id
-        assert bd.get(head.id).state == WorkState.PLANNED
+        # Read raw: get() renders depends_on through _load_list, whose repr of
+        # a deeply nested list overflows on 3.14 (json.loads accepts it there).
+        state = bd._conn.execute(
+            "SELECT state FROM work_items WHERE id=?", (head.id,)
+        ).fetchone()["state"]
+        assert state == WorkState.PLANNED.value
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert [head.id in r.getMessage() for r in warnings] == [True]
         # The goal-scoped claim takes the same path.
