@@ -56,7 +56,12 @@ jobs:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      - run: uv sync --locked --group dev
+      # Runner macOS system Python may omit SQLite extension loading, which the
+      # real memtomem store needs (same as memory-backend-real below).
+      - if: runner.os == 'macOS'
+        run: uv sync --locked --group dev --managed-python
+      - if: runner.os != 'macOS'
+        run: uv sync --locked --group dev
       - run: uv run pytest -q --durations=25
 
   posix-process:
