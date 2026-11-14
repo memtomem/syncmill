@@ -605,6 +605,9 @@ class _FakeRoomStore:
     def get_candidate(self, candidate_id):
         return {"id": candidate_id}
 
+    def round_room_id(self, round_id):
+        return "room-1"
+
     def load_candidate(self, candidate_id):
         return {"candidate_id": candidate_id, "patch_sha256": "abc123"}
 
@@ -1260,6 +1263,9 @@ class _FakeCandidateRoomStore:
 
     def get_candidate(self, candidate_id):
         return dict(self.rows[candidate_id])
+
+    def round_room_id(self, round_id):
+        return "room-1"
 
     def get_round(self, round_id):
         return {"id": round_id, "number": 3}
@@ -2253,6 +2259,222 @@ def test_rooms_late_candidate_read_failure_keeps_both_panes(
             assert (
                 str(app.query_one("#candidate-detail").render()) == candidate_before
             )
+
+    drive(scenario())
+
+
+def test_an_unreadable_candidate_marks_its_pane_and_the_room_still_refreshes(
+    tmp_path, git_repo, monkeypatch
+):
+    """A RoomError from the candidate's own artifact is that candidate's
+    damage: the room's other panes refresh, the candidate pane says it is
+    unreadable, and nothing is cached, so a repair shows on the next poll."""
+    from syncmill.rooms import RoomError
+
+    class _DamagedArtifactStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+            self.patch_reads = 0
+
+        def get_room(self, room_id):
+            room = super().get_room(room_id)
+            if self.broken:
+                room["state"] = "awaiting_decision"  # the room pane changes
+            return room
+
+        def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+            self.patch_reads += 1
+            if self.broken:
+                raise RoomError(f"candidate round binding mismatch: {candidate_id}")
+            return super().load_candidate_patch_head(candidate_id, max_patch_bytes)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _DamagedArtifactStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+            store.broken = True
+            store.rows["cand-ok"]["patch_sha256"] = "p-new"  # key changes → re-read
+            app._poll()
+            await pilot.pause()
+            status = str(app.query_one("#room-status").render())
+            assert "DEGRADED" not in status and "rooms:" in status
+            assert "awaiting_decision" in str(app.query_one("#room-detail").render())
+            detail = str(app.query_one("#candidate-detail").render())
+            assert "unreadable" in detail and "cand-ok" in detail
+            assert app._selected_candidate_id == "cand-ok"
+            # Never cached: the next poll reads again, and a repair shows.
+            reads = store.patch_reads
+            app._poll()
+            await pilot.pause()
+            assert store.patch_reads == reads + 1
+            store.broken = False
+            app._poll()
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+
+    drive(scenario())
+
+
+def test_a_round_that_leaves_the_room_invalidates_the_cached_pane(
+    tmp_path, git_repo, monkeypatch
+):
+    """The cache key carries the round's binding: a candidate shown while its
+    round was intact is validated again once the round moves or vanishes."""
+    from syncmill.rooms import RoomError
+
+    class _MovingRoundStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.round_room = "room-a"
+
+        def round_room_id(self, round_id):
+            return self.round_room
+
+        def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+            if self.round_room != "room-a":
+                raise RoomError(f"candidate round binding mismatch: {candidate_id}")
+            return super().load_candidate_patch_head(candidate_id, max_patch_bytes)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _MovingRoundStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+            store.round_room = None  # the round is gone; the row is unchanged
+            app._poll()
+            await pilot.pause()
+            assert "unreadable" in str(app.query_one("#candidate-detail").render())
+            store.round_room = "room-a"
+            app._poll()
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+
+    drive(scenario())
+
+
+def test_a_candidate_moved_to_another_round_invalidates_the_cached_pane(
+    tmp_path, git_repo, monkeypatch
+):
+    """The candidate's own round id is in the key too: a row pointed at another
+    round of the same room is validated again, then shows once restored."""
+    from syncmill.rooms import RoomError
+
+    class _RepointedStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            for row in self.rows.values():
+                row["round_id"] = "round-1"
+
+        def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+            if self.rows[candidate_id]["round_id"] != "round-1":
+                raise RoomError(f"candidate round_id binding mismatch: {candidate_id}")
+            return super().load_candidate_patch_head(candidate_id, max_patch_bytes)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _RepointedStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+            store.rows["cand-ok"]["round_id"] = "round-2"  # same room, digests unchanged
+            app._poll()
+            await pilot.pause()
+            assert "unreadable" in str(app.query_one("#candidate-detail").render())
+            store.rows["cand-ok"]["round_id"] = "round-1"
+            app._poll()
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+
+    drive(scenario())
+
+
+def test_a_candidate_row_that_cannot_be_read_marks_only_its_pane(
+    tmp_path, git_repo, monkeypatch
+):
+    from syncmill.rooms import RoomError
+
+    class _VanishingRowStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+            self.row_reads = 0
+
+        def get_room(self, room_id):
+            room = super().get_room(room_id)
+            if self.broken:
+                room["state"] = "awaiting_decision"
+            return room
+
+        def get_candidate(self, candidate_id):
+            self.row_reads += 1
+            if self.broken:
+                raise RoomError(f"unknown candidate: {candidate_id}")
+            return super().get_candidate(candidate_id)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _VanishingRowStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            store.broken = True
+            app._poll()
+            await pilot.pause()
+            assert "DEGRADED" not in str(app.query_one("#room-status").render())
+            assert "awaiting_decision" in str(app.query_one("#room-detail").render())
+            detail = str(app.query_one("#candidate-detail").render())
+            assert "unreadable" in detail and "unknown candidate" in detail
+            reads = store.row_reads
+            store.broken = False
+            app._poll()
+            await pilot.pause()
+            assert store.row_reads > reads
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+
+    drive(scenario())
+
+
+def test_switching_view_after_an_unreadable_diff_reads_the_output(
+    tmp_path, git_repo, monkeypatch
+):
+    from syncmill.rooms import RoomError
+
+    class _BadPatchStore(_FakeCandidateRoomStore):
+        def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+            raise RoomError(f"candidate patch digest mismatch: {candidate_id}")
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_BadPatchStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert "unreadable" in str(app.query_one("#candidate-detail").render())
+            assert "DEGRADED" not in str(app.query_one("#room-status").render())
+            assert app._show_candidate_as("cand-ok", "output", 1)
+            await pilot.pause()
+            assert "provider said hi" in str(app.query_one("#candidate-detail").render())
 
     drive(scenario())
 

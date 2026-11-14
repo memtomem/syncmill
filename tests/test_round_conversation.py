@@ -100,8 +100,8 @@ def test_builder_reports_exactly_the_candidates_in_its_prompt(git_repo, tmp_path
             monkeypatch.setattr(rooms_module, "_ROOM_PROMPT_MAX_BYTES", cap)
         rows = coordinator.store.candidate_rows(room["id"])
         for kwargs in ({}, {"exclude_member": "claude", "min_round_number": 1}):
-            prompt, included, omitted = coordinator._checkpoint(room["id"], "next", **kwargs)
-            assert prompt == coordinator._prompt_with_checkpoint(room["id"], "next", **kwargs)
+            prompt, included, omitted = coordinator._checkpoint(room["id"], "next", round_number=3, **kwargs)
+            assert prompt == coordinator._prompt_with_checkpoint(room["id"], "next", round_number=3, **kwargs)
             assert _BLOCK.findall(prompt) == included
             eligible = checkpoint_eligible(rows, round_number=3, **kwargs)
             if omitted:
@@ -472,7 +472,7 @@ def test_bare_prompt_fallbacks_report_no_candidates(git_repo, tmp_path, monkeypa
         with monkeypatch.context() as patch:
             # Framing alone over the cap.
             patch.setattr(rooms_module, "_ROOM_PROMPT_MAX_BYTES", 50)
-            assert coordinator._checkpoint(room["id"], "next") == ("next", [], True)
+            assert coordinator._checkpoint(room["id"], "next", round_number=2) == ("next", [], True)
         with monkeypatch.context() as patch:
             # Room for the framing but not for the truncation marker.
             framing = len(
@@ -481,7 +481,7 @@ def test_bare_prompt_fallbacks_report_no_candidates(git_repo, tmp_path, monkeypa
                 "after the separator.\n\n\n\n--- CURRENT USER TASK ---\nnext".encode()
             )
             patch.setattr(rooms_module, "_ROOM_PROMPT_MAX_BYTES", framing + 1)
-            assert coordinator._checkpoint(room["id"], "next") == ("next", [], True)
+            assert coordinator._checkpoint(room["id"], "next", round_number=2) == ("next", [], True)
         real = rooms_module._prompt_arg_units
 
         def units(text, name):
@@ -493,7 +493,7 @@ def test_bare_prompt_fallbacks_report_no_candidates(git_repo, tmp_path, monkeypa
             # The composed prompt fits the byte budget but not the platform
             # accounting (the Windows quoting path): bare prompt, nothing in it.
             patch.setattr(rooms_module, "_prompt_arg_units", units)
-            assert coordinator._checkpoint(room["id"], "next") == ("next", [], True)
+            assert coordinator._checkpoint(room["id"], "next", round_number=2) == ("next", [], True)
     finally:
         coordinator.close()
 
@@ -609,7 +609,7 @@ def test_prompts_are_byte_identical_to_the_pre_change_builder(git_repo, tmp_path
         room_id = _frozen_room(coordinator.store, clock)
         cases = checkpoint_cases(
             rooms_module,
-            lambda **kw: coordinator._checkpoint(room_id, "next", **kw)[0],
+            lambda **kw: coordinator._checkpoint(room_id, "next", round_number=3, **kw)[0],
             lambda ctx, prompt: RoomCoordinator._memory_prefixed(ctx, prompt)[0],
             _patcher(monkeypatch, rooms_module),
         )

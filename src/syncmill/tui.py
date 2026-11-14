@@ -308,6 +308,14 @@ def _read_artifact_result(run_id: str, *, store: ArtifactStore) -> dict | None:
     return value
 
 
+def _unreadable_candidate(candidate_id: str, exc: Exception) -> str:
+    """The candidate pane for a candidate that cannot be read."""
+    return (
+        f"Candidate {printable_name(candidate_id)} unreadable: "
+        f"{printable_name(str(exc))}"
+    )
+
+
 def _one_line(value: object) -> str:
     """A stored value in a one-line field, as the CLI shows it."""
     return printable_name(str(value))
@@ -2700,11 +2708,22 @@ class SyncmillTuiApp(App[None]):
             )
         assert candidate_id is not None
         reset = view is None
-        row = self._rooms.store.get_candidate(candidate_id)
+        # A RoomError from reading the candidate itself (its row, artifact or
+        # round binding) is that candidate's damage: it is staged as this
+        # pane's text, so the room's other panes still refresh. Store failures
+        # (sqlite3.Error and the rest) still raise and degrade the whole room.
+        # The unreadable text is never cached (key None): a view change or a
+        # repair is read again on the next stage.
+        try:
+            row = self._rooms.store.get_candidate(candidate_id)
+        except RoomError as exc:
+            return None, _unreadable_candidate(candidate_id, exc), view or "output", pages, False
         if view is None:
             view = "diff" if row.get("state") == "completed" else "output"
         # Candidates are immutable (digest-bound), so this key makes a
-        # poll tick a no-op instead of re-streaming the patch.
+        # poll tick a no-op instead of re-streaming the patch. The round's
+        # binding is part of it: a round deleted or moved to another room
+        # after the candidate was shown must be validated again.
         key = (
             candidate_id,
             view,
@@ -2712,14 +2731,24 @@ class SyncmillTuiApp(App[None]):
             row.get("patch_sha256"),
             row.get("output_sha256"),
             row.get("state"),
+            row.get("round_id"),
+            self._rooms.store.round_room_id(row.get("round_id")),
         )
         truncated = False if reset else self._diff_truncated
         if key == self._candidate_detail_key:
             return key, None, view, pages, truncated
+        try:
+            if view == "diff":
+                manifest = self._rooms.store.load_candidate_patch_head(
+                    candidate_id, pages * _DIFF_DISPLAY_BYTES
+                )
+            else:
+                manifest = self._rooms.store.load_candidate_checkpoint(
+                    candidate_id, _CANDIDATE_OUTPUT_BYTES
+                )
+        except RoomError as exc:
+            return None, _unreadable_candidate(candidate_id, exc), view, pages, False
         if view == "diff":
-            manifest = self._rooms.store.load_candidate_patch_head(
-                candidate_id, pages * _DIFF_DISPLAY_BYTES
-            )
             truncated = bool(manifest["patch_truncated"])
             text = render_candidate_diff(
                 manifest,
@@ -2728,9 +2757,6 @@ class SyncmillTuiApp(App[None]):
                 binary=manifest.get("patch_binary"),
             )
         else:
-            manifest = self._rooms.store.load_candidate_checkpoint(
-                candidate_id, _CANDIDATE_OUTPUT_BYTES
-            )
             text = render_candidate_output(manifest)
         return key, text, view, pages, truncated
 

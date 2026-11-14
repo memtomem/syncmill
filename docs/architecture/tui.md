@@ -120,6 +120,11 @@ scope stays equal to the room goal it was copied from.
 EVERY poll path is degrade-guarded (`_ROOM_POLL_ERRORS`/`_SESSION_POLL_ERRORS`/
 `_JOB_POLL_ERRORS`) — an unguarded read escapes the interval callback and kills
 the app, so a store failure must show DEGRADED and keep the last good view.
+One candidate that cannot be read is not a store failure: a `RoomError` from
+that candidate's own row, artifact or round binding becomes its pane's text
+("unreadable", never cached) while the room's other panes refresh. The
+candidate cache key includes the round's binding (`RoomStore.round_room_id`),
+so a round deleted or moved away after the candidate was shown is checked again.
 `JobStore.control` likewise converts everything to `JobError` (its callers catch
 only that): the manager can vanish between the poll and the keypress, taking the
 token file and leaving a truncated socket reply.
