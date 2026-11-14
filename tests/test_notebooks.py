@@ -422,6 +422,7 @@ def test_notebook_outputs_carry_no_home_paths(path):
     os.environ.get("SYNCMILL_TEST_NOTEBOOKS_REAL") != "1",
     reason="executes notebooks with nbclient; set SYNCMILL_TEST_NOTEBOOKS_REAL=1",
 )
+@pytest.mark.timeout(900)  # the nbclient run alone may take 600s
 @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda p: p.name)
 def test_notebook_executes_end_to_end(path, tmp_path):
     # Execute a copy (with its helper beside it, where the kernel's cwd will

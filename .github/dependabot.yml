@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # SHA-pinned actions in ci.yml and release.yml. The UV_VERSION env pin in
+  # both workflows is a `with:` input Dependabot cannot bump; keep it by hand.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly

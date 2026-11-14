@@ -27,10 +27,14 @@ from syncmill.teamfile import load_config_at
 
 LIVE_ENABLED = os.environ.get("SYNCMILL_TEST_TUI_LIVE_CODEX") == "1"
 LIVE_HOME = os.environ.get("SYNCMILL_LIVE_HOME")
-pytestmark = pytest.mark.skipif(
-    not LIVE_ENABLED,
-    reason="set SYNCMILL_TEST_TUI_LIVE_CODEX=1 for two real Codex calls",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not LIVE_ENABLED,
+        reason="set SYNCMILL_TEST_TUI_LIVE_CODEX=1 for two real Codex calls",
+    ),
+    # Two real provider calls, each awaited for up to 180s (_wait_for_job).
+    pytest.mark.timeout(900),
+]
 _TERMINAL_JOBS = {
     "finished",
     "cancelled",

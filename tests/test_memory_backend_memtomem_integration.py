@@ -859,6 +859,8 @@ asyncio.run(main(sys.argv[1]))
     os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
     reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
 )
+# The build step alone may take 600s on a cold uv cache (it fetches 0.4.0).
+@pytest.mark.timeout(900)
 def test_real_store_written_by_memtomem_04_works_after_the_upgrade(tmp_path):
     """An existing user's store survives the 0.4 → 0.6 pin move.
 
