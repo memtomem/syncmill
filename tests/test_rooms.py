@@ -1946,13 +1946,14 @@ def test_detached_worker_receives_private_resolved_config(
         return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
 
     monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
-    pid = rooms_module.launch_room_worker(
+    started = rooms_module.launch_room_worker(
         git_repo,
         "room-id",
         resolved_config=config,
         config_base=tmp_path,
     )
-    assert pid == 4242
+    started.waiter.close()
+    assert started.pid == 4242
     argv = captured["argv"]
     snapshot = Path(argv[argv.index("--resolved-config") + 1])
     payload = json.loads(snapshot.read_text(encoding="utf-8"))
@@ -2036,13 +2037,14 @@ def test_worker_launch_keeps_prompt_off_argv_and_id_after_separator(
         return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
 
     monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
-    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt")
+    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt").waiter.close()
     argv = captured["argv"]
     assert "secret prompt" not in argv
     assert argv[-2:] == ["--", "room-id"]
     fd = int(argv[argv.index("--prompt-fd") + 1])
     assert captured["prompt"] == b"secret prompt"
-    assert captured["kwargs"]["pass_fds"] == (fd,)
+    ready_fd = int(argv[argv.index("--ready-fd") + 1])
+    assert captured["kwargs"]["pass_fds"] == (fd, ready_fd)
     # Anonymous by construction: the temp file was unlinked while still open,
     # so no plaintext path exists for ANY failure mode to strand.
     assert not list(Path(tempfile.gettempdir()).glob("syncmill-room-prompt-*"))
@@ -2075,7 +2077,7 @@ def test_prompt_file_is_anonymous_before_any_plaintext_lands(monkeypatch, git_re
         "Popen",
         lambda argv, **kwargs: SimpleNamespace(pid=4242, wait=lambda: reaped.set()),
     )
-    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt")
+    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt").waiter.close()
     assert state["named_at_first_write"] is False
     assert reaped.wait(1)
 

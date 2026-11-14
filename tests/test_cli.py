@@ -25,7 +25,7 @@ from syncmill.project import project_id
 from syncmill.report import load_envelope, render_report
 from syncmill.rooms import RoomError
 
-from conftest import FakeAgent, FakeRegistry
+from conftest import FakeAgent, FakeRegistry, ready_job, ready_room_worker
 
 
 @pytest.fixture
@@ -1127,12 +1127,12 @@ def _patch_fake_jobstore(monkeypatch, captured, *, launch_error=None):
         def __init__(self, tui, project_root, *, board_db=None):
             captured["ctor"] = {"project_root": project_root, "board_db": board_db}
 
-        def launch(self, spec, *, resolved_config=None):
+        def launch_detached(self, spec, *, resolved_config=None):
             if launch_error is not None:
                 raise JobError(launch_error)
             captured["spec"] = spec
             captured["resolved_config"] = resolved_config
-            return {"job_id": "abcd1234efgh", "op": spec.op}
+            return ready_job({"job_id": "abcd1234efgh", "op": spec.op})
 
     monkeypatch.setattr("syncmill.cli.JobStore", FakeJobStore)
 
@@ -5026,7 +5026,7 @@ def test_detached_room_round_forwards_session_flags(monkeypatch, runner, tmp_pat
 
     def launch(root, room_id, prompt, **kwargs):
         captured.update(kwargs)
-        return 4242
+        return ready_room_worker(4242)
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
@@ -5119,7 +5119,9 @@ def test_detached_room_round_preflights_session_flags(monkeypatch, runner, tmp_p
         "syncmill.cli._room_coordinator",
         lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
-    monkeypatch.setattr("syncmill.cli.launch_room_worker", lambda *a, **k: 4242)
+    monkeypatch.setattr(
+        "syncmill.cli.launch_room_worker", lambda *a, **k: ready_room_worker(4242)
+    )
     monkeypatch.setattr("syncmill.cli.git_root", lambda path: tmp_path)
 
     res = runner.invoke(

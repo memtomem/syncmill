@@ -19,6 +19,7 @@ import pytest
 
 import syncmill.isolated_session as isolated
 import syncmill.worktree as W
+from conftest import FakeRegistry, ready_job
 from syncmill.artifacts import ArtifactStore
 from syncmill.git_env import isolated_git_env
 from syncmill.isolated_session import IsolatedSessionStore
@@ -32,7 +33,6 @@ from syncmill.worktree import (
     repository_fingerprint,
 )
 
-from conftest import FakeRegistry
 from test_isolated_session import _config as _session_config
 from test_rooms import WritingAgent, _config as _room_config
 from test_workflow import WorkflowAgent, _config as _workflow_config
@@ -348,8 +348,8 @@ def test_workflow_run_accepts_a_v1_plan_before_launch(monkeypatch, git_repo, tmp
             pass
 
     class FakeJobs:
-        def launch(self, job_spec, *, resolved_config):
-            return {"job_id": "12345678-1234", "job_dir": str(tmp_path / "job")}
+        def launch_detached(self, job_spec, *, resolved_config):
+            return ready_job({"job_id": "12345678-1234", "job_dir": str(tmp_path / "job")})
 
     monkeypatch.setattr(
         "syncmill.cli._workflow_supervisor", lambda repo, team: (FakeSupervisor(), config)

@@ -820,6 +820,30 @@ class FakeTracer:
 # ── Factories / fixtures ─────────────────────────────────────────────────
 
 
+def ready_waiter():
+    """A readiness waiter whose worker already signalled: for fakes of a
+    detached launch that should read as a worker that came up."""
+    from syncmill.readiness import ready_pipe, signal_ready
+
+    waiter, write_fd = ready_pipe()
+    signal_ready(write_fd)
+    return waiter
+
+
+def ready_job(row: dict):
+    """A ``LaunchedJob`` for ``row`` whose manager already came up."""
+    from syncmill.tui_jobs import LaunchedJob
+
+    return LaunchedJob(row, ready_waiter())
+
+
+def ready_room_worker(pid: int, log_path=None):
+    """A ``RoomWorkerLaunch`` whose worker already holds the room."""
+    from syncmill.rooms import RoomWorkerLaunch
+
+    return RoomWorkerLaunch(pid, log_path, ready_waiter())
+
+
 def make_memory(backend: FakeBackend) -> SyncmillMemory:
     """Build ``SyncmillMemory`` around a fake backend without real storage."""
     m = SyncmillMemory.__new__(SyncmillMemory)

@@ -22,7 +22,7 @@ import pytest
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from conftest import FakeRegistry
+from conftest import FakeRegistry, ready_job
 from syncmill.artifacts import ArtifactError, workflow_approved
 from syncmill.cli import cli
 from syncmill.config import SyncmillConfig
@@ -1838,9 +1838,9 @@ def test_workflow_run_detach_preflights_and_launches_typed_job(
     captured = {}
 
     class FakeJobs:
-        def launch(self, job_spec, *, resolved_config):
+        def launch_detached(self, job_spec, *, resolved_config):
             captured.update(spec=job_spec, config=resolved_config)
-            return {"job_id": "12345678-1234", "job_dir": str(tmp_path / "job")}
+            return ready_job({"job_id": "12345678-1234", "job_dir": str(tmp_path / "job")})
 
     monkeypatch.setattr(
         "syncmill.cli._workflow_supervisor",

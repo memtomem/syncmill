@@ -519,8 +519,12 @@ def test_launch_apply_writes_frozen_config_snapshot(tmp_path, monkeypatch):
     assert payload["repo_root"] == str(tmp_path.resolve())
     assert payload["runs"]["root"] == str((tmp_path / "runs").resolve())
     assert payload["workspace"]["root"] == str((tmp_path / "ws").resolve())
-    # An apply op takes NO legacy bridge lock (that is board-run only).
-    assert len(captured["kwargs"]["pass_fds"]) == 1
+    # An apply op takes NO legacy bridge lock (that is board-run only): the
+    # worker inherits the target lock and the readiness pipe's write end.
+    assert "--legacy-lock-fd" not in captured["argv"]
+    ready_fd = int(captured["argv"][captured["argv"].index("--ready-fd") + 1])
+    lock_fd = int(captured["argv"][captured["argv"].index("--lock-fd") + 1])
+    assert sorted(captured["kwargs"]["pass_fds"]) == sorted([lock_fd, ready_fd])
 
 
 def test_launch_failure_unlinks_config_snapshot(tmp_path, monkeypatch):
@@ -614,7 +618,7 @@ def test_board_launch_threads_legacy_bridge_fd(tmp_path, monkeypatch):
     # The worker inherits BOTH the target lock and the schema-1 bridge lock, and
     # is told the bridge fd so it can thread it to the child/guardian.
     assert "--legacy-lock-fd" in captured["argv"]
-    assert len(captured["kwargs"]["pass_fds"]) == 2
+    assert len(captured["kwargs"]["pass_fds"]) == 3  # target, bridge, readiness
 
 
 def _control_manager(tmp_path) -> _Manager:
@@ -723,7 +727,9 @@ def test_worker_main_preserves_terminal_receipt_on_post_ack_cleanup_error(
 
     monkeypatch.setattr(_Manager, "run", fake_run)
     with pytest.raises(RuntimeError, match="post-ack cleanup boom"):
-        _worker_main(SimpleNamespace(job_dir=str(directory), lock_fd=-1, legacy_lock_fd=-1))
+        _worker_main(
+            SimpleNamespace(job_dir=str(directory), lock_fd=-1, legacy_lock_fd=-1, ready_fd=-1)
+        )
     # The finished receipt is preserved, NOT overwritten with launch_failed.
     assert json.loads((directory / "state.json").read_text())["status"] == "finished"
 

@@ -17,6 +17,7 @@ the only op the UI launches (room/artifact-apply execution lands in Chunk B).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ from typing import Any, NoReturn
 from uuid import uuid4
 
 from syncmill.config import SyncmillConfig, TuiConfig
+from syncmill.readiness import ReadyWaiter, adopt_ready_fd, log_tail, ready_pipe, signal_ready
 
 try:  # browsing remains available on non-POSIX platforms; execution is gated.
     import fcntl
@@ -59,6 +61,34 @@ _MANAGER_DONE = b"\x01"
 
 class JobError(RuntimeError):
     pass
+
+
+@dataclass
+class LaunchedJob:
+    """A started job's row and the waiter for its manager's readiness byte."""
+
+    row: dict[str, Any]
+    waiter: ReadyWaiter
+
+
+def exited_diagnostic(job_dir: str | Path) -> tuple[str, list[str]]:
+    """Why a manager exited before readiness, from what it left behind: the
+    error ``state.json`` records, else the last lines of ``manager.log``.
+    Read-only — EOF on the readiness pipe does not prove the guardian or a
+    reconciler has stopped writing ``state.json``. Lines are raw; each surface
+    escapes them."""
+    directory = Path(job_dir)
+    try:
+        state = _read_json(directory / "state.json") or {}
+    except ValueError:  # not UTF-8; a damaged file must not hide the log below
+        state = {}
+    status, error = state.get("status"), state.get("error")
+    if status in ("launch_failed", "lost") and isinstance(error, str) and error:
+        return error, []
+    tail = log_tail(directory / "manager.log")
+    if tail:
+        return f"see {directory / 'manager.log'}", tail
+    return f"no error was recorded (see {directory})", []
 
 
 @dataclass(frozen=True)
@@ -654,6 +684,22 @@ class JobStore:
         cwd: str | Path | None = None,
         resolved_config: SyncmillConfig | None = None,
     ) -> dict[str, Any]:
+        """Start a job and return its row without waiting for readiness: for
+        callers that follow the job themselves (foreground workflow run)."""
+        launched = self.launch_detached(spec, cwd=cwd, resolved_config=resolved_config)
+        launched.waiter.close()
+        return launched.row
+
+    def launch_detached(
+        self,
+        spec: JobSpec,
+        *,
+        cwd: str | Path | None = None,
+        resolved_config: SyncmillConfig | None = None,
+    ) -> LaunchedJob:
+        """Start a job and hand back a waiter for its manager's readiness byte
+        (written once its socket is up and the job child runs; see
+        ``readiness``). The caller owns the waiter."""
         # The store OWNS the repository boundary: the worker always runs in the
         # store's project root, never an arbitrary caller cwd.
         cwd_path = self.project_root
@@ -731,12 +777,18 @@ class JobStore:
             raise JobError(f"cannot acquire the target lock: {exc}") from exc
         legacy_fd: int | None = None
         launched = False
+        waiter: ReadyWaiter | None = None
+        ready_fd: int | None = None
         try:
+            # Inside the cleanup scope: a failure here still releases the lock.
+            waiter, ready_fd = ready_pipe()
             if spec.op == "board-run":
                 legacy_fd = self._try_legacy_lock()
             # We now own the target — retire any older job still claiming it.
             self._reconcile_superseded(lock_key, job_id)
-            pass_fds = [target_fd] if legacy_fd is None else [target_fd, legacy_fd]
+            pass_fds = [target_fd, ready_fd]
+            if legacy_fd is not None:
+                pass_fds.append(legacy_fd)
             job_dir.mkdir(mode=0o700, parents=True)
             if snapshot_path is not None:
                 # 0600 pinned snapshot (via _atomic_json); the worker consumes+unlinks.
@@ -750,6 +802,7 @@ class JobStore:
             worker_argv = [
                 sys.executable, "-m", "syncmill.tui_jobs", "worker",
                 "--job-dir", str(job_dir), "--lock-fd", str(target_fd),
+                "--ready-fd", str(ready_fd),
             ]
             if legacy_fd is not None:
                 worker_argv += ["--legacy-lock-fd", str(legacy_fd)]
@@ -794,14 +847,25 @@ class JobStore:
                         _atomic_json(job_dir / "state.json", state)
                 except OSError:
                     pass
+                if waiter is not None:
+                    waiter.close()
                 raise JobError(f"failed to launch TUI worker: {exc}") from exc
         finally:
-            os.close(target_fd)
-            if legacy_fd is not None:
-                os.close(legacy_fd)
-        if launched:
+            # Each on its own: one failing close must not strand the others.
+            # The worker holds its own copies.
+            for fd in (target_fd, ready_fd, legacy_fd):
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+        try:
             self.prune()
-        return {**spec_doc, **state, "job_dir": str(job_dir)}
+        except Exception as exc:
+            waiter.close()
+            raise JobError(
+                f"job {job_id[:8]} started, but pruning old jobs failed: {exc}"
+            ) from exc
+        assert waiter is not None
+        return LaunchedJob({**spec_doc, **state, "job_dir": str(job_dir)}, waiter)
 
     def prune(self) -> None:
         # Prune ONLY schema-2 project jobs; legacy dirs are read-only overlays,
@@ -897,7 +961,15 @@ class _RollingLog:
 
 
 class _Manager:
-    def __init__(self, job_dir: Path, lock_fd: int, legacy_lock_fd: int = -1):
+    def __init__(
+        self,
+        job_dir: Path,
+        lock_fd: int,
+        legacy_lock_fd: int = -1,
+        ready_fd: int | None = None,
+    ):
+        # Readiness byte (see ``readiness``): written once the job is supervised.
+        self.ready_fd = ready_fd
         self.job_dir = job_dir
         self.lock_fd = lock_fd
         # Threaded through child -> guardian (like lock_fd) so the schema-1
@@ -1055,6 +1127,10 @@ class _Manager:
             os.close(manager_read)
             manager_read = -1
             self._mark_running(self.child.pid)
+            # From here every outcome lands in state.json and the TUI: tell the
+            # launcher the job is supervised. Never raises.
+            ready_fd, self.ready_fd = self.ready_fd, None
+            signal_ready(ready_fd)
             assert self.child.stdout is not None
             # read1, not read: BufferedReader.read(n) blocks until n bytes or
             # EOF, so a low-volume run wrote NOTHING to the log until 64KiB
@@ -1083,6 +1159,11 @@ class _Manager:
             )
             return 1
         finally:
+            if self.ready_fd is not None:
+                # Never ready: close without the byte, so the launcher sees EOF.
+                with contextlib.suppress(OSError):
+                    os.close(self.ready_fd)
+                self.ready_fd = None
             if manager_read >= 0:
                 os.close(manager_read)
             os.close(manager_write)
@@ -1386,7 +1467,10 @@ def _worker_main(args: argparse.Namespace) -> int:
     state_path = job_dir / "state.json"
     try:
         return _Manager(
-            job_dir, int(args.lock_fd), int(args.legacy_lock_fd)
+            job_dir,
+            int(args.lock_fd),
+            int(args.legacy_lock_fd),
+            adopt_ready_fd(int(args.ready_fd)),
         ).run()
     except BaseException as exc:
         # PRESERVE a terminal receipt already recorded by the manager (the
@@ -1428,6 +1512,7 @@ def main() -> int:
     worker.add_argument("--job-dir", required=True)
     worker.add_argument("--lock-fd", required=True, type=int)
     worker.add_argument("--legacy-lock-fd", type=int, default=-1)
+    worker.add_argument("--ready-fd", type=int, default=-1)
     child = sub.add_parser("child")
     child.add_argument("--job-dir", required=True)
     child.add_argument("--lock-fd", required=True, type=int)

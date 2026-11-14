@@ -17,6 +17,7 @@ from click.testing import CliRunner
 
 import syncmill.cli as cli_module
 import syncmill.rooms as rooms_module
+from conftest import ready_room_worker
 from syncmill.board import Board, render_lessons_section
 from syncmill.cli import cli
 from syncmill.config import SyncmillConfig
@@ -399,13 +400,14 @@ def test_worker_launch_hands_the_lessons_over_a_second_anonymous_fd(monkeypatch,
         return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
 
     monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
-    launch_room_worker(git_repo, "room-id", "the prompt", lessons=[L1, L2])
+    launch_room_worker(git_repo, "room-id", "the prompt", lessons=[L1, L2]).waiter.close()
     argv = captured["argv"]
     assert not any(L1.text in arg or L1.id in arg for arg in argv)
     assert argv[-2:] == ["--", "room-id"]
     prompt_fd = int(argv[argv.index("--prompt-fd") + 1])
     lessons_fd = int(argv[argv.index("--lessons-fd") + 1])
-    assert captured["kwargs"]["pass_fds"] == (prompt_fd, lessons_fd)
+    ready_fd = int(argv[argv.index("--ready-fd") + 1])
+    assert captured["kwargs"]["pass_fds"] == (prompt_fd, lessons_fd, ready_fd)
     assert json.loads(captured["lessons"]) == [
         {"id": L1.id, "text": L1.text}, {"id": L2.id, "text": L2.text},
     ]
@@ -422,7 +424,7 @@ def test_worker_launch_without_lessons_passes_no_lessons_fd(monkeypatch, git_rep
         rooms_module.subprocess, "Popen",
         lambda argv, **kwargs: captured.update(argv=argv) or SimpleNamespace(pid=1, wait=lambda: None),
     )
-    launch_room_worker(git_repo, "room-id", "p")
+    launch_room_worker(git_repo, "room-id", "p").waiter.close()
     assert "--lessons-fd" not in captured["argv"]
 
 
@@ -608,7 +610,7 @@ def _round_cli(monkeypatch, tmp_path, config, *, history=False, room_prompt="cre
 
     def launch(*args, **kwargs):
         captured["launched"] = kwargs.get("lessons")
-        return 4242
+        return ready_room_worker(4242)
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator", lambda repo: (tmp_path, config, Coordinator())

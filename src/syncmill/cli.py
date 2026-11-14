@@ -133,17 +133,29 @@ from syncmill.rooms import (
     RepairPlan,
     RoomCoordinator,
     RoomError,
+    RoomWorkerLaunch,
     RoundLesson,
     launch_room_worker,
+    room_worker_exit_diagnostic,
     round_lessons,
     round_lessons_fit,
+    worker_launched_payload,
 )
 from syncmill.tui_jobs import (
     ArtifactApplySpec,
     JobError,
     JobStore,
+    LaunchedJob,
     RoomApplySpec,
     WorkflowRunSpec,
+    exited_diagnostic,
+)
+from syncmill.readiness import (
+    CLI_READY_TIMEOUT_SECONDS,
+    Outcome,
+    adopt_ready_fd,
+    pending_text,
+    signal_ready,
 )
 from syncmill.session import (
     SessionLaunchError,
@@ -1980,6 +1992,7 @@ def _execute_workflow(
 ) -> None:
     effective_team = team or _peek_workflow_team(repo, workflow_id)
     supervisor, config = _workflow_supervisor(repo, effective_team)
+    launched: LaunchedJob | None = None
     try:
         workflow_store = supervisor.workflow_store
         record = workflow_store.load(workflow_id)
@@ -2018,21 +2031,38 @@ def _execute_workflow(
             _render_workflow_completion(executed, repo)
             return
         store = _workflow_job_store(config, root)
+        spec = WorkflowRunSpec(workflow_id=workflow_id, resume=resume)
         try:
-            row = store.launch(
-                WorkflowRunSpec(workflow_id=workflow_id, resume=resume),
-                resolved_config=config,
-            )
+            if detach:
+                launched = store.launch_detached(spec, resolved_config=config)
+                row = launched.row
+            else:
+                row = store.launch(spec, resolved_config=config)
         except JobError as exc:
             raise click.ClickException(str(exc)) from exc
+    except BaseException:
+        if launched is not None:
+            launched.waiter.close()
+            launched = None
+        raise
     finally:
-        _echo_workflow_preflight(supervisor)
-        supervisor.close()
-        close_event_loop()
-    if detach:
-        echo(
-            f"[syncmill] detached workflow-run job {row['job_id'][:8]} — "
-            "inspect with `syncmill workflow status --watch` or the TUI Runs tab"
+        try:
+            _echo_workflow_preflight(supervisor)
+            supervisor.close()
+            close_event_loop()
+        except Exception as exc:
+            if launched is None:
+                raise
+            launched.waiter.close()
+            raise click.ClickException(
+                f"detached workflow-run job {launched.row['job_id'][:8]} started, "
+                f"but closing this command's session failed: {exc}"
+            ) from exc
+    if launched is not None:
+        _report_detached_job(
+            launched,
+            "workflow-run",
+            "inspect with `syncmill workflow status --watch` or the TUI Runs tab",
         )
         return
     _follow_workflow_job(store, workflow_store, row, workflow_id)
@@ -2804,13 +2834,45 @@ def _launch_detached_apply(
     board_db = config.board.db_path if config.board.enabled else None
     try:
         store = JobStore(config.tui, project_root, board_db=board_db)
-        row = store.launch(spec, resolved_config=config)
+        launched = store.launch_detached(spec, resolved_config=config)
     except JobError as exc:
         raise click.ClickException(str(exc)) from exc
-    echo(
-        f"[syncmill] detached {spec.op} job {row['job_id'][:8]} — "
-        "inspect it in `syncmill tui` (Runs tab)"
-    )
+    _report_detached_job(launched, spec.op, "inspect it in `syncmill tui` (Runs tab)")
+
+
+def _report_room_worker(
+    started: RoomWorkerLaunch, outcome: Outcome, timeout: float
+) -> None:
+    """Say what the readiness wait established about a room worker."""
+    if outcome is Outcome.READY:
+        echo(f"Room worker started: pid {started.pid}")
+    elif outcome is Outcome.PENDING:
+        where = f" (log: {started.log_path})" if started.log_path else ""
+        echo(f"Room worker started: pid {started.pid}; {pending_text(timeout)}{where}")
+    else:
+        summary, tail = room_worker_exit_diagnostic(started)
+        raise _MultilineError(
+            f"room worker (pid {started.pid}) exited before it took the room: {summary}",
+            *(f"  | {line}" for line in tail),
+        )
+
+
+def _report_detached_job(launched: LaunchedJob, op: str, hint: str) -> None:
+    """Wait for the job manager's readiness byte, then say what is known:
+    supervised, exited before it was (non-zero), or not confirmed in time."""
+    with launched.waiter as waiter:
+        outcome = waiter.wait(CLI_READY_TIMEOUT_SECONDS)
+    head = f"[syncmill] detached {op} job {launched.row['job_id'][:8]}"
+    if outcome is Outcome.READY:
+        echo(f"{head} — {hint}")
+    elif outcome is Outcome.PENDING:
+        echo(f"{head} started; {pending_text(CLI_READY_TIMEOUT_SECONDS)} — {hint}")
+    else:
+        summary, tail = exited_diagnostic(launched.row["job_dir"])
+        raise _MultilineError(
+            f"detached {op} job {launched.row['job_id'][:8]} exited before it started: {summary}",
+            *(f"  | {line}" for line in tail),
+        )
 
 
 @cli.group("room")
@@ -3052,7 +3114,7 @@ def room_round(
             fresh_session=fresh_session,
         )
         if detach:
-            pid = launch_room_worker(
+            started = launch_room_worker(
                 root,
                 room_id,
                 prompt,
@@ -3064,8 +3126,18 @@ def room_round(
                 config_base=git_root(repo.resolve()),
                 lessons=lessons,
             )
-            coordinator.store.record_event(room_id, "worker.launched", {"pid": pid})
-            echo(f"Room worker started: pid {pid}")
+            with started.waiter as waiter:
+                try:
+                    coordinator.store.record_event(
+                        room_id, "worker.launched", worker_launched_payload(started)
+                    )
+                except BaseException as exc:
+                    raise click.ClickException(
+                        f"room worker started (pid {started.pid}), but recording "
+                        f"its launch failed: {exc}"
+                    ) from exc
+                outcome = waiter.wait(CLI_READY_TIMEOUT_SECONDS)
+            _report_room_worker(started, outcome, CLI_READY_TIMEOUT_SECONDS)
             return
         room = coordinator.run_round(
             room_id,
@@ -4203,6 +4275,7 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 @click.option("--prompt", default=None)
 @click.option("--prompt-fd", default=None, type=int, hidden=True)
 @click.option("--lessons-fd", default=None, type=int, hidden=True)
+@click.option("--ready-fd", default=None, type=int, hidden=True)
 @click.option(
     "--lineage",
     type=click.Choice(["continue-own", "fresh", "branch-from"]),
@@ -4225,6 +4298,7 @@ def room_worker(
     prompt: str | None,
     prompt_fd: int | None,
     lessons_fd: int | None,
+    ready_fd: int | None,
     lineage: str,
     base_candidate: str | None,
     fresh_session: bool,
@@ -4233,6 +4307,9 @@ def room_worker(
     resolved_config: Path | None,
 ) -> None:
     """Detached worker entrypoint; public callers use ``room round --detach``."""
+    # First: nothing this worker starts may inherit the readiness fd, or a
+    # long-lived descendant would hold it open and hide this worker's exit.
+    ready_fd = adopt_ready_fd(ready_fd)
     # The launcher keeps the prompt and the chosen lessons off argv (visible
     # in `ps`) AND off the filesystem: each rides an inherited fd of an
     # already-unlinked temp file, so there is no plaintext path to strand if
@@ -4301,6 +4378,7 @@ def room_worker(
             fresh_session=fresh_session,
             fork=fork,
             lessons=lessons,
+            on_owned=lambda: signal_ready(ready_fd),
         )
     finally:
         coordinator.close()

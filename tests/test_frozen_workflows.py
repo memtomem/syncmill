@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from conftest import ready_job
 from syncmill.cli import cli
 from syncmill.worktree import fingerprint_version, repository_fingerprint
 
@@ -1354,9 +1355,9 @@ class _Launches:
         self.launched: list = []
         monkeypatch.setattr("syncmill.cli._workflow_job_store", lambda config, root: self)
 
-    def launch(self, spec, *, resolved_config):
+    def launch_detached(self, spec, *, resolved_config):
         self.launched.append((spec, resolved_config))
-        return {"job_id": "0" * 32}
+        return ready_job({"job_id": "0" * 32})
 
 
 @pytest.mark.parametrize(("command", "scenario"), [("run", "planned"), ("resume", "recovery-required")])
