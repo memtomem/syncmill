@@ -9,6 +9,7 @@ import threading
 import pytest
 
 import syncmill.workflow as workflow_module
+from conftest import ready_job
 from syncmill.models import TaskStatus, TokenUsage
 from syncmill.workflow import WorkflowError, WorkflowLeaseLost, WorkflowStore
 from test_workflow import FakeRegistry, WorkflowAgent, _config, _single_node_workflow
@@ -491,13 +492,13 @@ def test_detached_launch_carries_selected_team_config(workflow, monkeypatch):
         seen["team"] = team
         return supervisor, coordinator.config
 
-    def launch(spec, *, resolved_config):
+    def launch_detached(spec, *, resolved_config):
         seen.update(spec=spec, config=resolved_config)
-        return {"job_id": "detached-job"}
+        return ready_job({"job_id": "detached-job"})
 
     monkeypatch.setattr("syncmill.cli._workflow_supervisor", select)
     monkeypatch.setattr(
-        "syncmill.cli._workflow_job_store", lambda *args: SimpleNamespace(launch=launch)
+        "syncmill.cli._workflow_job_store", lambda *args: SimpleNamespace(launch_detached=launch_detached)
     )
     result = CliRunner().invoke(
         cli, ["workflow", "run", record.workflow_id, "--detach", "--team", "blue"]

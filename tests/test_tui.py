@@ -10,6 +10,7 @@ import threading
 import pytest
 from textual.widgets import DataTable, OptionList
 
+from conftest import ready_job, ready_room_worker
 from syncmill.artifacts import ArtifactError, ArtifactStore
 from syncmill.board import Board
 from syncmill.isolated_session import IsolatedSessionError
@@ -623,11 +624,11 @@ class _FakeJobs:
         self.launched: list[tuple] = []
         self._fail = fail
 
-    def launch(self, spec, *, resolved_config=None):
+    def launch_detached(self, spec, *, resolved_config=None):
         if self._fail is not None:
             raise self._fail
         self.launched.append((spec, resolved_config))
-        return {"job_id": "abcd1234efgh"}
+        return ready_job({"job_id": "abcd1234efgh"})
 
     def list_jobs(self):
         return []
@@ -3116,7 +3117,7 @@ def test_room_round_funnel_threads_prompt_lineage_and_base(
 
             def fake_launch(root, room_id, prompt=None, **kwargs):
                 launched.update(room_id=room_id, prompt=prompt, **kwargs)
-                return 4242
+                return ready_room_worker(4242)
 
             monkeypatch.setattr("syncmill.tui.launch_room_worker", fake_launch)
             monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
@@ -3185,11 +3186,12 @@ def test_room_round_reads_lesson_history_per_lineage_before_confirmation(
                 app, "notify", lambda message, **kwargs: notes.append((message, kwargs))
             )
             monkeypatch.setattr(
-                "syncmill.tui.launch_room_worker", lambda *a, **k: 4242
+                "syncmill.tui.launch_room_worker", lambda *a, **k: ready_room_worker(4242)
             )
             monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
             staged["cb"]({"prompt": "go", "lineage": "continue-own",
                           "base_candidate": None, "lessons": []})
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert [m for m, _ in notes] == ["room worker started (pid 4242)"]
 
@@ -3286,7 +3288,7 @@ def test_room_round_funnel_preserves_prompt_verbatim(tmp_path, git_repo, monkeyp
             monkeypatch.setattr(
                 "syncmill.tui.launch_room_worker",
                 lambda root, room_id, prompt=None, **kw: launched.update(prompt=prompt)
-                or 1,
+                or ready_room_worker(1),
             )
             monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
             app._apply_room_round({
@@ -5184,5 +5186,45 @@ def test_refresh_reports_deduplicates_ids_and_caches_docs(
             # _refresh_reports + _show_report + OptionHighlighted should only scan once
             assert calls == calls_before + 1
             assert set(app._reports_by_id.keys()) == {"dup-id", "dup-id#1"}
+
+    drive(scenario())
+
+
+def test_room_round_launch_record_failure_notifies_once_that_the_worker_started(
+    tmp_path, git_repo, monkeypatch
+):
+    from syncmill.rooms import RoomError
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rooms = _FakeRoundRooms()
+
+            def broken_record(*args):
+                raise RoomError("database is locked")
+
+            rooms.store.record_event = broken_record
+            app._rooms = rooms
+            app._selected_room_id = "room-a"
+            started = ready_room_worker(4242)
+            monkeypatch.setattr("syncmill.tui.launch_room_worker", lambda *a, **k: started)
+            monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
+            notes: list = []
+            monkeypatch.setattr(
+                app, "notify", lambda message, **kwargs: notes.append((message, kwargs))
+            )
+            app._apply_room_round(
+                {"prompt": "go", "lineage": "continue-own", "base_candidate": None},
+                "room-a", _ROUND_STORE,
+            )
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [m for m, _ in notes] == [
+                "room worker started (pid 4242), but recording its launch failed: "
+                "database is locked"
+            ]
+            assert app._readiness_waiters == set()
+            assert started.waiter._fd is None
 
     drive(scenario())

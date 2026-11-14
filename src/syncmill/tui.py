@@ -9,7 +9,9 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -86,7 +88,15 @@ from syncmill.rooms import (
     RoomStore,
     RoundLesson,
     launch_room_worker,
+    room_worker_exit_diagnostic,
     round_lessons_fit,
+    worker_launched_payload,
+)
+from syncmill.readiness import (
+    TUI_READY_TIMEOUT_SECONDS,
+    Outcome,
+    ReadyWaiter,
+    pending_text,
 )
 from syncmill.session import SessionLaunchError
 from syncmill.review_candidates import (
@@ -113,8 +123,10 @@ from syncmill.tui_jobs import (
     BoardJobSpec,
     JobError,
     JobStore,
+    LaunchedJob,
     RoomApplySpec,
     canonical_board_path,
+    exited_diagnostic,
 )
 from syncmill.tui_render import (
     PlainLabel,
@@ -815,6 +827,13 @@ class SyncmillTuiApp(App[None]):
         self._toml_path = toml_path
         self._refresh_seconds = max(MIN_REFRESH_SECONDS, refresh_seconds)
         self._initial_tab = initial_tab
+        # Readiness waits for detached launches run off the Textual thread.
+        # Every waiter stays here until its wait returns; unmount sets the
+        # cancel flag and closes what is left, including a waiter whose thread
+        # worker never started.
+        self._readiness_cancel = threading.Event()
+        self._readiness_waiters: set[ReadyWaiter] = set()
+        self._readiness_lock = threading.Lock()
         # Set at the end of on_mount; the TabActivated handler ignores events
         # until then (the initial activation must not double-refresh), and
         # _handled_tab dedupes re-activations of the already-handled tab.
@@ -1094,12 +1113,81 @@ class SyncmillTuiApp(App[None]):
         self._ui_ready = True
 
     def on_unmount(self) -> None:
+        self._readiness_cancel.set()
+        with self._readiness_lock:
+            waiters, self._readiness_waiters = self._readiness_waiters, set()
+        for waiter in waiters:
+            waiter.close()
         if self._board is not None:
             # The CLI also closes its latest connection; this one may have been
             # replaced by retry, and Board.close() is intentionally idempotent.
             self._board.close()
         if self._rooms is not None:
             self._rooms.close()
+
+    def _hold_waiter(self, waiter: ReadyWaiter) -> None:
+        with self._readiness_lock:
+            self._readiness_waiters.add(waiter)
+
+    def _await_readiness(
+        self,
+        waiter: ReadyWaiter,
+        prepare: Callable[[Outcome], tuple[str, SeverityLevel]],
+    ) -> None:
+        """Wait for a held waiter in a thread worker. ``prepare`` turns the
+        outcome into a notification on that thread (it may read log files);
+        only the finished notification runs on the Textual thread, and not
+        once the app is going away. It touches no widget: the screen can be
+        gone before unmount sets the cancel flag. A failure here is a lost
+        notification, never a reason to exit the app."""
+
+        def work() -> None:
+            try:
+                outcome = waiter.wait(
+                    TUI_READY_TIMEOUT_SECONDS, cancel=self._readiness_cancel
+                )
+            finally:
+                with self._readiness_lock:
+                    self._readiness_waiters.discard(waiter)
+            if self._readiness_cancel.is_set():
+                return
+            try:
+                message, severity = prepare(outcome)
+            except Exception as exc:  # a worker error would exit the app
+                message, severity = f"could not read why the worker stopped: {exc}", "error"
+            try:
+                self.call_from_thread(self._deliver_readiness, message, severity)
+            except RuntimeError:
+                pass  # the app stopped between the check and the call
+
+        self.run_worker(work, thread=True, group="readiness", exit_on_error=False)
+
+    def _deliver_readiness(self, message: str, severity: SeverityLevel) -> None:
+        # Textual keeps its loop through unmount, so a call can still land
+        # after teardown began: the flag, not call_from_thread, drops it.
+        if self._readiness_cancel.is_set():
+            return
+        self.notify(message, severity=severity)
+
+    def _await_job(self, launched: LaunchedJob, op: str) -> None:
+        job_id = launched.row["job_id"][:8]
+
+        def prepare(outcome: Outcome) -> tuple[str, SeverityLevel]:
+            if outcome is Outcome.READY:
+                return f"detached {op} job {job_id}", "information"
+            if outcome is Outcome.PENDING:
+                return (
+                    f"detached {op} job {job_id} started; "
+                    f"{pending_text(TUI_READY_TIMEOUT_SECONDS)}",
+                    "warning",
+                )
+            summary, tail = exited_diagnostic(launched.row["job_dir"])
+            return (
+                "\n".join([f"{op} job {job_id} exited before it started: {summary}", *tail]),
+                "error",
+            )
+
+        self._await_readiness(launched.waiter, prepare)
 
     def _active(self) -> str:
         return self.query_one("#tabs", TabbedContent).active
@@ -1787,11 +1875,13 @@ class SyncmillTuiApp(App[None]):
             spec = ArtifactApplySpec(
                 run_id=run_id, verify=bool(self._config.gate.commands)
             )
-            row = self._jobs.launch(spec, resolved_config=self._runtime_config)
+            launched = self._jobs.launch_detached(spec, resolved_config=self._runtime_config)
         except (JobError, ValueError) as exc:
             self.notify(str(exc), severity="error")
             return
-        self.notify(f"detached artifact-apply job {row['job_id'][:8]}")
+        self._hold_waiter(launched.waiter)
+        self._await_job(launched, "artifact-apply")
+        row = launched.row
         if row.get("job_dir"):
             self._selected_job_dir = row["job_dir"]
         self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
@@ -1856,10 +1946,12 @@ class SyncmillTuiApp(App[None]):
                 strategy=fields["strategy"],
                 agent=fields["agent"],
             )
-            self._jobs.launch(spec)
+            launched = self._jobs.launch_detached(spec)
         except (JobError, ValueError) as exc:
             self.notify(str(exc), severity="error")
             return
+        self._hold_waiter(launched.waiter)
+        self._await_job(launched, spec.op)
         self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
         self.action_tab("runs-tab")
 
@@ -3123,7 +3215,7 @@ class SyncmillTuiApp(App[None]):
                 lineage=lineage,
                 base_candidate_id=base_candidate,
             )
-            pid = launch_room_worker(
+            started = launch_room_worker(
                 self._project_root(),
                 room_id,
                 prompt,
@@ -3133,7 +3225,6 @@ class SyncmillTuiApp(App[None]):
                 config_base=self._toml_path.parent,
                 lessons=lessons,
             )
-            self._rooms.store.record_event(room_id, "worker.launched", {"pid": pid})
         # ProjectError covers a repository that disappeared under us: git_root
         # reports an unusable path that way rather than letting subprocess's
         # OSError through, and an unguarded raise here kills the whole app.
@@ -3144,8 +3235,46 @@ class SyncmillTuiApp(App[None]):
             # after the dialog opened must not escape the callback.
             self.notify(str(exc) or type(exc).__name__, severity="error")
             return
+        # Held before the fallible event write, so unmount closes it even if
+        # that write fails.
+        self._hold_waiter(started.waiter)
+        try:
+            self._rooms.store.record_event(
+                room_id, "worker.launched", worker_launched_payload(started)
+            )
+        except _ROOM_POLL_ERRORS as exc:
+            # One notification: the worker started; this dialog stops waiting.
+            with self._readiness_lock:
+                self._readiness_waiters.discard(started.waiter)
+            started.waiter.close()
+            self.notify(
+                f"room worker started (pid {started.pid}), but recording its launch "
+                f"failed: {exc}",
+                severity="error",
+            )
+            self._refresh_rooms()
+            return
         sent = f", {len(lessons)} approved lesson(s)" if lessons else ""
-        self.notify(f"room worker started (pid {pid}{sent})")
+
+        def prepare(outcome: Outcome) -> tuple[str, SeverityLevel]:
+            if outcome is Outcome.READY:
+                return f"room worker started (pid {started.pid}{sent})", "information"
+            if outcome is Outcome.PENDING:
+                return (
+                    f"room worker started (pid {started.pid}{sent}); "
+                    f"{pending_text(TUI_READY_TIMEOUT_SECONDS)}",
+                    "warning",
+                )
+            summary, tail = room_worker_exit_diagnostic(started)
+            return (
+                "\n".join(
+                    [f"room worker (pid {started.pid}) exited before it took the room: "
+                     f"{summary}", *tail]
+                ),
+                "error",
+            )
+
+        self._await_readiness(started.waiter, prepare)
         self._refresh_rooms()
 
     def action_judge(self) -> None:
@@ -3511,11 +3640,12 @@ class SyncmillTuiApp(App[None]):
                 expected_candidate_id=candidate_id,
                 expected_revision=expected_revision,
             )
-            row = self._jobs.launch(spec, resolved_config=self._rooms.config)
+            launched = self._jobs.launch_detached(spec, resolved_config=self._rooms.config)
         except (JobError, ValueError) as exc:
             self.notify(str(exc), severity="error")
             return
-        self.notify(f"detached room-apply job {row['job_id'][:8]}")
+        self._hold_waiter(launched.waiter)
+        self._await_job(launched, "room-apply")
         self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
         self.action_tab("runs-tab")
 

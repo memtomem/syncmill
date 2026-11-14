@@ -12,6 +12,7 @@ from textual.widgets import Button, Checkbox, Input, Select, TextArea
 
 from test_room_judgments import _applied_room
 from test_rooms import WritingAgent, _config
+from conftest import ready_room_worker
 from syncmill.board import Board, BoardError
 from syncmill.config import SyncmillConfig
 from syncmill.rooms import _ROOM_PROMPT_MAX_BYTES, RoomCoordinator, RoomError
@@ -464,7 +465,7 @@ def _launches(monkeypatch) -> list[dict]:
 
     def fake_launch(root, room_id, prompt=None, **kwargs):
         launched.append({"room_id": room_id, "prompt": prompt, **kwargs})
-        return 4242
+        return ready_room_worker(4242)
 
     monkeypatch.setattr("syncmill.tui.launch_room_worker", fake_launch)
     return launched

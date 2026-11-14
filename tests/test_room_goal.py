@@ -335,6 +335,9 @@ def test_a_detached_round_hands_the_goal_lesson_to_the_worker(
     def fake_popen(argv, **kwargs):
         fd = int(argv[argv.index("--lessons-fd") + 1])
         payload["lessons"] = json.loads(os.read(fd, 200_000))
+        # Stand in for a worker that took the room (the launcher closes its
+        # own copy of this write end right after the spawn).
+        os.write(int(argv[argv.index("--ready-fd") + 1]), b"R")
         return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
 
     monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)

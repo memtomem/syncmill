@@ -646,8 +646,13 @@ uv run --project "$SYNCMILL_SRC" syncmill run "<할 일>" [옵션]
 `workflow resume`은 `XDG_RUNTIME_DIR`이나 임시 디렉터리 아래의 Unix 소켓을 씁니다. 소켓을
 준비할 수 없으면 아무것도 시작하지 않고 실패하면서 이유를 알려 줍니다. 경로가 너무 길면
 `XDG_RUNTIME_DIR`을 더 짧고 쓰기 가능한 디렉터리로 설정하고, 실행 중인 job을 찾을 수 있도록 이후
-명령에도 같은 값을 설정하세요. `detached ... job`은 worker를 시작했다는 뜻이지, 끝났거나 계속 살아 있다는 뜻이
-아닙니다. 진행은 TUI의 Runs 탭에서 확인하세요.
+명령에도 같은 값을 설정하세요. `detached ... job`은 job의 manager가 올라왔다는 뜻입니다. 그 뒤로는 성공이든
+실패든 job의 결과가 TUI의 Runs 탭에 남습니다. manager가 그 전에 종료하면 명령이 그 오류를 보여 주며 실패합니다.
+10초 안에 응답이 없으면 줄 끝에 `started; not confirmed within 10s`가 붙고, job은 아직 시작하는 중일 수 있으니
+Runs 탭에서 확인하세요. `room round --detach`도 worker가 room을 잡을 때까지 같은 방식으로 기다린 뒤
+`Room worker started: pid N`을 출력합니다. worker가 그 전에 종료하면 명령이 실패하며 그 로그의 마지막 줄들을
+보여 줍니다. 로그는 실행마다 `<runs root>/<project id>/rooms/worker-logs/` 아래에 하나씩 생기며, 최근 20개를
+남기고 아직 실행 중인 worker의 로그는 지우지 않습니다.
 
 ### `agents` — 에이전트 목록 보기
 

@@ -132,7 +132,19 @@ Click child in its own process group. `q` only exits the UI. Explicit stop is
 SIGINT-first; explicit force after ten seconds is SIGKILL and never fabricates a
 Board transition. `JobStore.launch` binds and removes the job's socket path before it
 takes a lock or spawns, because the manager binds after `launch` has returned; a job
-whose socket cannot exist is refused with `JobError` instead of dying unseen. `launch`
-still gives no readiness guarantee for other failures. PID fields are informational only. `Board.renew_claim` plus the
+whose socket cannot exist is refused with `JobError` instead of dying unseen. Other early
+deaths are caught by a readiness pipe (`readiness.py`, #281): `launch_detached` hands the
+manager the write end, and the manager writes one byte right after `_mark_running`, when
+its socket is up and the job child runs. EOF without the byte means it exited first; no
+byte in time is reported as not confirmed, never as failed; the launcher reads
+`state.json`/`manager.log` for the reason but never writes `state.json` (EOF does not prove
+the guardian or a reconciler has stopped). `launch` keeps its old contract for callers that
+follow the job. The TUI's four launch sites wait in a `readiness` thread worker; every
+waiter is held in an app-owned set until its wait returns, unmount sets a cancel flag and
+closes what is left, and the delivered callback checks that flag (Textual keeps its loop
+through unmount, so `call_from_thread` raising is not enough). `launch_room_worker` uses
+the same pipe: its worker signals through `RoomCoordinator.run_round(on_owned=)` once the
+workspace reservation or the round lease commits, and writes stdout/stderr to a per-launch
+log whose shared `flock` (held through the inherited description) keeps pruning off it. PID fields are informational only. `Board.renew_claim` plus the
 Supervisor's separate-connection heartbeat prevents a healthy run from crossing the
 lease timeout and being dispatched twice. Default tests use fake children only.

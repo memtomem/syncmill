@@ -673,8 +673,15 @@ non-POSIX systems.
 directory. If it cannot be set up, the command fails before starting anything and says
 why. When the path is too long, set `XDG_RUNTIME_DIR` to a shorter, writable directory,
 and set it for later commands too, so they can find the running job.
-`detached ... job` means the worker was started, not that it finished or even stayed up;
-follow it in the TUI's Runs tab.
+`detached ... job` means the job's manager came up: from then on the job's outcome,
+success or failure, is in the TUI's Runs tab. A manager that exits before that fails the
+command with its error. If it does not answer within 10 seconds, the line ends
+`started; not confirmed within 10s` and the job may still be starting; check the Runs tab.
+`room round --detach` waits the same way until its worker holds the room before it prints
+`Room worker started: pid N`. A worker that exits first fails the command and shows the
+last lines of its log. Each launch gets its own log under
+`<runs root>/<project id>/rooms/worker-logs/`; the newest 20 are kept, and the log of a
+worker that is still running is never removed.
 
 ### `agents` — list registered agents
 

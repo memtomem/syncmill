@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
+from conftest import ready_job
 from conftest import FakeRegistry
 from syncmill.cli import cli
 from syncmill.workflow import (
@@ -1100,11 +1101,11 @@ def no_team_project(git_repo: Path, tmp_path: Path, monkeypatch):
     launched = []
 
     class Jobs:
-        def launch(self, spec, *, resolved_config):
+        def launch_detached(self, spec, *, resolved_config):
             snapshot = tmp_path / f"snapshot-{len(launched)}.json"
             snapshot.write_text(resolved_config.model_dump_json(), encoding="utf-8")
             launched.append((spec, resolved_config, snapshot))
-            return {"job_id": f"job-{len(launched)}-0000", "job_dir": str(tmp_path)}
+            return ready_job({"job_id": f"job-{len(launched)}-0000", "job_dir": str(tmp_path)})
 
     monkeypatch.setattr("syncmill.cli._workflow_job_store", lambda *args: Jobs())
     document = tmp_path / "plan.json"

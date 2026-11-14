@@ -118,6 +118,17 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- A detached worker that dies right after it was started no longer gets a success
+  message (#281). `apply --detach`, `room apply --detach` and detached `workflow run`
+  / `workflow resume` wait up to 10 seconds for the job's manager to come up, and
+  `room round --detach` for its worker to take the room. A worker that exits first
+  makes the command fail with the reason it left behind. One that does not answer in
+  time is reported as `started; not confirmed within 10s`, never as failed. The TUI
+  waits the same way, up to 30 seconds, without blocking the screen, and its
+  notification now arrives when the wait ends. A detached room worker's output,
+  which used to be discarded, goes to a log under
+  `<runs root>/<project id>/rooms/worker-logs/`, and the `worker.launched` room
+  event names it.
 - Your Git `apply.whitespace` setting no longer rewrites or refuses the stored
   patch in `apply`, its `--verify` check or its rollback. With
   `apply.whitespace=fix`, Git stripped trailing whitespace from the lines it

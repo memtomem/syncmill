@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import logging
 import os
 import re
 import shutil
@@ -25,8 +26,14 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Iterator
 from uuid import UUID, uuid4
+
+try:  # POSIX only; Windows still imports the CLI for --help and --version
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows only
+    fcntl = None  # type: ignore[assignment]
 
 from syncmill.platform_support import require_supported_platform
 from syncmill.agents import (
@@ -54,6 +61,7 @@ from syncmill.project import configure_project_memory, project_id
 # viewers build for reclaimable rooms. The runtime import graph is deliberately
 # rooms → room_viewer, so this module-level import is cycle-free.
 from syncmill.room_viewer import _TERMINAL_ROOM_STATES
+from syncmill.readiness import ReadyWaiter, log_tail, ready_pipe
 from syncmill.worktree import (
     capture_changes,
     Worktree,
@@ -68,6 +76,8 @@ from syncmill.worktree import (
     repository_fingerprint,
     trusted_admin_dir,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
@@ -5056,6 +5066,7 @@ class RoomCoordinator:
         fork: bool = False,
         lessons: list[RoundLesson] | tuple[RoundLesson, ...] | None = None,
         target: RepairPlan | None = None,
+        on_owned: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Run one round. ``lessons`` are the approved project lessons the
         launcher showed and chose (#174); the coordinator never opens the
@@ -5063,7 +5074,25 @@ class RoomCoordinator:
         before the task, and the round's conversation record names them.
 
         ``target`` makes this a repair: one member runs, from one candidate of
-        its own, as its confirmed plan says. Without it every member runs."""
+        its own, as its confirmed plan says. Without it every member runs.
+
+        ``on_owned`` is called once, right after this worker's first durable
+        claim on the room commits: the workspace reservation on a snapshot
+        round, the round lease otherwise. A detached worker uses it to tell its
+        launcher that a failure from here on shows in the room. Refusals before
+        that point never call it; its own errors are logged and ignored."""
+        owned_signalled = False
+
+        def owned() -> None:
+            nonlocal owned_signalled
+            if owned_signalled or on_owned is None:
+                return
+            owned_signalled = True
+            try:
+                on_owned()
+            except Exception:
+                logger.warning("room readiness signal failed", exc_info=True)
+
         selected_lessons = round_lessons(lessons)
         if target is not None:
             if (
@@ -5229,6 +5258,7 @@ class RoomCoordinator:
                 Path(self.config.workspace.root).expanduser().resolve() / workspace_id
             )
             self.store.reserve_workspace(room_id, planned_run_root, worker_id)
+            owned()
             try:
                 snapshot = capture_repository_snapshot(
                     self.repo_root,
@@ -5275,6 +5305,7 @@ class RoomCoordinator:
                 shutil.rmtree(snapshot.run_root, ignore_errors=True)
                 self.store.clear_workspaces(room_id)
             raise
+        owned()
         try:
             # Durably drop the stored session ids for the two cold lineages —
             # AFTER the round lease is held, so a losing/aborted competitor can
@@ -6131,8 +6162,8 @@ class RoomCoordinator:
             from syncmill.room_viewer import close_room_viewers
 
             close_room_viewers(self.project_id, room_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("could not close the viewers of room %s: %s", room_id, exc)
 
     def close_room(self, room_id: str) -> None:
         close_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
@@ -6457,6 +6488,94 @@ def _anonymous_fd(data: bytes, prefix: str) -> int:
     return fd
 
 
+#: Bootstrap logs kept per project; a log whose worker still runs is never pruned.
+_ROOM_WORKER_LOGS_KEEP = 20
+
+
+@dataclasses.dataclass
+class RoomWorkerLaunch:
+    """A started room worker: its pid, its bootstrap log (``None`` without a
+    resolved config to place it under), and the waiter for its readiness byte,
+    which the caller owns."""
+
+    pid: int
+    log_path: Path | None
+    waiter: ReadyWaiter
+
+
+def worker_launched_payload(started: RoomWorkerLaunch) -> dict[str, Any]:
+    """The ``worker.launched`` event payload. ``log`` is newer than the event
+    and absent without a log; readers must not require it."""
+    payload: dict[str, Any] = {"pid": started.pid}
+    if started.log_path is not None:
+        payload["log"] = str(started.log_path)
+    return payload
+
+
+def room_worker_exit_diagnostic(started: RoomWorkerLaunch) -> tuple[str, list[str]]:
+    """Why a worker exited before it held the room: the last lines of its
+    bootstrap log, raw (each surface escapes them)."""
+    if started.log_path is None:
+        return "no output was recorded", []
+    tail = log_tail(started.log_path)
+    if tail:
+        return f"see {started.log_path}", tail
+    return f"no output was recorded (see {started.log_path})", []
+
+
+def _prune_worker_logs(directory: Path, keep: int) -> None:
+    """Remove all but the newest ``keep`` logs, skipping any still in use.
+
+    The launcher takes a shared ``flock`` on each log's open file description
+    and the worker inherits it as stdout, so the lock lives exactly as long as
+    something holds that description. A log whose exclusive non-blocking lock
+    cannot be taken, for any reason, is kept."""
+    try:
+        with os.scandir(directory) as entries:
+            logs = [
+                (entry.stat(follow_symlinks=False).st_mtime, entry.path)
+                for entry in entries
+                if entry.name.endswith(".log") and entry.is_file(follow_symlinks=False)
+            ]
+    except OSError:
+        return
+    logs.sort(reverse=True)
+    for _, path in logs[keep:]:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.unlink(path)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+
+
+def _open_worker_log(directory: Path, room_id: str) -> tuple[Path, int] | tuple[None, None]:
+    """A fresh 0600 log for one launch, with the launcher's shared lock on it.
+    ``O_RDWR`` because where ``flock`` is emulated with ``fcntl`` locks (Linux
+    NFS), a shared lock needs read access. Where the lock cannot be taken, the
+    log could be pruned under a running worker, so this launch gets none:
+    ``(None, None)``, and its output is discarded as before."""
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _prune_worker_logs(directory, _ROOM_WORKER_LOGS_KEEP - 1)
+    path = directory / f"{room_id}-{uuid4().hex}.log"
+    fd = os.open(
+        path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+    except OSError:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None, None
+    return path, fd
+
+
 def launch_room_worker(
     repo_root: Path,
     room_id: str,
@@ -6469,9 +6588,11 @@ def launch_room_worker(
     resolved_config: SyncmillConfig | None = None,
     config_base: Path | None = None,
     lessons: list[RoundLesson] | tuple[RoundLesson, ...] | None = None,
-) -> int:
-    """Start a detached room worker and return its PID. ``lessons`` are the
-    approved lessons the caller showed and chose for this round (#174)."""
+) -> RoomWorkerLaunch:
+    """Start a detached room worker. ``lessons`` are the approved lessons the
+    caller showed and chose for this round (#174). The worker writes its
+    readiness byte once it holds the room (``RoomCoordinator.run_round``'s
+    ``on_owned``); its stdout and stderr go to the bootstrap log."""
     if os.name != "posix":
         raise RoomError("detached room workers require POSIX")
     chosen_lessons = round_lessons(lessons)
@@ -6480,6 +6601,7 @@ def launch_room_worker(
     ) > _ROOM_PROMPT_MAX_BYTES:
         raise RoomError("room prompt exceeds the safe process argument byte limit")
     config_snapshot: Path | None = None
+    log_dir: Path | None = None
     if resolved_config is not None:
         payload = resolved_config.model_dump(mode="json")
         base = (config_base or Path.cwd()).resolve()
@@ -6491,12 +6613,13 @@ def launch_room_worker(
         payload["repo_root"] = str(repo_root.resolve())
         payload["runs"]["root"] = absolute(payload["runs"]["root"])
         payload["workspace"]["root"] = absolute(payload["workspace"]["root"])
-        worker_dir = (
+        rooms_dir = (
             Path(payload["runs"]["root"])
             / project_id(repo_root, resolved_config.project.id)
             / "rooms"
-            / "worker-configs"
         )
+        worker_dir = rooms_dir / "worker-configs"
+        log_dir = rooms_dir / "worker-logs"
         config_snapshot = worker_dir / f"{room_id}-{uuid4().hex}.json"
         _atomic_write(
             config_snapshot,
@@ -6515,7 +6638,14 @@ def launch_room_worker(
     # block the launch.
     prompt_fd: int | None = None
     lessons_fd: int | None = None
+    log_path: Path | None = None
+    log_fd: int | None = None
+    waiter: ReadyWaiter | None = None
+    ready_fd: int | None = None
     try:
+        if log_dir is not None:
+            log_path, log_fd = _open_worker_log(log_dir, room_id)
+        waiter, ready_fd = ready_pipe()
         if prompt:
             prompt_fd = _anonymous_fd(
                 prompt.encode("utf-8", errors="surrogateescape"), "syncmill-room-prompt-"
@@ -6536,13 +6666,7 @@ def launch_room_worker(
         # and drop the config snapshot written above, which would otherwise
         # linger in worker-configs indefinitely (its cleanup below only covers
         # the Popen failure path).
-        for fd in (prompt_fd, lessons_fd):
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-        if config_snapshot is not None:
-            with contextlib.suppress(OSError):
-                config_snapshot.unlink(missing_ok=True)
+        _discard_launch(prompt_fd, lessons_fd, ready_fd, log_fd, waiter, config_snapshot, log_path)
         raise
 
     # Options BEFORE a `--` separator, the positional id last — the
@@ -6562,6 +6686,7 @@ def launch_room_worker(
         argv.extend(["--prompt-fd", str(prompt_fd)])
     if lessons_fd is not None:
         argv.extend(["--lessons-fd", str(lessons_fd)])
+    argv.extend(["--ready-fd", str(ready_fd)])
     argv.extend(["--lineage", lineage])
     if base_candidate_id:
         argv.extend(["--base-candidate", base_candidate_id])
@@ -6570,35 +6695,65 @@ def launch_room_worker(
     if fork:
         argv.append("--fork")
     argv.extend(["--", room_id])
+    output: int = subprocess.DEVNULL if log_fd is None else log_fd
     try:
         process = subprocess.Popen(
             argv,
             cwd=str(repo_root),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=output,
+            stderr=output,
             start_new_session=True,
             close_fds=True,
-            pass_fds=tuple(fd for fd in (prompt_fd, lessons_fd) if fd is not None),
+            pass_fds=tuple(
+                fd for fd in (prompt_fd, lessons_fd, ready_fd) if fd is not None
+            ),
         )
     except BaseException:
-        # suppress: one failing cleanup step must not strand the next (an
-        # unlink error would otherwise leak the fd).
-        if config_snapshot is not None:
-            with contextlib.suppress(OSError):
-                config_snapshot.unlink(missing_ok=True)
-        for fd in (prompt_fd, lessons_fd):
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
+        _discard_launch(prompt_fd, lessons_fd, ready_fd, log_fd, waiter, config_snapshot, log_path)
         raise
-    for fd in (prompt_fd, lessons_fd):
+    # The child holds its own copies. Closing the log fd does not release the
+    # shared lock: it belongs to the open description the worker now holds.
+    for fd in (prompt_fd, lessons_fd, ready_fd, log_fd):
         if fd is not None:
-            os.close(fd)  # the child holds its own copy
-    threading.Thread(
-        target=_reap_detached_worker,
-        args=(process,),
-        name=f"syncmill-room-worker-{process.pid}",
-        daemon=True,
-    ).start()
-    return process.pid
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    assert waiter is not None
+    try:
+        threading.Thread(
+            target=_reap_detached_worker,
+            args=(process,),
+            name=f"syncmill-room-worker-{process.pid}",
+            daemon=True,
+        ).start()
+    except BaseException as exc:
+        waiter.close()
+        raise RoomError(
+            f"room worker started (pid {process.pid}), but its reaper thread "
+            f"could not start: {exc}"
+        ) from exc
+    return RoomWorkerLaunch(process.pid, log_path, waiter)
+
+
+def _discard_launch(
+    prompt_fd: int | None,
+    lessons_fd: int | None,
+    ready_fd: int | None,
+    log_fd: int | None,
+    waiter: ReadyWaiter | None,
+    config_snapshot: Path | None,
+    log_path: Path | None,
+) -> None:
+    """Undo a launch that never spawned. Each step is suppressed on its own so
+    one failing cleanup cannot strand the next (an unlink error would otherwise
+    leak an fd)."""
+    for fd in (prompt_fd, lessons_fd, ready_fd, log_fd):
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    if waiter is not None:
+        waiter.close()
+    for path in (config_snapshot, log_path):
+        if path is not None:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
