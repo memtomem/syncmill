@@ -1,0 +1,1 @@
+{"status": "failed", "agent_id": "none", "output": "", "exit_code": 1, "duration_seconds": 0.0, "files_changed": [], "error": "orchestration crashed before producing a result", "gate_summary": null, "gate_passed": null, "patch": null}

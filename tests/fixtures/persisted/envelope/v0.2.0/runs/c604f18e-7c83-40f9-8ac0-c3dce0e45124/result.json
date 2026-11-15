@@ -1,0 +1,1 @@
+{"status": "failed", "agent_id": "none", "output": "", "exit_code": -1, "duration_seconds": 0.02, "files_changed": [], "error": "All agents failed:\n  [codex] codex (fake): refused", "gate_summary": null, "gate_passed": null, "patch": null}
