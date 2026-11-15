@@ -1,0 +1,1 @@
+{"status": "failed", "agent_id": "preflight", "output": "", "exit_code": 1, "duration_seconds": 0.0, "files_changed": [], "error": "strict toolgraph preflight blocked execution: CONTROL_PLAN_FINDING", "gate_summary": null, "gate_passed": null, "patch": null}

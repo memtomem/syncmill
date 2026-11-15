@@ -1,0 +1,276 @@
+{
+  "goldens": {
+    "control-preflight-v1.json": "bd78ffbea50c27092f5806d06503f6ebc9256302",
+    "control-preflight.schema.json": "8ec71dcd6ff66ac3f74dd9930990383506fde6f9",
+    "preflight-allow.json": "2d7a7efc42cc259ee218b96f88fe12b579101283",
+    "preflight-drift.json": "ab4495e6a9e7ef4264028242e5be2e11fe46901f",
+    "preflight-unknown-tool.json": "ae02acd9cca64a01bae32024b8f36f6814022eda",
+    "preflight-unresolved-identity.json": "fe52d653f7685bde35656088bc707a31cd6ee25d",
+    "preflight.schema.json": "f26a74cc9466d5c7b94ea6b0e17a023722716529"
+  },
+  "release": "0.2.0",
+  "report_list": "Recorded runs (newest first):\n\n  4f543e4b-2d01-41ae-9a0b-1e96a8213fb1  2026-11-15T07:20:49.489189+00:00  route  failed  \u2014\n  93876f8e-7b06-4a25-8182-f83c710df416  2026-11-15T07:20:49.184096+00:00  route  failed  preflight\n  3cbe3895-6200-4f53-a431-fbd39891ccb1  2026-11-15T07:20:48.505267+00:00  route  completed  codex\n  58357073-3dfa-4047-80a7-5867d3e9e671  2026-11-15T07:20:47.254432+00:00  route  failed  preflight\n  8b413cd0-0303-4e14-b8d4-f7f3128579d8  2026-11-15T07:20:46.543530+00:00  route  completed  codex\n  5ee6ddd0-a68a-495b-b419-30b6a8cab596  2026-11-15T07:20:46.246848+00:00  route  failed  preflight\n  4a5c6857-d2ae-4458-97c0-f1f8a92677e4  2026-11-15T07:20:45.540050+00:00  route  completed  codex\n  fa8fbedb-5b43-423b-8cd8-0fca033430f5  2026-11-15T07:20:45.234649+00:00  route  failed  preflight\n  eb103b1f-7a65-4de3-8f52-3f9bd06f4690  2026-11-15T07:20:44.530870+00:00  route  completed  codex\n  29c84008-e999-417c-8a8e-fed692735e0e  2026-11-15T07:20:43.832761+00:00  route  completed  codex\n  1af7a8f6-e02d-4f45-8e15-fedb898e8ddd  2026-11-15T07:20:43.105755+00:00  route  completed  codex\n  e6176a97-cc8d-4255-a734-9aac793c4ac9  2026-11-15T07:20:42.806576+00:00  route  failed  preflight\n  a30c274e-ad4a-44cc-a81e-2cdd734ea8d3  2026-11-15T07:20:42.504748+00:00  route  failed  preflight\n  c6ae2418-5aa7-4ae9-b57d-6f6ef709bc59  2026-11-15T07:20:42.257403+00:00  route  failed  preflight\n  b33b7deb-71b5-433a-857f-f0de95642115  2026-11-15T07:20:41.904932+00:00  compete  failed  preflight\n  54a993d2-911d-4aad-bbca-19d4c2575298  2026-11-15T07:20:41.550721+00:00  compete  failed  preflight\n  5bdabae1-d0ce-4ddd-b651-9b590a10da35  2026-11-15T07:20:40.693879+00:00  compete  completed  codex\n  6f6db177-1e3a-435b-ab11-cfbf051c207e  2026-11-15T07:20:39.965088+00:00  route  completed  codex\n  1655ed4a-4400-4311-9956-a608db2890e5  2026-11-15T07:20:39.668443+00:00  route  failed  preflight\n  d156fd0f-eb1d-4852-8ecb-2fa1189fb57e  2026-11-15T07:20:39.368114+00:00  route  failed  preflight\n  2621e0e0-3813-4994-9492-f2d83b0ca3b6  2026-11-15T07:20:38.069545+00:00  route  failed  preflight\n  6617e536-217c-48f0-8b8a-54774894f221  2026-11-15T07:20:37.768649+00:00  route  failed  preflight\n  6a66d9fa-a950-4205-9c45-1aff0c4bc961  2026-11-15T07:20:37.084146+00:00  route  completed  codex\n  23161d52-e1d6-4e2c-af9c-39ee873de113  2026-11-15T07:20:36.309154+00:00  route  completed  codex\n  1d8ff401-3131-43e7-ae98-9be75229d929  2026-11-15T07:20:34.570378+00:00  route  completed  codex\n  a8fa32d8-bf21-4719-815a-48f3ed59a589  2026-11-15T07:20:33.843994+00:00  route  completed  codex\n  5ba6b96c-92c0-411d-8efc-64909893a38c  2026-11-15T07:20:33.181567+00:00  route  completed  codex\n  497e80fb-4050-4b40-8ab3-e5b88dd7bb8e  2026-11-15T07:20:32.510526+00:00  route  completed  codex\n  e1bb23e2-78ab-4f8e-b6f8-2b8226d60e58  2026-11-15T07:20:31.801217+00:00  route  completed  codex\n  cfd9e8c8-aabf-47ed-95fa-a831d016f039  2026-11-15T07:20:30.884906+00:00  route  completed  codex\n",
+  "runs_dir": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmpi_cmgz2b/state/reports",
+  "scenarios": {
+    "advisory-allow": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        cfd9e8c8-aabf-47ed-95fa-a831d016f039\nCreated:    2026-11-15T07:20:30.884906+00:00\nFinished:   2026-11-15T07:20:31.534834+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       dce435b7-a789-492e-84d2-f24ecdc34f74\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.08s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:0ba327f895a43644830c39bab9547db4d302481833bc02cd29c2e032d001236e\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "cfd9e8c8-aabf-47ed-95fa-a831d016f039"
+    },
+    "advisory-drift": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        e1bb23e2-78ab-4f8e-b6f8-2b8226d60e58\nCreated:    2026-11-15T07:20:31.801217+00:00\nFinished:   2026-11-15T07:20:32.253659+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       685b3d6b-240c-4f65-8464-17e4ea55d1a6\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "e1bb23e2-78ab-4f8e-b6f8-2b8226d60e58"
+    },
+    "advisory-error": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        a8fa32d8-bf21-4719-815a-48f3ed59a589\nCreated:    2026-11-15T07:20:33.843994+00:00\nFinished:   2026-11-15T07:20:34.309222+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       6f6f6679-ad0b-42dc-87c9-3bbc9f786c26\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "a8fa32d8-bf21-4719-815a-48f3ed59a589"
+    },
+    "advisory-timeout": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        1d8ff401-3131-43e7-ae98-9be75229d929\nCreated:    2026-11-15T07:20:34.570378+00:00\nFinished:   2026-11-15T07:20:36.036898+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       38be267a-ed92-4e32-ba4e-0114d59debc4\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  timeout\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "1d8ff401-3131-43e7-ae98-9be75229d929"
+    },
+    "advisory-unmapped": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        5ba6b96c-92c0-411d-8efc-64909893a38c\nCreated:    2026-11-15T07:20:33.181567+00:00\nFinished:   2026-11-15T07:20:33.584102+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       72645939-edff-4525-bfdd-d9a906ec0e79\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  unresolved_identity\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "5ba6b96c-92c0-411d-8efc-64909893a38c"
+    },
+    "advisory-unresolved": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        497e80fb-4050-4b40-8ab3-e5b88dd7bb8e\nCreated:    2026-11-15T07:20:32.510526+00:00\nFinished:   2026-11-15T07:20:32.929592+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       2c2c7600-1f6d-4307-89af-a8c0c27be768\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  unresolved_identity\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "497e80fb-4050-4b40-8ab3-e5b88dd7bb8e"
+    },
+    "control-allow": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        1af7a8f6-e02d-4f45-8e15-fedb898e8ddd\nCreated:    2026-11-15T07:20:43.105755+00:00\nFinished:   2026-11-15T07:20:43.570038+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       a67f4a0d-9875-4107-8557-f6b78f52ed8a\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "1af7a8f6-e02d-4f45-8e15-fedb898e8ddd"
+    },
+    "control-error": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        4a5c6857-d2ae-4458-97c0-f1f8a92677e4\nCreated:    2026-11-15T07:20:45.540050+00:00\nFinished:   2026-11-15T07:20:45.992262+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       fbcd1770-afea-4052-91cf-96a82a4932af\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "4a5c6857-d2ae-4458-97c0-f1f8a92677e4"
+    },
+    "control-finding": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        eb103b1f-7a65-4de3-8f52-3f9bd06f4690\nCreated:    2026-11-15T07:20:44.530870+00:00\nFinished:   2026-11-15T07:20:44.979771+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       be781895-18e9-4331-82f8-4d26fb9f6fc2\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "eb103b1f-7a65-4de3-8f52-3f9bd06f4690",
+      "synthetic": "one UNREACHABLE_NODE finding added to the control golden"
+    },
+    "control-persist": {
+      "injected_write_failure": {
+        "destination": "control-preflight.json",
+        "exception": "OSError('injected write failure: <destination>')"
+      },
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        3cbe3895-6200-4f53-a431-fbd39891ccb1\nCreated:    2026-11-15T07:20:48.505267+00:00\nFinished:   2026-11-15T07:20:48.928732+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       bac50e04-b9e1-4a95-90bb-7bb1c121b1e8\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "3cbe3895-6200-4f53-a431-fbd39891ccb1"
+    },
+    "control-strict-allow": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        29c84008-e999-417c-8a8e-fed692735e0e\nCreated:    2026-11-15T07:20:43.832761+00:00\nFinished:   2026-11-15T07:20:44.271057+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       5a04f016-67be-47fd-8e2c-f5470d1cc5c1\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "29c84008-e999-417c-8a8e-fed692735e0e"
+    },
+    "control-strict-error": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        5ee6ddd0-a68a-495b-b419-30b6a8cab596\nCreated:    2026-11-15T07:20:46.246848+00:00\nFinished:   2026-11-15T07:20:46.298470+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       55636b72-d896-40da-8cf3-b873621aa1e1\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:3f998b2ddfdf81c3b9d292c225060b39eb57e050fa398d87a5d99c1862399012\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "5ee6ddd0-a68a-495b-b419-30b6a8cab596"
+    },
+    "control-strict-error-warn": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        8b413cd0-0303-4e14-b8d4-f7f3128579d8\nCreated:    2026-11-15T07:20:46.543530+00:00\nFinished:   2026-11-15T07:20:46.996306+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       eb6b7495-dba8-466c-bc92-041055ae0fcd\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "8b413cd0-0303-4e14-b8d4-f7f3128579d8"
+    },
+    "control-strict-finding": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        fa8fbedb-5b43-423b-8cd8-0fca033430f5\nCreated:    2026-11-15T07:20:45.234649+00:00\nFinished:   2026-11-15T07:20:45.293869+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       74720b18-02bc-4457-8136-7be94f5b8d77\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:b19a0942a18499cbea567a88e6026fde0db409c9e2b9004fcc14cb21c1ad7d91\n  patch digest:       \u2014\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "fa8fbedb-5b43-423b-8cd8-0fca033430f5",
+      "synthetic": "one UNREACHABLE_NODE finding added to the control golden"
+    },
+    "control-strict-persist": {
+      "injected_write_failure": {
+        "destination": "control-preflight.json",
+        "exception": "OSError('injected write failure: <destination>')"
+      },
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        93876f8e-7b06-4a25-8182-f83c710df416\nCreated:    2026-11-15T07:20:49.184096+00:00\nFinished:   2026-11-15T07:20:49.238542+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       23c3d35f-5293-498f-aa41-cc74809931d5\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:93bfe4b63f3a7e81b509c600240c151991813a63e453c25d8d3c9fcdc7f4ee48\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "93876f8e-7b06-4a25-8182-f83c710df416"
+    },
+    "control-strict-timeout": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        58357073-3dfa-4047-80a7-5867d3e9e671\nCreated:    2026-11-15T07:20:47.254432+00:00\nFinished:   2026-11-15T07:20:48.260678+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       0a96c5c8-ca13-48aa-baee-8a85e807c2d2\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:3f998b2ddfdf81c3b9d292c225060b39eb57e050fa398d87a5d99c1862399012\n  patch digest:       \u2014\nPreflight:  timeout\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "58357073-3dfa-4047-80a7-5867d3e9e671"
+    },
+    "killed-after-preflight": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        4f543e4b-2d01-41ae-9a0b-1e96a8213fb1\nCreated:    2026-11-15T07:20:49.489189+00:00\nFinished:   2026-11-15T07:20:49.489189+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       96f5f132-2d19-47a7-a3ff-99ce962dd18c\nAgents:     codex\nBoard:      \u2014\nResult:     failed\n  winner:             \u2014\n  exit code:          None\n  duration:           Nones\n  gate passed:        None\n  files changed:      None\n  artifact:           \u2014\n  digest:             \u2014\n  patch digest:       \u2014\nPreflight:  disabled\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "4f543e4b-2d01-41ae-9a0b-1e96a8213fb1"
+    },
+    "strict-allow": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        23161d52-e1d6-4e2c-af9c-39ee873de113\nCreated:    2026-11-15T07:20:36.309154+00:00\nFinished:   2026-11-15T07:20:36.829537+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       bff23181-4816-48fd-9e1e-9069c0e8969d\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "23161d52-e1d6-4e2c-af9c-39ee873de113"
+    },
+    "strict-block": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        6617e536-217c-48f0-8b8a-54774894f221\nCreated:    2026-11-15T07:20:37.768649+00:00\nFinished:   2026-11-15T07:20:37.822485+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       f1d1b4a6-b95c-40a9-aadd-3f17a1bf444c\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:3f5ee2d1143d77bc76b4eeef3a53c8cd9dda4c465901ac42c76fa24e3c9a69a0\n  patch digest:       \u2014\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "6617e536-217c-48f0-8b8a-54774894f221"
+    },
+    "strict-gen-mismatch": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        b33b7deb-71b5-433a-857f-f0de95642115\nCreated:    2026-11-15T07:20:41.904932+00:00\nFinished:   2026-11-15T07:20:42.008013+00:00\nStrategy:   compete\nTeam:       pair\nTask:       7890aadc-b328-436c-8514-d206ccfa3584\nAgents:     codex, kimi-code\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:9c4d2beae8c1b098ed52a08aad1f7be6e49af813febf8fc745cce0563684c273\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "b33b7deb-71b5-433a-857f-f0de95642115",
+      "synthetic": "identity kimi answered with the allow golden, agent replaced and graph_generation 43"
+    },
+    "strict-multi-allow": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        5bdabae1-d0ce-4ddd-b651-9b590a10da35\nCreated:    2026-11-15T07:20:40.693879+00:00\nFinished:   2026-11-15T07:20:41.278849+00:00\nStrategy:   compete\nTeam:       pair\nTask:       87ddea66-885c-4665-9e82-cc5d40941e0d\nAgents:     codex, kimi-code\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "5bdabae1-d0ce-4ddd-b651-9b590a10da35",
+      "synthetic": "identity kimi answered with the allow golden, agent replaced"
+    },
+    "strict-multi-mixed": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        54a993d2-911d-4aad-bbca-19d4c2575298\nCreated:    2026-11-15T07:20:41.550721+00:00\nFinished:   2026-11-15T07:20:41.655972+00:00\nStrategy:   compete\nTeam:       pair\nTask:       37d70685-ebdd-4fe3-ac22-fca16ecca70e\nAgents:     codex, kimi-code\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:3f998b2ddfdf81c3b9d292c225060b39eb57e050fa398d87a5d99c1862399012\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "54a993d2-911d-4aad-bbca-19d4c2575298"
+    },
+    "strict-persist-aggregate": {
+      "injected_write_failure": {
+        "destination": "preflight.json",
+        "exception": "OSError('injected write failure: <destination>')"
+      },
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        e6176a97-cc8d-4255-a734-9aac793c4ac9\nCreated:    2026-11-15T07:20:42.806576+00:00\nFinished:   2026-11-15T07:20:42.859398+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       ad03a2a4-7d08-41ae-9de0-687a80895b0b\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:93bfe4b63f3a7e81b509c600240c151991813a63e453c25d8d3c9fcdc7f4ee48\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "e6176a97-cc8d-4255-a734-9aac793c4ac9"
+    },
+    "strict-persist-eval": {
+      "injected_write_failure": {
+        "destination": "eval-000.json",
+        "exception": "OSError('injected write failure: <destination>')"
+      },
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        a30c274e-ad4a-44cc-a81e-2cdd734ea8d3\nCreated:    2026-11-15T07:20:42.504748+00:00\nFinished:   2026-11-15T07:20:42.556960+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       ee35d370-aa85-4ddc-83c2-03dfa9035eca\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:93bfe4b63f3a7e81b509c600240c151991813a63e453c25d8d3c9fcdc7f4ee48\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "a30c274e-ad4a-44cc-a81e-2cdd734ea8d3"
+    },
+    "strict-timeout": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        2621e0e0-3813-4994-9492-f2d83b0ca3b6\nCreated:    2026-11-15T07:20:38.069545+00:00\nFinished:   2026-11-15T07:20:39.080846+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       0ef848f5-d01d-47a6-aefe-4a54f21132d5\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:3f998b2ddfdf81c3b9d292c225060b39eb57e050fa398d87a5d99c1862399012\n  patch digest:       \u2014\nPreflight:  timeout\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "2621e0e0-3813-4994-9492-f2d83b0ca3b6"
+    },
+    "strict-unavailable": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        1655ed4a-4400-4311-9956-a608db2890e5\nCreated:    2026-11-15T07:20:39.668443+00:00\nFinished:   2026-11-15T07:20:39.724751+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       39594512-5b5e-4bee-913a-8204f6a2b813\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:3f998b2ddfdf81c3b9d292c225060b39eb57e050fa398d87a5d99c1862399012\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "1655ed4a-4400-4311-9956-a608db2890e5"
+    },
+    "strict-unavailable-warn": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        6f6db177-1e3a-435b-ab11-cfbf051c207e\nCreated:    2026-11-15T07:20:39.965088+00:00\nFinished:   2026-11-15T07:20:40.428192+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       70873871-2ec9-4563-bc64-daf9e022c68d\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "6f6db177-1e3a-435b-ab11-cfbf051c207e"
+    },
+    "strict-unmapped": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        c6ae2418-5aa7-4ae9-b57d-6f6ef709bc59\nCreated:    2026-11-15T07:20:42.257403+00:00\nFinished:   2026-11-15T07:20:42.258966+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       e74436ab-01d5-452b-8233-1d6c1d60f44f\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:d2f4740ffec7937781b18b7e6db1783300042470e5fe33d05143fd87ef3e5a25\n  patch digest:       \u2014\nPreflight:  unresolved_identity\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "c6ae2418-5aa7-4ae9-b57d-6f6ef709bc59"
+    },
+    "strict-unresolved": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        d156fd0f-eb1d-4852-8ecb-2fa1189fb57e\nCreated:    2026-11-15T07:20:39.368114+00:00\nFinished:   2026-11-15T07:20:39.424377+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       5d56f008-1092-4c1b-a9dd-80d7e9c65a40\nAgents:     codex\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:f4e074e8175c11148640c6cdb277c6591f7188add6528cab64ad39204620f51f\n  patch digest:       \u2014\nPreflight:  unresolved_identity\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "d156fd0f-eb1d-4852-8ecb-2fa1189fb57e"
+    },
+    "strict-warn": {
+      "report_show": {
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Run:        6a66d9fa-a950-4205-9c45-1aff0c4bc961\nCreated:    2026-11-15T07:20:37.084146+00:00\nFinished:   2026-11-15T07:20:37.513077+00:00\nStrategy:   route\nTeam:       \u2014\nTask:       a90cc101-e73c-498f-b3b0-9c375093b7c5\nAgents:     codex\nBoard:      \u2014\nResult:     completed (codex)\n  winner:             codex\n  exit code:          0\n  duration:           0.02s\n  gate passed:        None\n  files changed:      1\n  artifact:           result.json\n  digest:             sha256:ed6406ef70e8e2654213147460991afa8be83eefc62ff0ca2febbcbcf3baaed7\n  patch digest:       sha256:35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba\nPreflight:  ok\nTrace:      disabled\nDegraded:   \u2014\n"
+      },
+      "run_id": "6a66d9fa-a950-4205-9c45-1aff0c4bc961"
+    }
+  }
+}

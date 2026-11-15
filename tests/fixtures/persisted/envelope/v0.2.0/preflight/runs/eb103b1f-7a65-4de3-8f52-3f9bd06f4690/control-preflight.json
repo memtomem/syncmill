@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "kind": "toolgraph.control-preflight",
+  "run_id": "eb103b1f-7a65-4de3-8f52-3f9bd06f4690",
+  "created_at": "2026-08-11T00:00:00+00:00",
+  "mode": "advisory",
+  "profile": "review",
+  "plan_digest": "sha256:0cc95ff9a2ba84e25dc867ff6779d00b8ea57dc190d06a14fa65016e70ec6baf",
+  "graph_state": {
+    "instance_id": "test-instance",
+    "generation": 42
+  },
+  "decision": "advisory_warn",
+  "evaluations": [
+    {
+      "principal": "codex",
+      "agent_found": true,
+      "eligible": [
+        "workspace::read",
+        "workspace::write"
+      ],
+      "rejected": []
+    }
+  ],
+  "findings": [
+    {
+      "code": "UNREACHABLE_NODE",
+      "node": "verify"
+    }
+  ]
+}

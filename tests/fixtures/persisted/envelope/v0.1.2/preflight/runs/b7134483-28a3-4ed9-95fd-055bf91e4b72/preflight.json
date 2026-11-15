@@ -1,0 +1,27 @@
+{
+  "block_reasons": [],
+  "decision": "allow",
+  "evaluations": [
+    {
+      "blocking_reasons": [],
+      "status": "error",
+      "syncmill_agents": [
+        "codex"
+      ],
+      "toolgraph_agent": "codex",
+      "warning_reasons": [
+        "TOOLGRAPH_UNAVAILABLE"
+      ]
+    }
+  ],
+  "kind": "syncmill.toolgraph-enforcement",
+  "mode": "strict",
+  "policies": {
+    "drift": "warn",
+    "unavailable": "warn",
+    "unknown": "block"
+  },
+  "profile": "review",
+  "run_id": "b7134483-28a3-4ed9-95fd-055bf91e4b72",
+  "schema_version": 1
+}

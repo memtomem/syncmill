@@ -1,0 +1,31 @@
+{
+  "block_reasons": [],
+  "decision": "allow",
+  "evaluations": [
+    {
+      "artifact": "preflight/eval-000.json",
+      "blocking_reasons": [],
+      "digest": "sha256:108e35c53c9a34b3206a0fcc50aadc250f49be2d1098cb17da28fbd549c836ba",
+      "graph_generation": 42,
+      "producer_decision": "advisory_warn",
+      "status": "ok",
+      "syncmill_agents": [
+        "codex"
+      ],
+      "toolgraph_agent": "codex",
+      "warning_reasons": [
+        "DRIFTED"
+      ]
+    }
+  ],
+  "kind": "syncmill.toolgraph-enforcement",
+  "mode": "strict",
+  "policies": {
+    "drift": "warn",
+    "unavailable": "block",
+    "unknown": "block"
+  },
+  "profile": "review",
+  "run_id": "6a66d9fa-a950-4205-9c45-1aff0c4bc961",
+  "schema_version": 1
+}

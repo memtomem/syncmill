@@ -1,0 +1,33 @@
+{
+  "block_reasons": [
+    "AGENT_NOT_FOUND"
+  ],
+  "decision": "block",
+  "evaluations": [
+    {
+      "artifact": "preflight/eval-000.json",
+      "blocking_reasons": [
+        "AGENT_NOT_FOUND"
+      ],
+      "digest": "sha256:5566bc8ecefe29d37b900daf15cb55403f7d199bfaf8761473bec5802bc8be18",
+      "graph_generation": 42,
+      "producer_decision": "unresolved_identity",
+      "status": "unresolved_identity",
+      "syncmill_agents": [
+        "codex"
+      ],
+      "toolgraph_agent": "kimi-code",
+      "warning_reasons": []
+    }
+  ],
+  "kind": "syncmill.toolgraph-enforcement",
+  "mode": "strict",
+  "policies": {
+    "drift": "warn",
+    "unavailable": "block",
+    "unknown": "block"
+  },
+  "profile": "review",
+  "run_id": "43a88d52-fa7b-4e60-91e1-1483f839f3ef",
+  "schema_version": 1
+}

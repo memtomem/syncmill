@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "kind": "toolgraph.preflight",
+  "run_id": "18d20b51-a8db-455d-9d36-2f177d3b4f4c",
+  "created_at": "2026-07-11T00:00:00+00:00",
+  "graph_generation": 42,
+  "agent": "kimi-code",
+  "agent_found": false,
+  "profile": "review",
+  "mode": "advisory",
+  "eligible": [],
+  "rejected": [],
+  "features": [],
+  "decision": "unresolved_identity"
+}

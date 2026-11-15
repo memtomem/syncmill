@@ -1,0 +1,42 @@
+{
+  "block_reasons": [
+    "TOOLGRAPH_UNAVAILABLE"
+  ],
+  "decision": "block",
+  "evaluations": [
+    {
+      "artifact": "preflight/eval-000.json",
+      "blocking_reasons": [],
+      "digest": "sha256:359f22319b486e8e3409a1b9c1663a3162164ca9a46a30ea5f8af5b184eae3ed",
+      "graph_generation": 42,
+      "producer_decision": "advisory_allow",
+      "status": "ok",
+      "syncmill_agents": [
+        "codex"
+      ],
+      "toolgraph_agent": "codex",
+      "warning_reasons": []
+    },
+    {
+      "blocking_reasons": [
+        "TOOLGRAPH_UNAVAILABLE"
+      ],
+      "status": "error",
+      "syncmill_agents": [
+        "kimi-code"
+      ],
+      "toolgraph_agent": "kimi",
+      "warning_reasons": []
+    }
+  ],
+  "kind": "syncmill.toolgraph-enforcement",
+  "mode": "strict",
+  "policies": {
+    "drift": "warn",
+    "unavailable": "block",
+    "unknown": "block"
+  },
+  "profile": "review",
+  "run_id": "54a993d2-911d-4aad-bbca-19d4c2575298",
+  "schema_version": 1
+}
