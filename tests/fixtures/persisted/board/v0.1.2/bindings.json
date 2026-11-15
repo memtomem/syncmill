@@ -1,0 +1,1557 @@
+{
+  "box_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmpup2411q6",
+  "missing_dependency": "00000000-0000-4000-8000-000000000000",
+  "release": "0.1.2",
+  "scenarios": {
+    "crash-blocked": {
+      "decisions": {},
+      "files": [
+        "board.db"
+      ],
+      "frozen_at": 1794698668.965004,
+      "items": {
+        "crashed": "73ba618d-6255-4b7d-9be5-e69a8100fe1f",
+        "interrupted": "fa697534-212a-4918-b7b0-0be81b290879"
+      },
+      "release_read": {
+        "active_decisions": {
+          "*": []
+        },
+        "aggregates": {},
+        "boundary": {
+          "item": "73ba618d-6255-4b7d-9be5-e69a8100fe1f",
+          "stats": {
+            "after": {
+              "blocked_aged": [
+                "fa697534-212a-4918-b7b0-0be81b290879",
+                "73ba618d-6255-4b7d-9be5-e69a8100fe1f"
+              ],
+              "by_state": {
+                "blocked": 2
+              },
+              "dropped_handoffs": [],
+              "false_done": [],
+              "human_required_aged": [
+                "fa697534-212a-4918-b7b0-0be81b290879",
+                "73ba618d-6255-4b7d-9be5-e69a8100fe1f"
+              ],
+              "reclaimed_stale": 0,
+              "redispatched": [],
+              "stall_seconds": 3600,
+              "total": 2
+            },
+            "at": {
+              "blocked_aged": [
+                "fa697534-212a-4918-b7b0-0be81b290879",
+                "73ba618d-6255-4b7d-9be5-e69a8100fe1f"
+              ],
+              "by_state": {
+                "blocked": 2
+              },
+              "dropped_handoffs": [],
+              "false_done": [],
+              "human_required_aged": [
+                "fa697534-212a-4918-b7b0-0be81b290879",
+                "73ba618d-6255-4b7d-9be5-e69a8100fe1f"
+              ],
+              "reclaimed_stale": 0,
+              "redispatched": [],
+              "stall_seconds": 3600,
+              "total": 2
+            },
+            "before": {
+              "blocked_aged": [
+                "fa697534-212a-4918-b7b0-0be81b290879"
+              ],
+              "by_state": {
+                "blocked": 2
+              },
+              "dropped_handoffs": [],
+              "false_done": [],
+              "human_required_aged": [
+                "fa697534-212a-4918-b7b0-0be81b290879"
+              ],
+              "reclaimed_stale": 0,
+              "redispatched": [],
+              "stall_seconds": 3600,
+              "total": 2
+            }
+          },
+          "times": {
+            "after": 1794702268.9650042,
+            "at": 1794702268.965004,
+            "before": 1794702268.9650037
+          }
+        },
+        "decision_rows": [],
+        "decisions_mapped": [],
+        "items": {
+          "73ba618d-6255-4b7d-9be5-e69a8100fe1f": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698667.57725,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": true,
+            "id": "73ba618d-6255-4b7d-9be5-e69a8100fe1f",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "blocked",
+            "task": "orchestration raises",
+            "updated_at": 1794698668.965004
+          },
+          "fa697534-212a-4918-b7b0-0be81b290879": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698664.676212,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": true,
+            "id": "fa697534-212a-4918-b7b0-0be81b290879",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "blocked",
+            "task": "interrupted by the operator",
+            "updated_at": 1794698666.826995
+          }
+        },
+        "order": [
+          "fa697534-212a-4918-b7b0-0be81b290879",
+          "73ba618d-6255-4b7d-9be5-e69a8100fe1f"
+        ],
+        "stats": {
+          "aged": {
+            "blocked_aged": [
+              "fa697534-212a-4918-b7b0-0be81b290879",
+              "73ba618d-6255-4b7d-9be5-e69a8100fe1f"
+            ],
+            "by_state": {
+              "blocked": 2
+            },
+            "dropped_handoffs": [],
+            "false_done": [],
+            "human_required_aged": [
+              "fa697534-212a-4918-b7b0-0be81b290879",
+              "73ba618d-6255-4b7d-9be5-e69a8100fe1f"
+            ],
+            "reclaimed_stale": 0,
+            "redispatched": [],
+            "stall_seconds": 3600,
+            "total": 2
+          },
+          "fresh": {
+            "blocked_aged": [],
+            "by_state": {
+              "blocked": 2
+            },
+            "dropped_handoffs": [],
+            "false_done": [],
+            "human_required_aged": [],
+            "reclaimed_stale": 0,
+            "redispatched": [],
+            "stall_seconds": 3600,
+            "total": 2
+          }
+        },
+        "transitions": {
+          "73ba618d-6255-4b7d-9be5-e69a8100fe1f": [
+            {
+              "actor": "human",
+              "at": 1794698667.57725,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "14971b36-7613-4006-b310-3ba051053413",
+              "at": 1794698668.964285,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "system",
+              "at": 1794698668.965004,
+              "from_state": "running",
+              "note": "orchestration crashed: RuntimeError: frozen: injected orchestration failure",
+              "to_state": "blocked"
+            }
+          ],
+          "fa697534-212a-4918-b7b0-0be81b290879": [
+            {
+              "actor": "human",
+              "at": 1794698664.676212,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "05534c8c-56b0-438b-b8ce-1688c9b7206a",
+              "at": 1794698665.291122,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "system",
+              "at": 1794698666.826995,
+              "from_state": "running",
+              "note": "orchestration cancelled by operator (SIGINT)",
+              "to_state": "blocked"
+            }
+          ]
+        }
+      }
+    },
+    "lifecycle": {
+      "decisions": {
+        "global": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+        "other-scope": "28e3851b-1711-42a4-a5e5-60fa734a51e9",
+        "replacement": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+        "scoped": "296dc056-3c9e-4699-b044-d85baedd0d1a",
+        "superseded": "cb12bc01-96f6-4322-ae3a-6c4e9bb80f9f"
+      },
+      "files": [
+        "board.db"
+      ],
+      "frozen_at": 1794698661.102981,
+      "items": {
+        "agent-failed": "09b4c67a-ec4a-4732-8658-01d721dfc1b3",
+        "annotated": "3d5c3169-7023-4aa9-ad9d-62910fb767e6",
+        "bare-done-refused": "590a63d0-4d6b-43bc-a149-5a9ede88fbcb",
+        "evidence-done": "67ba43ad-2711-49b1-994f-af73fc7a6523",
+        "handed-off": "250805f5-fc0e-4ca3-8564-fa449f3e1855",
+        "human-blocked": "cd38d7ed-82f3-41c0-abad-841b590acf07",
+        "human-cleared": "f8e414fa-db58-4364-abc8-a26ade5ed297",
+        "human-required": "52e6c512-57f9-4c22-bd22-51e8427ea20f",
+        "imported-1": "db0ad772-7a10-587a-b48c-581e726e7b09",
+        "needs-done": "fa1452c9-a890-4136-8385-240cbea236bc",
+        "needs-missing": "d03a57bf-7d9c-4fdf-9169-69f55cd21a23",
+        "needs-planned": "fbca3bb1-35b9-4b27-994f-41367fbdd25b",
+        "needs-two": "fb34011e-6cab-4e76-a46a-ebc0c01b86fb",
+        "passed": "e80780d3-ea25-47d4-9e61-179e54db39ab",
+        "pipeline-gate-failed": "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+        "reclaimed": "5d99bb0d-60d3-4d03-99fa-3777680c1208",
+        "route-gate-failed": "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+        "signed-off": "cba2fe9d-c44e-4b28-a569-c54a2c40a32c",
+        "verified": "ed3507e2-101b-49d7-b88f-a2f4e20c55fb"
+      },
+      "release_read": {
+        "active_decisions": {
+          "*": [
+            {
+              "created_at": 1794698659.07176,
+              "id": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Use uv for every Python command."
+            },
+            {
+              "created_at": 1794698659.577112,
+              "id": "296dc056-3c9e-4699-b044-d85baedd0d1a",
+              "scope": "backend",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "백엔드는 SQLite를 유지한다."
+            },
+            {
+              "created_at": 1794698660.593653,
+              "id": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Spaces, not tabs."
+            },
+            {
+              "created_at": 1794698661.102981,
+              "id": "28e3851b-1711-42a4-a5e5-60fa734a51e9",
+              "scope": "docs",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Ship the docs with the code."
+            }
+          ],
+          "backend": [
+            {
+              "created_at": 1794698659.07176,
+              "id": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Use uv for every Python command."
+            },
+            {
+              "created_at": 1794698659.577112,
+              "id": "296dc056-3c9e-4699-b044-d85baedd0d1a",
+              "scope": "backend",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "백엔드는 SQLite를 유지한다."
+            },
+            {
+              "created_at": 1794698660.593653,
+              "id": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Spaces, not tabs."
+            }
+          ],
+          "docs": [
+            {
+              "created_at": 1794698659.07176,
+              "id": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Use uv for every Python command."
+            },
+            {
+              "created_at": 1794698660.593653,
+              "id": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Spaces, not tabs."
+            },
+            {
+              "created_at": 1794698661.102981,
+              "id": "28e3851b-1711-42a4-a5e5-60fa734a51e9",
+              "scope": "docs",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Ship the docs with the code."
+            }
+          ],
+          "nothing": [
+            {
+              "created_at": 1794698659.07176,
+              "id": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Use uv for every Python command."
+            },
+            {
+              "created_at": 1794698660.593653,
+              "id": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Spaces, not tabs."
+            }
+          ],
+          "review": [
+            {
+              "created_at": 1794698659.07176,
+              "id": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Use uv for every Python command."
+            },
+            {
+              "created_at": 1794698660.593653,
+              "id": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+              "scope": "",
+              "superseded_at": null,
+              "superseded_by": null,
+              "text": "Spaces, not tabs."
+            }
+          ]
+        },
+        "aggregates": {},
+        "boundary": {
+          "item": "cd38d7ed-82f3-41c0-abad-841b590acf07",
+          "stats": {
+            "after": {
+              "blocked_aged": [
+                "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+                "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+                "09b4c67a-ec4a-4732-8658-01d721dfc1b3",
+                "cd38d7ed-82f3-41c0-abad-841b590acf07"
+              ],
+              "by_state": {
+                "blocked": 4,
+                "done": 3,
+                "planned": 8,
+                "review": 4
+              },
+              "dropped_handoffs": [
+                "250805f5-fc0e-4ca3-8564-fa449f3e1855"
+              ],
+              "false_done": [],
+              "human_required_aged": [
+                "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+                "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+                "09b4c67a-ec4a-4732-8658-01d721dfc1b3"
+              ],
+              "reclaimed_stale": 1,
+              "redispatched": [
+                "5d99bb0d-60d3-4d03-99fa-3777680c1208"
+              ],
+              "stall_seconds": 3600,
+              "total": 19
+            },
+            "at": {
+              "blocked_aged": [
+                "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+                "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+                "09b4c67a-ec4a-4732-8658-01d721dfc1b3",
+                "cd38d7ed-82f3-41c0-abad-841b590acf07"
+              ],
+              "by_state": {
+                "blocked": 4,
+                "done": 3,
+                "planned": 8,
+                "review": 4
+              },
+              "dropped_handoffs": [
+                "250805f5-fc0e-4ca3-8564-fa449f3e1855"
+              ],
+              "false_done": [],
+              "human_required_aged": [
+                "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+                "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+                "09b4c67a-ec4a-4732-8658-01d721dfc1b3"
+              ],
+              "reclaimed_stale": 1,
+              "redispatched": [
+                "5d99bb0d-60d3-4d03-99fa-3777680c1208"
+              ],
+              "stall_seconds": 3600,
+              "total": 19
+            },
+            "before": {
+              "blocked_aged": [
+                "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+                "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+                "09b4c67a-ec4a-4732-8658-01d721dfc1b3"
+              ],
+              "by_state": {
+                "blocked": 4,
+                "done": 3,
+                "planned": 8,
+                "review": 4
+              },
+              "dropped_handoffs": [
+                "250805f5-fc0e-4ca3-8564-fa449f3e1855"
+              ],
+              "false_done": [],
+              "human_required_aged": [
+                "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+                "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+                "09b4c67a-ec4a-4732-8658-01d721dfc1b3"
+              ],
+              "reclaimed_stale": 1,
+              "redispatched": [
+                "5d99bb0d-60d3-4d03-99fa-3777680c1208"
+              ],
+              "stall_seconds": 3600,
+              "total": 19
+            }
+          },
+          "times": {
+            "after": 1794702253.6544821,
+            "at": 1794702253.654482,
+            "before": 1794702253.6544816
+          }
+        },
+        "decision_rows": [
+          {
+            "created_at": 1794698659.07176,
+            "id": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+            "scope": "",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "Use uv for every Python command."
+          },
+          {
+            "created_at": 1794698659.577112,
+            "id": "296dc056-3c9e-4699-b044-d85baedd0d1a",
+            "scope": "backend",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "백엔드는 SQLite를 유지한다."
+          },
+          {
+            "created_at": 1794698660.086337,
+            "id": "cb12bc01-96f6-4322-ae3a-6c4e9bb80f9f",
+            "scope": "",
+            "superseded_at": 1794698660.593653,
+            "superseded_by": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+            "text": "Tabs, not spaces."
+          },
+          {
+            "created_at": 1794698660.593653,
+            "id": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+            "scope": "",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "Spaces, not tabs."
+          },
+          {
+            "created_at": 1794698661.102981,
+            "id": "28e3851b-1711-42a4-a5e5-60fa734a51e9",
+            "scope": "docs",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "Ship the docs with the code."
+          }
+        ],
+        "decisions_mapped": [
+          {
+            "created_at": 1794698659.07176,
+            "id": "a5219469-1a17-4ee4-aa0a-e837654e84d4",
+            "scope": "",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "Use uv for every Python command."
+          },
+          {
+            "created_at": 1794698659.577112,
+            "id": "296dc056-3c9e-4699-b044-d85baedd0d1a",
+            "scope": "backend",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "백엔드는 SQLite를 유지한다."
+          },
+          {
+            "created_at": 1794698660.086337,
+            "id": "cb12bc01-96f6-4322-ae3a-6c4e9bb80f9f",
+            "scope": "",
+            "superseded_at": 1794698660.593653,
+            "superseded_by": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+            "text": "Tabs, not spaces."
+          },
+          {
+            "created_at": 1794698660.593653,
+            "id": "a022b75e-fa2f-4ff0-9c13-b19a42b42c86",
+            "scope": "",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "Spaces, not tabs."
+          },
+          {
+            "created_at": 1794698661.102981,
+            "id": "28e3851b-1711-42a4-a5e5-60fa734a51e9",
+            "scope": "docs",
+            "superseded_at": null,
+            "superseded_by": null,
+            "text": "Ship the docs with the code."
+          }
+        ],
+        "items": {
+          "09b4c67a-ec4a-4732-8658-01d721dfc1b3": {
+            "blocked_reason": "All agents failed:\n  [codex] codex (fake): refused",
+            "claimed_at": null,
+            "created_at": 1794698639.064196,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": true,
+            "id": "09b4c67a-ec4a-4732-8658-01d721dfc1b3",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": "none",
+            "state": "blocked",
+            "task": "ask a refusing agent",
+            "updated_at": 1794698640.572549
+          },
+          "250805f5-fc0e-4ca3-8564-fa449f3e1855": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698632.811248,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698634.37516,
+                "by": "codex",
+                "kind": "gate",
+                "passed": true,
+                "ref": "1/1 checks passed"
+              }
+            ],
+            "goal": "backend",
+            "handoff": "검토: 부호를 확인할 것",
+            "human_required": false,
+            "id": "250805f5-fc0e-4ca3-8564-fa449f3e1855",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [
+              "notes/plan.md",
+              "calc.py"
+            ],
+            "owner_agent": "codex",
+            "state": "review",
+            "task": "덧셈을 고친다",
+            "updated_at": 1794698634.37516
+          },
+          "3d5c3169-7023-4aa9-ad9d-62910fb767e6": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698654.1412852,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698654.6227572,
+                "by": "human",
+                "kind": "manual",
+                "passed": true,
+                "ref": "https://example.invalid/log/7"
+              }
+            ],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "3d5c3169-7023-4aa9-ad9d-62910fb767e6",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "carries a reference",
+            "updated_at": 1794698654.6228008
+          },
+          "52e6c512-57f9-4c22-bd22-51e8427ea20f": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698655.101978,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": true,
+            "id": "52e6c512-57f9-4c22-bd22-51e8427ea20f",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "needs a person",
+            "updated_at": 1794698655.101978
+          },
+          "590a63d0-4d6b-43bc-a149-5a9ede88fbcb": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698652.167226,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "590a63d0-4d6b-43bc-a149-5a9ede88fbcb",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "no verification yet",
+            "updated_at": 1794698652.167226
+          },
+          "5d99bb0d-60d3-4d03-99fa-3777680c1208": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698641.113525,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698646.1966789,
+                "by": "codex",
+                "kind": "gate",
+                "passed": true,
+                "ref": "1/1 checks passed"
+              }
+            ],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "5d99bb0d-60d3-4d03-99fa-3777680c1208",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [
+              "calc.py"
+            ],
+            "owner_agent": "codex",
+            "state": "review",
+            "task": "fix add after a crash",
+            "updated_at": 1794698646.1966789
+          },
+          "67ba43ad-2711-49b1-994f-af73fc7a6523": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698646.730467,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698648.338629,
+                "by": "codex",
+                "kind": "gate",
+                "passed": true,
+                "ref": "1/1 checks passed"
+              },
+              {
+                "at": 1794698648.906337,
+                "by": "human",
+                "kind": "manual",
+                "passed": true,
+                "ref": "CI ✓ run 42 — grün"
+              }
+            ],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "67ba43ad-2711-49b1-994f-af73fc7a6523",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [
+              "calc.py"
+            ],
+            "owner_agent": "codex",
+            "state": "done",
+            "task": "verified by CI",
+            "updated_at": 1794698648.906389
+          },
+          "cba2fe9d-c44e-4b28-a569-c54a2c40a32c": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698649.4325051,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698651.0604858,
+                "by": "codex",
+                "kind": "gate",
+                "passed": true,
+                "ref": "1/1 checks passed"
+              },
+              {
+                "at": 1794698651.638635,
+                "by": "human",
+                "kind": "human",
+                "passed": true,
+                "ref": "sign-off"
+              }
+            ],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "cba2fe9d-c44e-4b28-a569-c54a2c40a32c",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [
+              "calc.py"
+            ],
+            "owner_agent": "codex",
+            "state": "done",
+            "task": "verified by a human",
+            "updated_at": 1794698651.638696
+          },
+          "cd38d7ed-82f3-41c0-abad-841b590acf07": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698653.167745,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "cd38d7ed-82f3-41c0-abad-841b590acf07",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "blocked",
+            "task": "waits on ops",
+            "updated_at": 1794698653.654482
+          },
+          "d03a57bf-7d9c-4fdf-9169-69f55cd21a23": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698657.559104,
+            "depends_on": [
+              "00000000-0000-4000-8000-000000000000"
+            ],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "d03a57bf-7d9c-4fdf-9169-69f55cd21a23",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "after an item that does not exist",
+            "updated_at": 1794698657.559104
+          },
+          "db0ad772-7a10-587a-b48c-581e726e7b09": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698658.567849,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698658.567849,
+                "by": "tracegraph",
+                "kind": "tracegraph",
+                "passed": false,
+                "ref": "sha256:2469307ff4b7bc62fd803a18822f3d26c6620bfaa06e0037db62082f6c9c528b"
+              }
+            ],
+            "goal": "review",
+            "handoff": "",
+            "human_required": true,
+            "id": "db0ad772-7a10-587a-b48c-581e726e7b09",
+            "inputs": [
+              "source:tracegraph.review-candidates@v1",
+              "run_id:efd16fc1-758e-48fd-a765-bb3e27815952",
+              "pattern:tool-retry-failure@v2",
+              "tool_key:syncmill::board_stats",
+              "artifact_digest:sha256:2469307ff4b7bc62fd803a18822f3d26c6620bfaa06e0037db62082f6c9c528b"
+            ],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "review",
+            "task": "Review Tracegraph tool-retry-failure@v2 finding for syncmill::board_stats",
+            "updated_at": 1794698658.567849
+          },
+          "e2b2d0e1-1042-49bd-b09d-f8574b086ef1": {
+            "blocked_reason": "quality gate failed: 0/1 checks passed; failed: python -c \"from calc import add; assert add(2, 3) == 5\"",
+            "claimed_at": null,
+            "created_at": 1794698636.983017,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698638.513152,
+                "by": "codex",
+                "kind": "gate",
+                "passed": false,
+                "ref": "0/1 checks passed; failed: python -c \"from calc import add; assert add(2, 3) == 5\""
+              }
+            ],
+            "goal": "",
+            "handoff": "",
+            "human_required": true,
+            "id": "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": "codex",
+            "state": "blocked",
+            "task": "fix add badly in a pipeline",
+            "updated_at": 1794698638.513152
+          },
+          "e80780d3-ea25-47d4-9e61-179e54db39ab": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698628.608104,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698630.214753,
+                "by": "codex",
+                "kind": "gate",
+                "passed": true,
+                "ref": "1/1 checks passed"
+              }
+            ],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "e80780d3-ea25-47d4-9e61-179e54db39ab",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [
+              "calc.py"
+            ],
+            "owner_agent": "codex",
+            "state": "review",
+            "task": "fix add",
+            "updated_at": 1794698630.214753
+          },
+          "ed0d53d3-6670-4949-8557-b38f8f7a1465": {
+            "blocked_reason": "All agents failed:\n  [codex] quality gate failed: 0/1 checks passed; failed: python -c \"from calc import add; assert add(2, 3) == 5\"",
+            "claimed_at": null,
+            "created_at": 1794698634.904182,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": true,
+            "id": "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": "none",
+            "state": "blocked",
+            "task": "fix add badly",
+            "updated_at": 1794698636.43021
+          },
+          "ed3507e2-101b-49d7-b88f-a2f4e20c55fb": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698630.7539961,
+            "depends_on": [],
+            "evidence": [
+              {
+                "at": 1794698632.287241,
+                "by": "codex",
+                "kind": "gate",
+                "passed": true,
+                "ref": "1/1 checks passed"
+              }
+            ],
+            "goal": "backend",
+            "handoff": "",
+            "human_required": false,
+            "id": "ed3507e2-101b-49d7-b88f-a2f4e20c55fb",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [
+              "calc.py"
+            ],
+            "owner_agent": "codex",
+            "state": "done",
+            "task": "fix add and finish",
+            "updated_at": 1794698632.287241
+          },
+          "f8e414fa-db58-4364-abc8-a26ade5ed297": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698655.5769348,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "f8e414fa-db58-4364-abc8-a26ade5ed297",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "needed a person",
+            "updated_at": 1794698656.059977
+          },
+          "fa1452c9-a890-4136-8385-240cbea236bc": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698656.5677388,
+            "depends_on": [
+              "ed3507e2-101b-49d7-b88f-a2f4e20c55fb"
+            ],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "fa1452c9-a890-4136-8385-240cbea236bc",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "after the verified item",
+            "updated_at": 1794698656.5677388
+          },
+          "fb34011e-6cab-4e76-a46a-ebc0c01b86fb": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698658.060055,
+            "depends_on": [
+              "ed3507e2-101b-49d7-b88f-a2f4e20c55fb",
+              "3d5c3169-7023-4aa9-ad9d-62910fb767e6"
+            ],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "fb34011e-6cab-4e76-a46a-ebc0c01b86fb",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "after two items",
+            "updated_at": 1794698658.060055
+          },
+          "fbca3bb1-35b9-4b27-994f-41367fbdd25b": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698657.056418,
+            "depends_on": [
+              "3d5c3169-7023-4aa9-ad9d-62910fb767e6"
+            ],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "fbca3bb1-35b9-4b27-994f-41367fbdd25b",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "after a planned item",
+            "updated_at": 1794698657.056418
+          }
+        },
+        "order": [
+          "e80780d3-ea25-47d4-9e61-179e54db39ab",
+          "ed3507e2-101b-49d7-b88f-a2f4e20c55fb",
+          "250805f5-fc0e-4ca3-8564-fa449f3e1855",
+          "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+          "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+          "09b4c67a-ec4a-4732-8658-01d721dfc1b3",
+          "5d99bb0d-60d3-4d03-99fa-3777680c1208",
+          "67ba43ad-2711-49b1-994f-af73fc7a6523",
+          "cba2fe9d-c44e-4b28-a569-c54a2c40a32c",
+          "590a63d0-4d6b-43bc-a149-5a9ede88fbcb",
+          "cd38d7ed-82f3-41c0-abad-841b590acf07",
+          "3d5c3169-7023-4aa9-ad9d-62910fb767e6",
+          "52e6c512-57f9-4c22-bd22-51e8427ea20f",
+          "f8e414fa-db58-4364-abc8-a26ade5ed297",
+          "fa1452c9-a890-4136-8385-240cbea236bc",
+          "fbca3bb1-35b9-4b27-994f-41367fbdd25b",
+          "d03a57bf-7d9c-4fdf-9169-69f55cd21a23",
+          "fb34011e-6cab-4e76-a46a-ebc0c01b86fb",
+          "db0ad772-7a10-587a-b48c-581e726e7b09"
+        ],
+        "stats": {
+          "aged": {
+            "blocked_aged": [
+              "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+              "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+              "09b4c67a-ec4a-4732-8658-01d721dfc1b3",
+              "cd38d7ed-82f3-41c0-abad-841b590acf07"
+            ],
+            "by_state": {
+              "blocked": 4,
+              "done": 3,
+              "planned": 8,
+              "review": 4
+            },
+            "dropped_handoffs": [
+              "250805f5-fc0e-4ca3-8564-fa449f3e1855"
+            ],
+            "false_done": [],
+            "human_required_aged": [
+              "ed0d53d3-6670-4949-8557-b38f8f7a1465",
+              "e2b2d0e1-1042-49bd-b09d-f8574b086ef1",
+              "09b4c67a-ec4a-4732-8658-01d721dfc1b3",
+              "52e6c512-57f9-4c22-bd22-51e8427ea20f",
+              "db0ad772-7a10-587a-b48c-581e726e7b09"
+            ],
+            "reclaimed_stale": 1,
+            "redispatched": [
+              "5d99bb0d-60d3-4d03-99fa-3777680c1208"
+            ],
+            "stall_seconds": 3600,
+            "total": 19
+          },
+          "fresh": {
+            "blocked_aged": [],
+            "by_state": {
+              "blocked": 4,
+              "done": 3,
+              "planned": 8,
+              "review": 4
+            },
+            "dropped_handoffs": [],
+            "false_done": [],
+            "human_required_aged": [],
+            "reclaimed_stale": 1,
+            "redispatched": [
+              "5d99bb0d-60d3-4d03-99fa-3777680c1208"
+            ],
+            "stall_seconds": 3600,
+            "total": 19
+          }
+        },
+        "transitions": {
+          "09b4c67a-ec4a-4732-8658-01d721dfc1b3": [
+            {
+              "actor": "human",
+              "at": 1794698639.064196,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "acbe6df4-c07f-43d9-ab21-d3832a18538f",
+              "at": 1794698640.161309,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "none",
+              "at": 1794698640.572549,
+              "from_state": "running",
+              "note": "run failed",
+              "to_state": "blocked"
+            }
+          ],
+          "250805f5-fc0e-4ca3-8564-fa449f3e1855": [
+            {
+              "actor": "human",
+              "at": 1794698632.811248,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "ad3df32b-9c9f-432f-b2cd-85b2861fcd66",
+              "at": 1794698633.918839,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "codex",
+              "at": 1794698634.37516,
+              "from_state": "running",
+              "note": "agent completed; awaiting review",
+              "to_state": "review"
+            }
+          ],
+          "3d5c3169-7023-4aa9-ad9d-62910fb767e6": [
+            {
+              "actor": "human",
+              "at": 1794698654.1412852,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "human",
+              "at": 1794698654.6228008,
+              "from_state": "planned",
+              "note": "annotated",
+              "to_state": "planned"
+            }
+          ],
+          "52e6c512-57f9-4c22-bd22-51e8427ea20f": [
+            {
+              "actor": "human",
+              "at": 1794698655.101978,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            }
+          ],
+          "590a63d0-4d6b-43bc-a149-5a9ede88fbcb": [
+            {
+              "actor": "human",
+              "at": 1794698652.167226,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            }
+          ],
+          "5d99bb0d-60d3-4d03-99fa-3777680c1208": [
+            {
+              "actor": "human",
+              "at": 1794698641.113525,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "8628b3d3-5984-41ca-ab2d-5188935c6ec8",
+              "at": 1794698642.242814,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "system",
+              "at": 1794698645.181956,
+              "from_state": "running",
+              "note": "stale-claim recovery",
+              "to_state": "planned"
+            },
+            {
+              "actor": "db8ffa31-0ff2-41b9-ab2e-a2c8ee2eb108",
+              "at": 1794698645.774993,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "codex",
+              "at": 1794698646.1966789,
+              "from_state": "running",
+              "note": "agent completed; awaiting review",
+              "to_state": "review"
+            }
+          ],
+          "67ba43ad-2711-49b1-994f-af73fc7a6523": [
+            {
+              "actor": "human",
+              "at": 1794698646.730467,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "4e950744-afa9-4a60-b518-6236f74e78be",
+              "at": 1794698647.853072,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "codex",
+              "at": 1794698648.338629,
+              "from_state": "running",
+              "note": "agent completed; awaiting review",
+              "to_state": "review"
+            },
+            {
+              "actor": "human",
+              "at": 1794698648.906389,
+              "from_state": "review",
+              "note": "",
+              "to_state": "done"
+            }
+          ],
+          "cba2fe9d-c44e-4b28-a569-c54a2c40a32c": [
+            {
+              "actor": "human",
+              "at": 1794698649.4325051,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "a4e7383d-eb2d-4f3e-bc14-31e3c13d31a2",
+              "at": 1794698650.589119,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "codex",
+              "at": 1794698651.0604858,
+              "from_state": "running",
+              "note": "agent completed; awaiting review",
+              "to_state": "review"
+            },
+            {
+              "actor": "human",
+              "at": 1794698651.638696,
+              "from_state": "review",
+              "note": "",
+              "to_state": "done"
+            }
+          ],
+          "cd38d7ed-82f3-41c0-abad-841b590acf07": [
+            {
+              "actor": "human",
+              "at": 1794698653.167745,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "human",
+              "at": 1794698653.654482,
+              "from_state": "planned",
+              "note": "waiting on ops",
+              "to_state": "blocked"
+            }
+          ],
+          "d03a57bf-7d9c-4fdf-9169-69f55cd21a23": [
+            {
+              "actor": "human",
+              "at": 1794698657.559104,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            }
+          ],
+          "db0ad772-7a10-587a-b48c-581e726e7b09": [
+            {
+              "actor": "tracegraph-import",
+              "at": 1794698658.567849,
+              "from_state": null,
+              "note": "imported review candidate",
+              "to_state": "review"
+            }
+          ],
+          "e2b2d0e1-1042-49bd-b09d-f8574b086ef1": [
+            {
+              "actor": "human",
+              "at": 1794698636.983017,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "cb05fc5d-cc05-4cca-8c0c-44c76cfacf33",
+              "at": 1794698638.0754921,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "codex",
+              "at": 1794698638.513152,
+              "from_state": "running",
+              "note": "run failed",
+              "to_state": "blocked"
+            }
+          ],
+          "e80780d3-ea25-47d4-9e61-179e54db39ab": [
+            {
+              "actor": "human",
+              "at": 1794698628.608104,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "8763a631-fac4-4b9a-b102-ad4fb49e7cb3",
+              "at": 1794698629.1479979,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "codex",
+              "at": 1794698630.214753,
+              "from_state": "running",
+              "note": "agent completed; awaiting review",
+              "to_state": "review"
+            }
+          ],
+          "ed0d53d3-6670-4949-8557-b38f8f7a1465": [
+            {
+              "actor": "human",
+              "at": 1794698634.904182,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "9e1507ff-30b9-49e1-8276-22b8bef585f2",
+              "at": 1794698636.0288231,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "none",
+              "at": 1794698636.43021,
+              "from_state": "running",
+              "note": "run failed",
+              "to_state": "blocked"
+            }
+          ],
+          "ed3507e2-101b-49d7-b88f-a2f4e20c55fb": [
+            {
+              "actor": "human",
+              "at": 1794698630.7539961,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "c2451fa6-eb7c-4468-ad55-edb97bc22b24",
+              "at": 1794698631.854018,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            },
+            {
+              "actor": "codex",
+              "at": 1794698632.287241,
+              "from_state": "running",
+              "note": "agent completed; verified",
+              "to_state": "done"
+            }
+          ],
+          "f8e414fa-db58-4364-abc8-a26ade5ed297": [
+            {
+              "actor": "human",
+              "at": 1794698655.5769348,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "human",
+              "at": 1794698656.059977,
+              "from_state": "planned",
+              "note": "annotated",
+              "to_state": "planned"
+            }
+          ],
+          "fa1452c9-a890-4136-8385-240cbea236bc": [
+            {
+              "actor": "human",
+              "at": 1794698656.5677388,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            }
+          ],
+          "fb34011e-6cab-4e76-a46a-ebc0c01b86fb": [
+            {
+              "actor": "human",
+              "at": 1794698658.060055,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            }
+          ],
+          "fbca3bb1-35b9-4b27-994f-41367fbdd25b": [
+            {
+              "actor": "human",
+              "at": 1794698657.056418,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            }
+          ]
+        }
+      }
+    },
+    "running": {
+      "decisions": {},
+      "files": [
+        "board.db",
+        "board.db-shm",
+        "board.db-wal"
+      ],
+      "frozen_at": 1794698662.841047,
+      "items": {
+        "killed": "0fe98d25-4f1e-437f-a0bc-0c28cdbc6fcc",
+        "waiting": "eba73a32-22cd-4052-8cfb-c1bc12fb40bb"
+      },
+      "release_read": {
+        "active_decisions": {
+          "*": [],
+          "backend": []
+        },
+        "aggregates": {},
+        "decision_rows": [],
+        "decisions_mapped": [],
+        "items": {
+          "0fe98d25-4f1e-437f-a0bc-0c28cdbc6fcc": {
+            "blocked_reason": "",
+            "claimed_at": 1794698662.841047,
+            "created_at": 1794698662.309786,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "backend",
+            "handoff": "",
+            "human_required": false,
+            "id": "0fe98d25-4f1e-437f-a0bc-0c28cdbc6fcc",
+            "inputs": [],
+            "lease_run_id": "c8eecea0-a585-42e8-aa9d-dff948c5b960",
+            "outputs": [],
+            "owner_agent": null,
+            "state": "running",
+            "task": "killed mid-run",
+            "updated_at": 1794698662.841047
+          },
+          "eba73a32-22cd-4052-8cfb-c1bc12fb40bb": {
+            "blocked_reason": "",
+            "claimed_at": null,
+            "created_at": 1794698661.811179,
+            "depends_on": [],
+            "evidence": [],
+            "goal": "",
+            "handoff": "",
+            "human_required": false,
+            "id": "eba73a32-22cd-4052-8cfb-c1bc12fb40bb",
+            "inputs": [],
+            "lease_run_id": null,
+            "outputs": [],
+            "owner_agent": null,
+            "state": "planned",
+            "task": "still planned",
+            "updated_at": 1794698661.811179
+          }
+        },
+        "order": [
+          "eba73a32-22cd-4052-8cfb-c1bc12fb40bb",
+          "0fe98d25-4f1e-437f-a0bc-0c28cdbc6fcc"
+        ],
+        "stats": {
+          "aged": {
+            "blocked_aged": [],
+            "by_state": {
+              "planned": 1,
+              "running": 1
+            },
+            "dropped_handoffs": [],
+            "false_done": [],
+            "human_required_aged": [],
+            "reclaimed_stale": 0,
+            "redispatched": [],
+            "stall_seconds": 3600,
+            "total": 2
+          },
+          "fresh": {
+            "blocked_aged": [],
+            "by_state": {
+              "planned": 1,
+              "running": 1
+            },
+            "dropped_handoffs": [],
+            "false_done": [],
+            "human_required_aged": [],
+            "reclaimed_stale": 0,
+            "redispatched": [],
+            "stall_seconds": 3600,
+            "total": 2
+          }
+        },
+        "transitions": {
+          "0fe98d25-4f1e-437f-a0bc-0c28cdbc6fcc": [
+            {
+              "actor": "human",
+              "at": 1794698662.309786,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            },
+            {
+              "actor": "c8eecea0-a585-42e8-aa9d-dff948c5b960",
+              "at": 1794698662.841047,
+              "from_state": "planned",
+              "note": "claimed",
+              "to_state": "running"
+            }
+          ],
+          "eba73a32-22cd-4052-8cfb-c1bc12fb40bb": [
+            {
+              "actor": "human",
+              "at": 1794698661.811179,
+              "from_state": null,
+              "note": "created",
+              "to_state": "planned"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "stall_seconds": 3600,
+  "tracegraph_report": "tests/fixtures/tracegraph/v1.json"
+}
