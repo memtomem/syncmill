@@ -53,12 +53,20 @@ SCENARIOS = {
 }
 #: The one scenario that leaves a run directory without an envelope.
 NO_ENVELOPE = "trace-only"
-CASES = [(r, s) for r in RELEASES for s in sorted(SCENARIOS)]
-ENVELOPE_CASES = [(r, s) for r, s in CASES if s != NO_ENVELOPE]
 
 
 def _index(release: str) -> dict:
     return json.loads((FIXTURES / release / "index.json").read_text())
+
+
+def _scenarios(release: str) -> list[str]:
+    """Every scenario the release froze: SCENARIOS, plus any `completed-N` run
+    freeze.py added to make name order differ from created_at order."""
+    return sorted(_index(release)["scenarios"])
+
+
+CASES = [(r, s) for r in RELEASES for s in _scenarios(r)]
+ENVELOPE_CASES = [(r, s) for r, s in CASES if s != NO_ENVELOPE]
 
 
 def _run_id(release: str, scenario: str) -> str:
@@ -102,11 +110,13 @@ def report_root(tmp_path, monkeypatch):
 def test_every_release_froze_every_scenario(release):
     index = _index(release)
     assert index["release"] == release.lstrip("v")
-    assert set(index["scenarios"]) == SCENARIOS
+    assert SCENARIOS <= set(index["scenarios"])
+    extra = set(index["scenarios"]) - SCENARIOS
+    assert all(s.startswith("completed-") for s in extra), extra
     ids = [entry["run_id"] for entry in index["scenarios"].values()]
     assert sorted(ids) == sorted(p.name for p in (FIXTURES / release / "runs").iterdir())
     # Sentinel from v0.1.3 on, for the reporter and the tracer alike.
-    for scenario in SCENARIOS:
+    for scenario in _scenarios(release):
         has = (_run_dir(release, scenario) / RUN_DIR_SENTINEL).exists()
         assert has is (release != "v0.1.2"), scenario
 
@@ -153,11 +163,12 @@ def test_head_schema_accepts_the_released_envelope(release, scenario):
 
 
 @pytest.mark.parametrize(("release", "scenario"), CASES)
-def test_load_envelope_returns_the_stored_document(release, scenario):
+def test_load_envelope_returns_the_stored_document(release, scenario, tmp_path):
     raw = None
     if scenario != NO_ENVELOPE:
         raw = json.loads((_run_dir(release, scenario) / "envelope.json").read_bytes())
-    assert load_envelope(FIXTURES / release / "runs", _run_id(release, scenario)) == raw
+    root = _copy_runs(tmp_path / "reports", release)
+    assert load_envelope(root, _run_id(release, scenario)) == raw
 
 
 def _v(value: object) -> str:
@@ -242,7 +253,8 @@ def test_report_show_renders_the_released_envelope(release, scenario, report_roo
     # The release's own `report show` of the same bytes: no field changed meaning.
     assert done.stdout == release_show["stdout"]
     assert done.stdout.splitlines() == _show_lines(_doc(release, scenario))
-    for label, value in SHOWN[scenario].items():
+    shown = SHOWN["completed"] if scenario.startswith("completed-") else SHOWN[scenario]
+    for label, value in shown.items():
         if scenario == "board":
             board = _doc(release, scenario)["board"]
             assert board["goal"] == "frozen-goal"
@@ -265,7 +277,7 @@ def test_report_show_refuses_a_run_dir_without_an_envelope(release, report_root)
 
 def _newest_first(*releases: str) -> list[dict]:
     docs = [
-        _doc(r, s) for r in releases for s in SCENARIOS if s != NO_ENVELOPE
+        _doc(r, s) for r in releases for s in _scenarios(r) if s != NO_ENVELOPE
     ]
     return sorted(docs, key=lambda d: d["created_at"], reverse=True)
 
@@ -296,13 +308,24 @@ def test_report_list_orders_every_release_and_skips_foreign_entries(report_root)
     (root / "torn").mkdir()
     (root / "torn" / "envelope.json").write_text('{"run_id": "torn"')
     (root / "stray.json").write_text("{}")
+    # Every released run started and finished before the next began, so
+    # created_at and finished_at order agree on them. A test-made long run
+    # (a released envelope started before all of them, finished after all of
+    # them) tells the two orders apart: newest first means by created_at.
+    released = _newest_first(*RELEASES)
+    long_run = {**_doc("v0.1.2", "completed"), "run_id": "probe-long-run",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2099-01-01T00:00:00+00:00"}
+    assert long_run["created_at"] < min(d["created_at"] for d in released)
+    assert long_run["finished_at"] > max(d["finished_at"] for d in released)
+    (root / "probe-long-run").mkdir()
+    (root / "probe-long-run" / "envelope.json").write_text(json.dumps(long_run))
+    expected = [*released, long_run]
     done = CliRunner().invoke(cli, ["report", "list"])
     assert done.exit_code == 0, done.output
     rows = [line for line in done.stdout.splitlines() if line.startswith("  ")]
-    assert rows == [_list_row(d) for d in _newest_first(*RELEASES)]
-    assert [d["run_id"] for d in list_reports(root)] == [
-        d["run_id"] for d in _newest_first(*RELEASES)
-    ]
+    assert rows == [_list_row(d) for d in expected]
+    assert [d["run_id"] for d in list_reports(root)] == [d["run_id"] for d in expected]
 
 
 # ── the TUI Reports tab and the dashboard REPORT pane ─────────────────────
@@ -404,6 +427,8 @@ def test_dashboard_report_pane_shows_every_released_run(report_root, tmp_path):
 
 CURRENT = "current-run"
 KEEP_LAST = 10
+MARKER = "kept-by-the-current-run"
+MARKER_BYTES = b"written before the sweep\n"
 
 
 def _variant(root: Path, name: str, doc: object) -> None:
@@ -418,7 +443,7 @@ def _retention_root(root: Path) -> tuple[set[str], set[str]]:
     of `_is_run_dir`; the owned probe shows the probe-making keeps ownership."""
     _copy_runs(root, *RELEASES)
     owned = {
-        _run_id(r, s) for r in RELEASES for s in SCENARIOS
+        _run_id(r, s) for r in RELEASES for s in _scenarios(r)
         if not (r == "v0.1.2" and s == NO_ENVELOPE)
     }
     # v0.1.2 wrote no sentinel and a trace-only run writes no envelope: nothing
@@ -445,8 +470,11 @@ def _retention_root(root: Path) -> tuple[set[str], set[str]]:
                   "probe-not-object", "probe-torn", "probe-foreign"}
 
     # The current run exists already and is the OLDEST: it must survive anyway.
+    # It holds a marker, so a sweep that removed it and a writer that then
+    # recreated it cannot pass for one that left it alone.
     (root / CURRENT).mkdir()
     (root / CURRENT / RUN_DIR_SENTINEL).write_text("")
+    (root / CURRENT / MARKER).write_bytes(MARKER_BYTES)
     # Distinct, explicit mtimes in an order unrelated to names or releases, so
     # owned and foreign directories interleave around the retention cutoff.
     names = sorted(p.name for p in root.iterdir() if p.name != CURRENT)
@@ -479,6 +507,7 @@ def test_run_reporter_retention_owns_released_dirs_only(tmp_path):
     reporter.start(run_id=CURRENT, task_id="t", strategy="route", team=None, agents=["codex"])
     assert not reporter.degraded
     assert {p.name for p in root.iterdir()} == expected
+    assert (root / CURRENT / MARKER).read_bytes() == MARKER_BYTES
 
 
 def _trace_only(tmp_path, root: Path, trace_dir: str):
@@ -497,6 +526,7 @@ def test_supervisor_trace_only_sweep_owns_released_dirs_only(patched_worktree, t
     assert result.status is TaskStatus.COMPLETED
     assert {p.name for p in root.iterdir()} == expected
     assert (root / CURRENT / "trace.otlp.json").exists()
+    assert (root / CURRENT / MARKER).read_bytes() == MARKER_BYTES
 
 
 def test_supervisor_never_sweeps_a_custom_trace_dir(patched_worktree, tmp_path):  # noqa: F811
@@ -509,4 +539,5 @@ def test_supervisor_never_sweeps_a_custom_trace_dir(patched_worktree, tmp_path):
     assert result.status is TaskStatus.COMPLETED
     assert {p.name for p in root.iterdir()} == before
     assert (root / CURRENT / "trace.otlp.json").exists()
+    assert (root / CURRENT / MARKER).read_bytes() == MARKER_BYTES
 
