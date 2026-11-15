@@ -196,8 +196,9 @@ def _aggregates(release: str) -> dict[str, tuple[str, list[str], list[tuple]]]:
     return rows
 
 
-#: Producer replies that are not a golden's bytes (freeze.py says why).
-SYNTHETIC = {"strict-multi-allow", "strict-multi-mixed", "strict-gen-mismatch",
+#: Producer replies that are not a golden's bytes (freeze.py says why). Not
+#: strict-multi-mixed: its second identity's call fails, so no reply exists.
+SYNTHETIC = {"strict-multi-allow", "strict-gen-mismatch",
              "control-finding", "control-strict-finding"}
 #: Scenarios reached through a write the release's own writer was made to fail.
 INJECTED = {"strict-persist-eval": "eval-000.json", "strict-persist-aggregate": "preflight.json",

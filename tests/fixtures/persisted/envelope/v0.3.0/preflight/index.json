@@ -198,8 +198,7 @@
         "stderr": "",
         "stdout": "Run:        06744151-6a99-4fca-bf00-0cf11c45a92d\nCreated:    2026-11-15T07:20:06.981778+00:00\nFinished:   2026-11-15T07:20:07.084542+00:00\nStrategy:   compete\nTeam:       pair\nTask:       54087b7a-5ebd-4f75-9b37-3f66924b47b7\nAgents:     codex, kimi-code\nBoard:      \u2014\nResult:     failed (preflight)\n  winner:             \u2014\n  exit code:          1\n  duration:           0.0s\n  gate passed:        None\n  files changed:      0\n  artifact:           result.json\n  digest:             sha256:3f998b2ddfdf81c3b9d292c225060b39eb57e050fa398d87a5d99c1862399012\n  patch digest:       \u2014\nPreflight:  error\nTrace:      disabled\nDegraded:   \u2014\n"
       },
-      "run_id": "06744151-6a99-4fca-bf00-0cf11c45a92d",
-      "synthetic": "identity kimi answered with the allow golden, agent replaced"
+      "run_id": "06744151-6a99-4fca-bf00-0cf11c45a92d"
     },
     "strict-persist-aggregate": {
       "injected_write_failure": {

@@ -619,7 +619,7 @@ def preflight_scenarios(version: tuple[int, ...]) -> list[dict]:
 
 SYNTHETIC = {
     "strict-multi-allow": "identity kimi answered with the allow golden, agent replaced",
-    "strict-multi-mixed": "identity kimi answered with the allow golden, agent replaced",
+    # Not strict-multi-mixed: its kimi call fails before any reply is written.
     "strict-gen-mismatch": "identity kimi answered with the allow golden, agent replaced "
                            "and graph_generation 43",
     "control-finding": "one UNREACHABLE_NODE finding added to the control golden",
