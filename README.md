@@ -827,8 +827,14 @@ The suite replaces agents and memory with in-memory fakes (see
 
 The [2026-09-08 stabilization roadmap](https://github.com/memtomem/syncmill/blob/main/docs/improvement-roadmap-2026-09-08.ko.md)
 reconciles historical handoffs with current source and documents memory GC recovery.
-Opt-in real memory tests use temporary stores: `SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run
-pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py`.
+Opt-in real memory tests use temporary stores and copies of release-written ones:
+
+```bash
+SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q \
+  tests/test_memory_backend_memtomem_integration.py \
+  tests/test_memory_gc_process.py \
+  tests/test_frozen_memory_real.py
+```
 
 ## Contributing
 
