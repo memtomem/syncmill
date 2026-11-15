@@ -45,7 +45,9 @@ from test_supervisor import _supervisor, patched_worktree  # noqa: F401  (fixtur
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "persisted" / "envelope"
 HEAD_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "run-envelope.schema.json"
-RELEASES = ("v0.1.2", "v0.2.0", "v0.3.0")
+#: Every release frozen here, from the directories on disk: a release added by
+#: `freeze.py` is picked up without editing this file.
+RELEASES = tuple(sorted(p.parent.name for p in FIXTURES.glob("v*/index.json")))
 SCENARIOS = {
     "completed", "nochange", "failed", "gate-pass", "gate-fail", "compete-team",
     "traced", "phoenix-error", "trace-error", "breaker-degraded", "multi-degraded",
@@ -106,10 +108,20 @@ def report_root(tmp_path, monkeypatch):
 # ── the fixtures are what the releases wrote ──────────────────────────────
 
 
+def test_the_frozen_releases_are_all_present():
+    # Discovery from disk must not hide a fixture directory that went missing.
+    assert {"v0.1.2", "v0.2.0", "v0.3.0"} <= set(RELEASES)
+
+
 @pytest.mark.parametrize("release", RELEASES)
 def test_every_release_froze_every_scenario(release):
     index = _index(release)
     assert index["release"] == release.lstrip("v")
+    # The frozen schema is the release's own file: its git blob id is the one
+    # freeze.py read from the release tree.
+    schema = (FIXTURES / release / "run-envelope.schema.json").read_bytes()
+    blob = hashlib.sha1(b"blob %d\0" % len(schema) + schema).hexdigest()
+    assert blob == index["schema_blob"]
     assert SCENARIOS <= set(index["scenarios"])
     extra = set(index["scenarios"]) - SCENARIOS
     assert all(s.startswith("completed-") for s in extra), extra
