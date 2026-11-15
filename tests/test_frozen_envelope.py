@@ -153,10 +153,15 @@ def test_the_fixture_digests_bind_the_stored_sidecars(release, scenario):
 @pytest.mark.parametrize(("release", "scenario"), ENVELOPE_CASES)
 def test_head_schema_accepts_the_released_envelope(release, scenario):
     doc = _doc(release, scenario)
-    jsonschema.Draft202012Validator(json.loads(HEAD_SCHEMA.read_text())).validate(doc)
+    # Formats are checked where jsonschema can: `date` and the like always,
+    # `date-time` only with the optional rfc3339-validator installed.
+    checker = jsonschema.FormatChecker()
+    jsonschema.Draft202012Validator(
+        json.loads(HEAD_SCHEMA.read_text()), format_checker=checker
+    ).validate(doc)
     # And the release's own schema, frozen beside it: the fixture is what it meant.
     own = json.loads((FIXTURES / release / "run-envelope.schema.json").read_text())
-    jsonschema.Draft202012Validator(own).validate(doc)
+    jsonschema.Draft202012Validator(own, format_checker=checker).validate(doc)
 
 
 # ── load_envelope / report show / report list ─────────────────────────────
@@ -275,6 +280,24 @@ def test_report_show_refuses_a_run_dir_without_an_envelope(release, report_root)
     assert done.stderr == f"Error: no report found for run {run_id!r} under {root}\n"
 
 
+def _with_long_run(root: Path) -> list[dict]:
+    """Add a test-made long run to `root`; return every report newest first.
+
+    Every released run started and finished before the next began, so
+    created_at and finished_at order agree on them. This one (a released
+    envelope started before all of them and finished after all of them) tells
+    the two orders apart: newest first means by created_at, so it comes last."""
+    released = _newest_first(*RELEASES)
+    long_run = {**_doc("v0.1.2", "completed"), "run_id": "probe-long-run",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2099-01-01T00:00:00+00:00"}
+    assert long_run["created_at"] < min(d["created_at"] for d in released)
+    assert long_run["finished_at"] > max(d["finished_at"] for d in released)
+    (root / "probe-long-run").mkdir()
+    (root / "probe-long-run" / "envelope.json").write_text(json.dumps(long_run))
+    return [*released, long_run]
+
+
 def _newest_first(*releases: str) -> list[dict]:
     docs = [
         _doc(r, s) for r in releases for s in _scenarios(r) if s != NO_ENVELOPE
@@ -308,19 +331,7 @@ def test_report_list_orders_every_release_and_skips_foreign_entries(report_root)
     (root / "torn").mkdir()
     (root / "torn" / "envelope.json").write_text('{"run_id": "torn"')
     (root / "stray.json").write_text("{}")
-    # Every released run started and finished before the next began, so
-    # created_at and finished_at order agree on them. A test-made long run
-    # (a released envelope started before all of them, finished after all of
-    # them) tells the two orders apart: newest first means by created_at.
-    released = _newest_first(*RELEASES)
-    long_run = {**_doc("v0.1.2", "completed"), "run_id": "probe-long-run",
-                "created_at": "2026-01-01T00:00:00+00:00",
-                "finished_at": "2099-01-01T00:00:00+00:00"}
-    assert long_run["created_at"] < min(d["created_at"] for d in released)
-    assert long_run["finished_at"] > max(d["finished_at"] for d in released)
-    (root / "probe-long-run").mkdir()
-    (root / "probe-long-run" / "envelope.json").write_text(json.dumps(long_run))
-    expected = [*released, long_run]
+    expected = _with_long_run(root)
     done = CliRunner().invoke(cli, ["report", "list"])
     assert done.exit_code == 0, done.output
     rows = [line for line in done.stdout.splitlines() if line.startswith("  ")]
@@ -349,16 +360,19 @@ def _prompts(options: OptionList) -> list[str]:
 
 
 def _release_show(doc: dict) -> str:
+    """The release's own `report show` text; for the test-made long run, its
+    fields from the raw values."""
     for release in RELEASES:
         for scenario, entry in _index(release)["scenarios"].items():
             if entry["run_id"] == doc["run_id"]:
                 return entry["report_show"]["stdout"].rstrip("\n")
-    raise AssertionError(doc["run_id"])
+    assert doc["run_id"] == "probe-long-run"
+    return "\n".join(_show_lines(doc))
 
 
 def test_tui_reports_tab_shows_every_released_run(report_root, tmp_path):
     root = report_root(*RELEASES)
-    expected = _newest_first(*RELEASES)
+    expected = _with_long_run(root)
 
     async def scenario():
         app = SyncmillTuiApp(
@@ -392,7 +406,7 @@ class _Clock:
 
 def test_dashboard_report_pane_shows_every_released_run(report_root, tmp_path):
     root = report_root(*RELEASES)
-    expected = _newest_first(*RELEASES)
+    expected = _with_long_run(root)
     board = Board(str(tmp_path / "board.db"), now=_Clock())
 
     async def scenario():
