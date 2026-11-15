@@ -1,7 +1,7 @@
 """memtomem stores written by released syncmill, read by HEAD (#271).
 
 Opt-in like every real-memtomem test (``SYNCMILL_TEST_MEMTOMEM_REAL=1``; CI's
-real-memtomem job runs it): HEAD's ``MemtomemBackend`` and everything above it
+``memory-backend-real`` job runs it): HEAD's ``MemtomemBackend`` and everything above it
 (``SyncmillMemory``, the gateway, ``status``, the strategies, a room round, the
 board's scratch collection) work on a copy of a store the release's own CLI
 wrote. ``test_frozen_memory.py`` holds the stored bytes to the scenario
