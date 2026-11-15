@@ -1,0 +1,1 @@
+{"status": "failed", "agent_id": "codex", "output": "codex (fake) fix.", "exit_code": 0, "duration_seconds": 0.02, "files_changed": [], "error": "quality gate failed: 0/1 checks passed; failed: false", "gate_summary": "0/1 checks passed; failed: false", "gate_passed": false, "patch": null}

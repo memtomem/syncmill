@@ -1,0 +1,1 @@
+{"status": "completed", "agent_id": "codex", "output": "codex (fake) nochange.", "exit_code": 0, "duration_seconds": 0.02, "files_changed": [], "error": null, "gate_summary": null, "gate_passed": null, "patch": ""}
