@@ -1,0 +1,29 @@
+{
+  "block_reasons": [
+    "AGENT_MAPPING_MISSING"
+  ],
+  "decision": "block",
+  "evaluations": [
+    {
+      "blocking_reasons": [
+        "AGENT_MAPPING_MISSING"
+      ],
+      "status": "unresolved_identity",
+      "syncmill_agents": [
+        "codex"
+      ],
+      "toolgraph_agent": null,
+      "warning_reasons": []
+    }
+  ],
+  "kind": "syncmill.toolgraph-enforcement",
+  "mode": "strict",
+  "policies": {
+    "drift": "warn",
+    "unavailable": "block",
+    "unknown": "block"
+  },
+  "profile": "review",
+  "run_id": "c6ae2418-5aa7-4ae9-b57d-6f6ef709bc59",
+  "schema_version": 1
+}

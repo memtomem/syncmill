@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "kind": "toolgraph.preflight",
+  "run_id": "c7b68458-95c4-4343-b427-a98686121c09",
+  "created_at": "2026-07-11T00:00:00+00:00",
+  "graph_generation": 42,
+  "agent": "codex",
+  "agent_found": true,
+  "profile": "review",
+  "mode": "advisory",
+  "eligible": [
+    "memtomem::mem_search",
+    "syncmill::shared_read"
+  ],
+  "rejected": [],
+  "features": [],
+  "decision": "advisory_allow"
+}

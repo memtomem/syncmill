@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "kind": "toolgraph.preflight",
+  "run_id": "f571e545-f754-4a85-be59-97a5c78ba20e",
+  "created_at": "2026-07-12T00:00:00+00:00",
+  "graph_generation": 42,
+  "agent": "codex",
+  "agent_found": true,
+  "profile": "review",
+  "mode": "advisory",
+  "eligible": [],
+  "rejected": [
+    {
+      "candidate": "legacy::missing",
+      "tool_key": null,
+      "reason": "TOOL_NOT_FOUND"
+    }
+  ],
+  "features": [],
+  "decision": "advisory_warn"
+}
