@@ -554,4 +554,3 @@ def test_supervisor_never_sweeps_a_custom_trace_dir(patched_worktree, tmp_path):
     assert {p.name for p in root.iterdir()} == before
     assert (root / CURRENT / "trace.otlp.json").exists()
     assert (root / CURRENT / MARKER).read_bytes() == MARKER_BYTES
-
