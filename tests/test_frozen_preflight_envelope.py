@@ -355,7 +355,15 @@ def test_the_preflight_block_and_files_are_what_the_release_wrote(release, scena
             assert ("artifact" in row) is ("digest" in row), row
             if "artifact" in row:
                 referenced.add(row["artifact"])
-                assert row["digest"] == _sha((run_dir / row["artifact"]).read_bytes())
+                stored = (run_dir / row["artifact"]).read_bytes()
+                assert row["digest"] == _sha(stored)
+                # The reference is bound to its content, not to its position:
+                # the producer reply it names is this row's identity's, for this run.
+                reply = json.loads(stored)
+                assert reply["agent"] == row["toolgraph_agent"], row
+                assert reply["run_id"] == doc["run_id"] == manifest["run_id"]
+                assert reply["decision"] == row["producer_decision"]
+                assert reply["graph_generation"] == row["graph_generation"]
         # Every eval file on disk is referenced, and nothing referenced is absent.
         assert referenced == {f for f in files if f.startswith("preflight/")}
 
