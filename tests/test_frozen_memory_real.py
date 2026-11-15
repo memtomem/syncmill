@@ -132,7 +132,10 @@ def rebind(store: StoreCopy) -> StoreCopy:
     """
     from memtomem.storage.sqlite_helpers import norm_path
 
-    old, new = store.generating_mem, norm_path(store.mem)
+    # Directory prefixes with their separator, compared exactly (a LIKE
+    # pattern would read the `_` in a temporary path as a wildcard).
+    old = store.generating_mem.rstrip("/") + "/"
+    new = norm_path(store.mem).rstrip("/") + "/"
     before = _cells(store.db)
     conn = sqlite3.connect(store.db)
     try:
@@ -148,7 +151,7 @@ def rebind(store: StoreCopy) -> StoreCopy:
         conn.commit()
         assert moved == conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] > 0
         assert conn.execute(
-            "SELECT COUNT(*) FROM chunks WHERE source_file LIKE ?", (old + "%",)
+            "SELECT COUNT(*) FROM chunks WHERE substr(source_file, 1, ?) = ?", (len(old), old)
         ).fetchone() == (0,)
         assert conn.execute(
             "SELECT COUNT(*) FROM chunks c JOIN chunks_fts f ON f.rowid = c.rowid "
@@ -214,6 +217,7 @@ def test_head_opens_every_released_store_and_leaves_its_rows_alone(release, tmp_
         # a SIGKILL left with its rows still in the WAL.
         before = _snapshot(frozen.copy(name, tmp_path / "reference"))
         assert before, name
+        released = frozen.read[name]
         store = frozen.copy(name, tmp_path / "opened")
         for _ in range(2):  # the second open finds a store HEAD already opened
             with _Engine(store) as engine:
@@ -221,9 +225,24 @@ def test_head_opens_every_released_store_and_leaves_its_rows_alone(release, tmp_
                     ns: run_async(engine.backend.count_namespace(ns))
                     for ns in {v[0] for v in before.values()}
                 }
+                # Moved, not rebound: the rows read as stored, the killed
+                # run's row out of the WAL included.
+                for chunk_id, (ns, tags, content) in before.items():
+                    got = run_async(engine.backend.get(chunk_id))
+                    assert (got["namespace"], sorted(got["tags"]), got["content"]) == (
+                        ns, list(tags), content
+                    ), chunk_id
+                    assert got["source"] == released["get"][chunk_id]["source"]
+                found = {
+                    ns: _ids(run_async(engine.backend.search(
+                        frozen.anchor, namespace=ns, top_k=ALL
+                    )))
+                    for ns in counts
+                }
             assert counts == {
                 ns: sum(1 for v in before.values() if v[0] == ns) for ns in counts
             }, name
+            assert found == released["search"], name
             assert _snapshot(store) == before, name
 
 
@@ -360,8 +379,8 @@ def test_a_fresh_share_lands_beside_the_released_rows(release, tmp_path, monkeyp
         ))
         assert len(write.source_ids) == len(write.shared_ids) == 1
         found = run_async(engine.backend.search(frozen.anchor, namespace="shared", top_k=ALL))
-        assert write.shared_ids[0] in _ids(found)
-        assert set(before) < set(_ids(found)) | set(before)
+        released_shared = {i for i, v in before.items() if v[0] == "shared"}
+        assert _ids(found) == sorted(released_shared | {write.shared_ids[0]})
     after = store.rows()
     assert {i: v for i, v in _snapshot(store).items() if i in before} == before
     assert set(after) == set(before) | {write.source_ids[0], write.shared_ids[0]}
@@ -536,14 +555,19 @@ def test_status_connects_to_a_released_store(release, tmp_path, monkeypatch):
 
 
 class _Scripted(FakeAgent):
-    """A fake agent whose replies are scripted per call (the last repeats)."""
+    """A fake agent whose replies are scripted per call (the last repeats).
+    Each call is also appended to ``events``, when given, as ``("call",
+    prompt)``."""
 
-    def __init__(self, agent_id: str, replies: list[str]):
+    def __init__(self, agent_id: str, replies: list[str], events: list | None = None):
         super().__init__(agent_id)
         self._replies = replies
+        self._events = events
 
     def execute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
         self._output = self._replies[min(len(self.calls), len(self._replies) - 1)]
+        if self._events is not None:
+            self._events.append(("call", prompt))
         return super().execute(prompt, workdir, timeout)
 
 
@@ -572,12 +596,15 @@ def _supervisor(memory, strategy, agents: list, *, board=None, **config) -> Supe
     return sup
 
 
-def _recording(memory, sent: list) -> None:
+def _recording(memory, events: list) -> None:
+    """Append each recall to ``events`` as ``("recall", tag filter, context
+    returned)``."""
     real = memory.search_context
 
     async def search_context(query, agent_id=None, **kwargs):
-        sent.append(kwargs.get("tag_filter"))
-        return await real(query, agent_id, **kwargs)
+        text = await real(query, agent_id, **kwargs)
+        events.append(("recall", kwargs.get("tag_filter"), text))
+        return text
 
     memory.search_context = search_context
 
@@ -610,21 +637,44 @@ def test_a_head_strategy_asks_a_released_store_for_the_kinds_it_holds(
 ):
     frozen = Frozen(release)
     store = rebind(frozen.copy("store", tmp_path))
+    released = [r for r in store.rows().values() if r.namespace == "shared"]
+    # Every word of the task is in each released strategy result (their
+    # prompts were "<anchor> tok<scenario> fix add in calc.py"). memtomem
+    # falls back from matching every word to matching any word only when the
+    # first finds nothing, so a word the released rows lack would leave a
+    # later phase with this run's own rows alone, which repeat the task.
+    task = f"{frozen.anchor} fix add in calc.py"
+    assert sum(1 for r in released if all(w in r.content for w in task.split())) >= 10
+    events: list = []
     plan = json.dumps(["first half of the work", "second half of the work"])
-    agents = [_Scripted("codex", [plan, "codex did it"]), _Scripted("kimi-code", ["kimi did it"])]
-    sent: list = []
+    agents = [
+        _Scripted("codex", [plan, "codex did it"], events),
+        _Scripted("kimi-code", ["kimi did it"], events),
+    ]
     with _Engine(store) as engine:
-        _recording(engine.memory, sent)
-        result = _supervisor(engine.memory, strategy(), agents, **config).run(
-            Task(prompt=f"{frozen.anchor} a new task")
-        )
+        _recording(engine.memory, events)
+        result = _supervisor(engine.memory, strategy(), agents, **config).run(Task(prompt=task))
         engine.healthy()
     assert result.status.value == "completed", result.error
-    assert sent == filters
-    # Each filter HEAD sent is one this module shows to select exactly the
-    # released rows of those kinds
-    # (test_search_stays_inside_the_namespace_and_the_kind_asked_for).
-    assert {f for f in sent if f} <= set(LATER_PHASE_FILTERS)
+    recalls = [i for i, event in enumerate(events) if event[0] == "recall"]
+    assert [events[i][1] for i in recalls] == filters
+    for n, at in enumerate(recalls):
+        _, wanted, text = events[at]
+        # A phase recalls once, then runs its agents: its prompts are the
+        # calls before the next recall.
+        until = recalls[n + 1] if n + 1 < len(recalls) else len(events)
+        phase = [event[1] for event in events[at + 1:until] if event[0] == "call"]
+        assert phase, wanted
+        kinds = LATER_PHASE_FILTERS[wanted] if wanted else None
+        entitled = _bodies([r for r in released if kinds is None or kinds & set(r.tags)])
+        others = _bodies(released) - entitled
+        returned = {body for body in entitled if body in text}
+        # Each recall finds released rows, only of the kinds it asks for, and
+        # every agent of that phase is handed them.
+        assert returned, (wanted, text)
+        assert not any(body in text for body in others), wanted
+        for body in returned:
+            assert all(body in prompt for prompt in phase), (wanted, body[:80])
 
 
 def test_a_head_run_hands_its_agent_the_released_result(release, tmp_path, pool):

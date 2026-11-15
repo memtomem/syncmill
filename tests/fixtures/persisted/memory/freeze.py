@@ -1,8 +1,10 @@
 """Produce the frozen memtomem stores under this directory (#271).
 
-Run once per release, with THAT release's interpreter and source, never the
-current one. The output directory must not exist; frozen fixtures are never
-regenerated.
+Run once per release. This script itself runs under any Python 3; everything
+that touches the store is the release's own code: its CLI writes the rows and
+its interpreter (`<release-root>/.venv`) reads them back, never the current
+source. The output directory must not exist; frozen fixtures are never
+regenerated, and a run that stops early leaves no output directory.
 
     git worktree add --detach /tmp/wt-v0.3.0 v0.3.0
     (cd /tmp/wt-v0.3.0 && uv sync --frozen --no-dev)
@@ -15,7 +17,8 @@ version the release locked: `run` under each strategy, `board run`, and
 binaries on PATH. One store comes out, with every scenario in it one after
 another. The last is a `board run -s pipeline` whose CLI is SIGKILLed while its
 second stage works, so the store is copied as that kill left it (its newest
-rows still in the WAL, a live lease on the board) and never reopened.
+row only in the WAL, which is checked; a live lease on the board) and never
+reopened.
 
 Each fake reply carries a common token and a token of its own scenario. The
 stores are written with no embedding provider, so a search finds a row only
@@ -220,22 +223,36 @@ def _normal_tags(raw: str) -> list[str]:
     return sorted(out)
 
 
-def _rows(db: Path) -> dict[str, dict]:
-    """The chunk rows of a store, read from a throwaway copy (the WAL with it)
-    so the store itself is never opened by this script."""
+def _query(db: Path, sql: str, params: tuple = (), *, wal: bool = True) -> list[tuple]:
+    """Run one query on a throwaway copy of a database (its WAL with it, unless
+    ``wal`` is false), so a database a release wrote is never opened by this
+    script and a reader always sees what the release committed."""
     with tempfile.TemporaryDirectory() as tmp:
-        for part in db.parent.glob(db.name + "*"):
+        parts = db.parent.glob(db.name + "*") if wal else [db]
+        for part in parts:
             shutil.copy(part, Path(tmp) / part.name)
         conn = sqlite3.connect(Path(tmp) / db.name)
-        rows = {
-            r[0]: {"namespace": r[1], "tags": _normal_tags(r[2]), "content": r[3],
-                   "source": Path(r[4]).name}
-            for r in conn.execute(
-                "SELECT id, namespace, tags, content, source_file FROM chunks ORDER BY rowid"
-            )
-        }
-        conn.close()
-    return rows
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+
+def _raw_rows(db: Path) -> dict[str, tuple]:
+    """The chunk rows of a store as stored: id -> (namespace, tags JSON,
+    content, source_file)."""
+    return {
+        r[0]: tuple(r[1:])
+        for r in _query(
+            db, "SELECT id, namespace, tags, content, source_file FROM chunks ORDER BY rowid"
+        )
+    }
+
+
+def _normal(raw: tuple) -> dict:
+    """A stored row the way the scenario definitions name one."""
+    return {"namespace": raw[0], "tags": _normal_tags(raw[1]), "content": raw[2],
+            "source": Path(raw[3]).name}
 
 
 def _require(name: str, new: list[dict], expected: list[dict]) -> None:
@@ -261,9 +278,15 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     release = args.release_root.resolve()
-    out = args.out.resolve()
-    if out.exists():
-        sys.exit(f"{out} exists; frozen fixtures are never regenerated")
+    # The parent is resolved, not the target: a symlink there must be refused,
+    # not followed.
+    out = args.out.absolute().parent.resolve() / args.out.name
+
+    def refuse_existing() -> None:
+        if out.exists() or out.is_symlink():
+            sys.exit(f"{out} exists; frozen fixtures are never regenerated")
+
+    refuse_existing()
     python = release / ".venv" / "bin" / "python"
     syncmill = release / ".venv" / "bin" / "syncmill"
 
@@ -278,7 +301,20 @@ def main() -> None:
     if version not in ("0.2.0", "0.3.0"):
         sys.exit(f"no scenario definitions for syncmill {version} yet")
     with tempfile.TemporaryDirectory() as tmp:
-        _generate(Path(tmp).resolve(), out, python, syncmill, version, metadata("memtomem"))
+        stage = Path(tmp).resolve() / "frozen"
+        _generate(Path(tmp).resolve(), stage, python, syncmill, version, metadata("memtomem"))
+        # Publish whole: a hidden sibling first (fixture discovery skips it),
+        # then one rename into place, the target checked again just before.
+        # The sibling is removed on any failure, an interrupt included.
+        out.parent.mkdir(parents=True, exist_ok=True)
+        partial = Path(tempfile.mkdtemp(dir=out.parent, prefix=f".{out.name}.partial-"))
+        try:
+            shutil.copytree(stage, partial / "frozen")
+            refuse_existing()
+            (partial / "frozen").rename(out)
+        finally:
+            shutil.rmtree(partial)
+    print(f"frozen {version} into {out}")
 
 
 def _generate(box: Path, out: Path, python: Path, syncmill: Path,
@@ -336,7 +372,7 @@ def _generate(box: Path, out: Path, python: Path, syncmill: Path,
         def __init__(self, name: str, root: Path, db: Path, mem: Path, env: dict):
             self.name, self.root, self.db, self.mem = name, root, db, mem
             self.env = {**common_env, **env}
-            self.seen: set[str] = set()
+            self.known: dict[str, tuple] = {}
 
         def sm(self, scenario: str, *argv: str, plan: dict | None = None,
                ok: bool = True, cwd: Path = repo) -> str:
@@ -356,9 +392,19 @@ def _generate(box: Path, out: Path, python: Path, syncmill: Path,
             return done.stdout
 
         def new_rows(self) -> list[dict]:
-            rows = _rows(self.db) if self.db.exists() else {}
-            new = [row for chunk_id, row in rows.items() if chunk_id not in self.seen]
-            self.seen = set(rows)
+            """The rows added since the last call. Every earlier row must still
+            be there exactly as stored (ids in its tags and its full source
+            path included): a scenario only adds."""
+            rows = _raw_rows(self.db) if self.db.exists() else {}
+            changed = {
+                chunk_id: (row, rows.get(chunk_id))
+                for chunk_id, row in self.known.items() if rows.get(chunk_id) != row
+            }
+            if changed:
+                sys.exit(f"an earlier row was changed or removed: "
+                         f"{json.dumps(changed, ensure_ascii=False, indent=1)}")
+            new = [_normal(row) for chunk_id, row in rows.items() if chunk_id not in self.known]
+            self.known = rows
             return new
 
         def record(self, scenario: str, expected: list[dict], **facts) -> None:
@@ -551,12 +597,11 @@ def _generate(box: Path, out: Path, python: Path, syncmill: Path,
                             "-a", "codex", "-a", "kimi-code").split()[0]
     main_store.sm("room-apply", "room", "round", room_id, plan=plan)
     rooms_db = state / "runs-store" / PROJECT_ID / "rooms" / "rooms.sqlite3"
-    with sqlite3.connect(f"file:{rooms_db}?mode=ro&immutable=1", uri=True) as conn:
-        candidates = conn.execute(
-            "SELECT id, member_id FROM candidates WHERE room_id = ? AND eligible = 1 "
-            "ORDER BY member_id", (room_id,)
-        ).fetchall()
-    conn.close()
+    candidates = _query(
+        rooms_db,
+        "SELECT id, member_id FROM candidates WHERE room_id = ? AND eligible = 1 "
+        "ORDER BY member_id", (room_id,),
+    )
     if not candidates or candidates[0][1] != "codex":
         sys.exit(f"room-apply: no eligible codex candidate: {candidates}")
     main_store.sm("room-apply", "room", "select", room_id, candidates[0][0])
@@ -585,19 +630,32 @@ def _generate(box: Path, out: Path, python: Path, syncmill: Path,
         cwd=repo, env={**killed.env, "FAKE_PLAN": json.dumps(plan), "FAKE_CALLS": str(calls)},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
     )
+    def kill_group() -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
     deadline = time.monotonic() + 120
     while not (started / "kimi").exists():
         if proc.poll() is not None or time.monotonic() > deadline:
-            proc.kill()
-            sys.exit(f"board-killed: the second stage never started: {proc.communicate()[0]}")
+            # The whole group, or an agent still holding the output pipe
+            # would keep the read below from ever returning.
+            kill_group()
+            try:
+                output = proc.communicate(timeout=30)[0]
+            except subprocess.TimeoutExpired:
+                output = "(no output: the pipe is still held open)"
+            sys.exit(f"board-killed: the second stage never started: {output}")
         time.sleep(0.05)
     agent_pid = int((started / "kimi").read_text())
-    os.killpg(proc.pid, signal.SIGKILL)
+    kill_group()
     proc.wait()
     try:
         os.kill(agent_pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    proc.stdout.close()
     scratch = killed.new_rows()
     runs = sorted({r["namespace"] for r in scratch}) or [""]
     reply = default_reply("codex", 1, "tokkilled")
@@ -608,14 +666,16 @@ def _generate(box: Path, out: Path, python: Path, syncmill: Path,
         or not scratch[0]["content"].endswith(f"**Agent:** codex\n\n**Output:**\n{reply}")
     ):
         sys.exit(f"board-killed: unexpected rows {json.dumps(scratch, ensure_ascii=False, indent=1)}")
-    with tempfile.TemporaryDirectory() as tmp:
-        for part in killed.root.glob("board.db*"):
-            shutil.copy(part, Path(tmp) / part.name)
-        conn = sqlite3.connect(Path(tmp) / "board.db")
-        lease = conn.execute(
-            "SELECT state, lease_run_id, claimed_at FROM work_items WHERE id = ?", (item_id,)
-        ).fetchone()
-        conn.close()
+    # The kill left the stage's row in the WAL only: the main file alone does
+    # not have it.
+    in_main = _query(killed.db, "SELECT COUNT(*) FROM chunks WHERE namespace = ?",
+                     (runs[0],), wal=False)
+    if in_main != [(0,)]:
+        sys.exit(f"board-killed: the scratch row is already in the main file: {in_main}")
+    (lease,) = _query(
+        killed.root / "board.db",
+        "SELECT state, lease_run_id, claimed_at FROM work_items WHERE id = ?", (item_id,),
+    )
     if lease[0] != "running" or f"board-run:{lease[1]}" != runs[0]:
         sys.exit(f"board-killed: the board holds no live lease for the scratch run: {lease}")
     index["scenarios"]["board-killed"] = {
@@ -654,7 +714,6 @@ def _generate(box: Path, out: Path, python: Path, syncmill: Path,
     (out / "index.json").write_text(
         json.dumps(index, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(f"frozen {version} (memtomem {memtomem}) into {out}")
 
 
 if __name__ == "__main__":

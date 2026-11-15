@@ -29,6 +29,11 @@ SOURCE_TABLES = (
     "pending_source_checks",
     "source_visibility_generations",
 )
+#: The kind tags the release read searched by (``freeze.py`` ``KINDS``).
+KINDS = {
+    "task-result", "room-result", "pipeline-stage", "council-proposal",
+    "council-critique", "decompose-plan", "decompose-subtask",
+}
 #: What ``_namespace_day_file_suffixes`` reads from a memtomem config.
 STORE_CONFIG = SimpleNamespace(namespace=SimpleNamespace(default_namespace="default"))
 
@@ -148,7 +153,11 @@ def test_the_release_read_is_tied_to_the_stored_rows(release, tmp_path):
         # search for it returns the whole namespace, and only that namespace.
         assert all(frozen.anchor in row.content for row in rows.values())
         assert read["search"] == {ns: sorted(ids) for ns, ids in by_namespace.items()}
+        # Every release's backend search takes a tag filter, so the release
+        # searched every namespace by every kind.
+        assert set(read["search_by_kind"]) == set(by_namespace)
         for ns, by_kind in read["search_by_kind"].items():
+            assert set(by_kind) == KINDS, ns
             for kind, ids in by_kind.items():
                 assert ids == sorted(
                     r.id for r in rows.values() if r.namespace == ns and kind in r.tags
@@ -158,10 +167,7 @@ def test_the_release_read_is_tied_to_the_stored_rows(release, tmp_path):
         for row in frozen.copy("store", tmp_path / "kinds").rows().values()
         for tag in normal_tags(list(row.tags))
     }
-    assert {
-        "task-result", "room-result", "pipeline-stage", "council-proposal",
-        "council-critique", "decompose-plan", "decompose-subtask",
-    } <= kinds
+    assert KINDS <= kinds
 
 
 def test_only_the_source_path_binds_a_store_to_where_it_was_written(release, tmp_path):
@@ -200,7 +206,8 @@ def test_only_the_source_path_binds_a_store_to_where_it_was_written(release, tmp
                 "WHERE f.source_file != c.source_file"
             ).fetchone() == (0,)
             present = [t for t in SOURCE_TABLES if t in tables]
-            expected = list(SOURCE_TABLES) if frozen.index["memtomem"] >= "0.6" else []
+            memtomem = tuple(int(part) for part in frozen.index["memtomem"].split(".")[:2])
+            expected = list(SOURCE_TABLES) if memtomem >= (0, 6) else []
             assert present == expected, name
             for table in present:
                 assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,), table
@@ -209,3 +216,42 @@ def test_only_the_source_path_binds_a_store_to_where_it_was_written(release, tmp
             ).fetchone() == (0,)
         finally:
             conn.close()
+
+
+def test_the_store_was_written_with_no_embedding_provider(release, tmp_path):
+    """A search finds a released row only through a word (the tests rely on
+    the scenario tokens), because the store has no vectors at all."""
+    frozen = Frozen(release)
+    for name in frozen.stores:
+        conn = sqlite3.connect(frozen.copy(name, tmp_path).db)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM _memtomem_meta"))
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+        finally:
+            conn.close()
+        assert (meta["embedding_provider"], meta["embedding_dimension"]) == ("none", "0"), name
+        assert not [t for t in tables if t.startswith("chunks_vec")], name
+
+
+def test_the_killed_runs_row_is_only_in_the_wal(release, tmp_path):
+    """The SIGKILLed board run is the last scenario, and its stage row never
+    reached the main database file: a reader that ignores the WAL misses it."""
+    frozen = Frozen(release)
+    killed = frozen.scenario("board-killed")
+    store = frozen.copy("store", tmp_path / "whole")
+    wal = store.db.with_name(store.db.name + "-wal")
+    assert wal.is_file() and wal.stat().st_size > 0
+    # The main file's bytes are taken before anything opens the copy: closing
+    # an ordinary connection checkpoints the WAL into it.
+    alone = tmp_path / "main-file-only"
+    alone.mkdir()
+    (alone / store.db.name).write_bytes(store.db.read_bytes())
+    (row,) = frozen.scenario_rows(store, "board-killed")
+    assert row.namespace == f"board-run:{killed['run_id']}"
+    conn = sqlite3.connect(f"file:{alone / store.db.name}?mode=ro&immutable=1", uri=True)
+    try:
+        ids = {r[0] for r in conn.execute("SELECT id FROM chunks")}
+    finally:
+        conn.close()
+    assert row.id not in ids
+    assert ids == set(store.rows()) - {row.id}
