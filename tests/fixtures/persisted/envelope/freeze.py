@@ -439,7 +439,10 @@ else:
         refuse("no control behaviour " + plan)
     schema = "control-preflight.schema.json"
 contract = json.loads((golden / schema).read_text())
-jsonschema.validators.validator_for(contract)(contract).validate(doc)
+try:
+    jsonschema.validators.validator_for(contract)(contract).validate(doc)
+except jsonschema.ValidationError as exc:
+    refuse("reply fails " + schema + ": " + exc.message)
 Path(opts["--out"]).write_text(json.dumps(doc, indent=2) + "\\n")
 print(json.dumps(doc))
 '''

@@ -164,6 +164,38 @@ def _expected(release: str) -> dict[str, tuple[dict, set[str], bool]]:
     return rows
 
 
+def _aggregates(release: str) -> dict[str, tuple[str, list[str], list[tuple]]]:
+    """scenario -> the strict aggregate (`preflight.json`, kind
+    `syncmill.toolgraph-enforcement`) the release wrote: decision, block
+    reasons, and per evaluation (syncmill agents, toolgraph identity, status,
+    whether it references an eval file). Scenarios not listed wrote none."""
+    codex_ok = (["codex"], "codex", "ok", True)
+    kimi_ok = (["kimi-code"], "kimi", "ok", True)
+    rows = {
+        "strict-allow": ("allow", [], [codex_ok]),
+        "strict-warn": ("allow", [], [codex_ok]),
+        "strict-block": ("block", ["TOOL_NOT_FOUND"], [codex_ok]),
+        "strict-timeout": ("block", ["TOOLGRAPH_UNAVAILABLE"],
+                           [(["codex"], "codex", "timeout", False)]),
+        "strict-unresolved": ("block", ["AGENT_NOT_FOUND"],
+                              [(["codex"], "kimi-code", "unresolved_identity", True)]),
+        "strict-unavailable": ("block", ["TOOLGRAPH_UNAVAILABLE"],
+                               [(["codex"], "codex", "error", False)]),
+        "strict-unavailable-warn": ("allow", [], [(["codex"], "codex", "error", False)]),
+        "strict-multi-allow": ("allow", [], [codex_ok, kimi_ok]),
+        "strict-multi-mixed": ("block", ["TOOLGRAPH_UNAVAILABLE"],
+                               [codex_ok, (["kimi-code"], "kimi", "error", False)]),
+        "strict-gen-mismatch": ("block", ["GRAPH_GENERATION_MISMATCH"], [codex_ok, kimi_ok]),
+        "strict-unmapped": ("block", ["AGENT_MAPPING_MISSING"],
+                            [(["codex"], None, "unresolved_identity", False)]),
+        "killed-after-preflight": ("allow", [], [codex_ok]),
+    }
+    if release != "v0.1.2":  # the reference to the eval file it could not write is dropped
+        rows["strict-persist-eval"] = ("block", ["EVIDENCE_PERSIST_FAILED"],
+                                       [(["codex"], "codex", "ok", False)])
+    return rows
+
+
 #: Producer replies that are not a golden's bytes (freeze.py says why).
 SYNTHETIC = {"strict-multi-allow", "strict-multi-mixed", "strict-gen-mismatch",
              "control-finding", "control-strict-finding"}
@@ -303,11 +335,21 @@ def test_the_preflight_block_and_files_are_what_the_release_wrote(release, scena
         stored = json.loads((run_dir / "control-preflight.json").read_bytes())
         assert stored["plan_digest"] == _sha(plan)
     aggregate = run_dir / "preflight.json"
-    if preflight.get("mode") == "strict" and aggregate.exists():
+    expected_aggregate = _aggregates(release).get(_base(scenario))
+    # Chosen by scenario, not by the envelope: the killed run's skeleton says
+    # `disabled` beside a real aggregate.
+    is_aggregate = aggregate.exists() and json.loads(aggregate.read_bytes()).get(
+        "kind") == "syncmill.toolgraph-enforcement"
+    assert is_aggregate is (expected_aggregate is not None)
+    if expected_aggregate is not None:
+        decision, reasons, rows = expected_aggregate
         manifest = json.loads(aggregate.read_bytes())
-        assert manifest["kind"] == "syncmill.toolgraph-enforcement"
-        assert manifest["decision"] == preflight["enforcement_decision"]
-        assert len(manifest["evaluations"]) == preflight["evaluation_count"]
+        assert (manifest["decision"], manifest["block_reasons"]) == (decision, reasons)
+        assert [(r["syncmill_agents"], r["toolgraph_agent"], r["status"], "artifact" in r)
+                for r in manifest["evaluations"]] == rows
+        if "enforcement_decision" in preflight:
+            assert preflight["enforcement_decision"] == decision
+            assert preflight["evaluation_count"] == len(rows)
         referenced = set()
         for row in manifest["evaluations"]:
             assert ("artifact" in row) is ("digest" in row), row
