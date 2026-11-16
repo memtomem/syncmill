@@ -126,4 +126,4 @@ jobs:
         run: uv run python -c "import sqlite3, sqlite_vec; db = sqlite3.connect(':memory:'); db.enable_load_extension(True); sqlite_vec.load(db); db.close()"
       # Temporary stores and copies of release-written ones, real
       # writer/watcher/locks; no provider calls.
-      - run: SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py tests/test_frozen_memory_real.py
+      - run: SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py tests/test_frozen_memory_real.py tests/test_frozen_memory_schema1_real.py

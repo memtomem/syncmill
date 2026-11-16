@@ -833,7 +833,8 @@ Opt-in real memory tests use temporary stores and copies of release-written ones
 SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q \
   tests/test_memory_backend_memtomem_integration.py \
   tests/test_memory_gc_process.py \
-  tests/test_frozen_memory_real.py
+  tests/test_frozen_memory_real.py \
+  tests/test_frozen_memory_schema1_real.py
 ```
 
 ## Contributing

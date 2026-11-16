@@ -32,7 +32,8 @@ Some changes require an opt-in real smoke before they can be reviewed:
 ```bash
 SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q \
   tests/test_memory_backend_memtomem_integration.py \
-  tests/test_frozen_memory_real.py                    # the memtomem add flow or pin
+  tests/test_frozen_memory_real.py \
+  tests/test_frozen_memory_schema1_real.py            # the memtomem add flow or pin
 SYNCMILL_TEST_MEMORY_MIGRATION_REAL=1 uv run pytest -q \
   tests/test_memory_migration_integration.py          # migration adapters
 SYNCMILL_TEST_LANGGRAPH_REAL=1 uv run pytest -q \
