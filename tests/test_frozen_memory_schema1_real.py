@@ -120,11 +120,18 @@ def _by_role(frozen: Schema1Frozen, store: StoreCopy, scenario: str, namespace: 
 
 
 def test_head_migrates_a_released_store_and_leaves_its_rows_alone(release, tmp_path):
+    """HEAD opens the copy first, WAL and all: any other connection closed on
+    it beforehand would checkpoint the WAL into the main file and remove it.
+    The schema version and the rows to compare with therefore come from a
+    second copy (and from what generation recorded)."""
     frozen = Schema1Frozen(release)
-    store = frozen.copy(tmp_path)  # moved, not rebound: the WAL is read as left
-    assert _schema(store) == "1"
-    before = _spans(store)
+    reference = frozen.copy(tmp_path / "reference")
+    assert _schema(reference) == "1"
+    before = _spans(reference)
     assert before == frozen.index["rows"]
+    store = frozen.copy(tmp_path / "opened")  # moved, not rebound, not opened
+    wal = store.db.with_name(store.db.name + "-wal")
+    assert wal.is_file() and wal.stat().st_size > 0
     with _Engine(store) as engine:
         engine.healthy()
     assert _schema(store) != "1"
@@ -217,6 +224,7 @@ def test_a_fresh_share_on_a_later_day_lands_beside_the_released_rows(release, tm
     after = store.rows()
     assert {i: v for i, v in _snapshot(store).items() if i in before} == before
     assert set(after) == set(before) | {*write.source_ids, *write.shared_ids}
+    assert set(released_files) <= {p.name for p in store.day_files()}
     for path in store.day_files():
         if path.name in released_files:
             assert path.read_bytes() == released_files[path.name]
@@ -460,7 +468,10 @@ def test_a_head_strategy_sees_released_rows_only_in_its_first_phase(
             for body in returned:
                 assert all(body in prompt for prompt in phase)
         else:
+            # Neither the recall nor anything the phase's agents are handed
+            # carries a released body.
             assert not returned, wanted
+            assert not any(body in prompt for body in released for prompt in phase), wanted
 
 
 @pytest.mark.usefixtures("pool")
