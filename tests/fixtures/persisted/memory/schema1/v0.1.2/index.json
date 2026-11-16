@@ -1,0 +1,666 @@
+{
+ "anchor": "frozenmemoryanchor",
+ "date": "2026-11-16",
+ "entries": {
+  "2026-11-16.md": [
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py",
+    "end": 255,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py"
+    ],
+    "role": "direct",
+    "step": 0,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline",
+    "end": 488,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline"
+    ],
+    "role": "direct",
+    "step": 1,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py",
+    "end": 756,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py"
+    ],
+    "role": "direct",
+    "step": 1,
+    "tags": [
+     "task-result",
+     "kimi-code"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py",
+    "end": 1015,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py"
+    ],
+    "role": "direct",
+    "step": 2,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil",
+    "end": 1246,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil"
+    ],
+    "role": "direct",
+    "step": 3,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokcouncil",
+    "end": 1484,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokcouncil"
+    ],
+    "role": "direct",
+    "step": 3,
+    "tags": [
+     "task-result",
+     "kimi-code"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokcouncil",
+    "end": 1715,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokcouncil"
+    ],
+    "role": "direct",
+    "step": 3,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 2: frozenmemoryanchor tokcouncil",
+    "end": 1953,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 2: frozenmemoryanchor tokcouncil"
+    ],
+    "role": "direct",
+    "step": 3,
+    "tags": [
+     "task-result",
+     "kimi-code"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokcouncil",
+    "end": 2184,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 2: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokcouncil"
+    ],
+    "role": "direct",
+    "step": 3,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil",
+    "end": 2422,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 2: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]",
+     "**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil"
+    ],
+    "role": "direct",
+    "step": 3,
+    "tags": [
+     "task-result",
+     "kimi-code"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 4: frozenmemoryanchor tokcouncil\n\n**Files changed:** calc.py",
+    "end": 2681,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 4: frozenmemoryanchor tokcouncil\n\n**Files changed:** calc.py"
+    ],
+    "role": "direct",
+    "step": 3,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokdecompose",
+    "end": 2916,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 4: frozenmemoryanchor tokcouncil\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokdecompose"
+    ],
+    "role": "direct",
+    "step": 4,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokdecompose",
+    "end": 3158,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 4: frozenmemoryanchor tokcouncil\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokdecompose"
+    ],
+    "role": "direct",
+    "step": 4,
+    "tags": [
+     "task-result",
+     "kimi-code"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokdecompose\n\n**Files changed:** calc.py",
+    "end": 3421,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 4: frozenmemoryanchor tokcouncil\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:47+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokdecompose\n\n**Files changed:** calc.py"
+    ],
+    "role": "direct",
+    "step": 4,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokunicode say something long\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\r\nsecond line after CRLF\r\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라",
+    "end": 6253,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 4: frozenmemoryanchor tokcouncil\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"kimi-code\"]",
+     "**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:47+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokdecompose\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:48+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokunicode say something long\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\nsecond line after CRLF\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라"
+    ],
+    "role": "direct",
+    "step": 5,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokheadings review calc.py\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokheadings summary line\n\n### Findings\n\nfrozenmemoryanchor tokheadings findings. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument.\n\n### Next steps\n\nfrozenmemoryanchor tokheadings steps. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero.",
+    "end": 7345,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:47+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokdecompose\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:48+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokunicode say something long\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\nsecond line after CRLF\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라\n\n> created: 2026-11-16T00:19:50+00:00\n> tags: [\"task-result\", \"codex\"]",
+     "**Prompt:** frozenmemoryanchor tokheadings review calc.py\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokheadings summary line\n\n### Findings\n\nfrozenmemoryanchor tokheadings findings. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument.\n\n### Next steps\n\nfrozenmemoryanchor tokheadings steps. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero."
+    ],
+    "role": "direct",
+    "step": 6,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** frozenmemoryanchor toklong fix add in calc.py.\n\nrequirement-000 keeps the sum of two integers exact\n\nrequirement-001 keeps the sum of two integers exact\n\nrequirement-002 keeps the sum of two integers exact\n\nrequirement-003 keeps the sum of two integers exact\n\nrequirement-004 keeps the sum of two integers exact\n\nrequirement-005 keeps the sum of two integers exact\n\nrequirement-006 keeps the sum of two integers exact\n\nrequirement-007 keeps the sum of two integers exact\n\nrequirement-008 keeps the sum of two integers exact\n\nrequirement-009 keeps the sum of two integers exact\n\nrequirement-010 keeps the sum of two integers exact\n\nrequirement-011 keeps the sum of two integers exact\n\nrequirement-012 keeps the sum of two integers exact\n\nrequirement-013 keeps the sum of two integers exact\n\nrequirement-014 keeps the sum of two integers exact\n\nrequirement-015 keeps the sum of two integers exact\n\nrequirement-016 keeps the sum of two integers exact\n\nrequirement-017 keeps the sum of two integers exact\n\nrequirement-018 keeps the sum of two integers exact\n\nrequirement-019 keeps the sum of two integers exact\n\nrequirement-020 keeps the sum of two integers exact\n\nrequirement-021 keeps the sum of two integers exact\n\nrequirement-022 keeps the sum of two integers exact\n\nrequirement-023 keeps the sum of two integers exact\n\nrequirement-024 keeps the sum of two integers exact\n\nrequirement-025 keeps the sum of two integers exact\n\nrequirement-026 keeps the sum of two integers exact\n\nrequirement-027 keeps the sum of two integers exact\n\nrequirement-028 keeps the sum of two integers exact\n\nrequirement-029 keeps the sum of two integers exact\n\nrequirement-030 keeps the sum of two integers exact\n\nrequirement-031 keeps the sum of two integers exact\n\nrequirement-032 keeps the sum of two integers exact\n\nrequirement-033 keeps the sum of two integers exact\n\nrequirement-034 keeps the sum of two integers exact\n\nrequirement-035 keeps the sum of two integers exact\n\nrequirement-036 keeps the sum of two integers exact\n\nrequirement-037 keeps the sum of two integers exact\n\nrequirement-038 keeps the sum of two integers exact\n\nrequirement-039 keeps the sum of two integers exact\n\nrequirement-040 keeps the sum of two integers exact\n\nrequirement-041 keeps the sum of two integers exact\n\nrequirement-042 keeps the sum of two integers exact\n\nrequirement-043 keeps the sum of two integers exact\n\nrequirement-044 keeps the sum of two integers exact\n\nrequirement-045 keeps the sum of two integers exact\n\nrequirement-046 keeps the sum of two integers exact\n\nrequirement-047 keeps the sum of two integers exact\n\nrequirement-048 keeps the sum of two integers exact\n\nrequirement-049 keeps the sum of two integers exact\n\nrequirement-050 keeps the sum of two integers exact\n\nrequirement-051 keeps the sum of two integers exact\n\nrequirement-052 keeps the sum of two integers exact\n\nrequirement-053 keeps the sum of two integers exact\n\nrequirement-054 keeps the sum of two integers exact\n\nrequirement-055 keeps the sum of two integers exact\n\nrequirement-056 keeps the sum of two integers exact\n\nrequirement-057 keeps the sum of two integers exact\n\nrequirement-058 keeps the sum of two integers exact\n\nrequirement-059 keeps the sum of two integers exact\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor toklong",
+    "end": 10751,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** frozenmemoryanchor tokheadings review calc.py\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokheadings summary line\n\n### Findings\n\nfrozenmemoryanchor tokheadings findings. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument.\n\n### Next steps\n\nfrozenmemoryanchor tokheadings steps. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero.\n\n> created: 2026-11-16T00:19:51+00:00\n> tags: [\"task-result\", \"codex\"]",
+     "**Prompt:** frozenmemoryanchor toklong fix add in calc.py.\n\nrequirement-000 keeps the sum of two integers exact\n\nrequirement-001 keeps the sum of two integers exact\n\nrequirement-002 keeps the sum of two integers exact\n\nrequirement-003 keeps the sum of two integers exact\n\nrequirement-004 keeps the sum of two integers exact\n\nrequirement-005 keeps the sum of two integers exact\n\nrequirement-006 keeps the sum of two integers exact\n\nrequirement-007 keeps the sum of two integers exact\n\nrequirement-008 keeps the sum of two integers exact\n\nrequirement-009 keeps the sum of two integers exact\n\nrequirement-010 keeps the sum of two integers exact\n\nrequirement-011 keeps the sum of two integers exact\n\nrequirement-012 keeps the sum of two integers exact\n\nrequirement-013 keeps the sum of two integers exact\n\nrequirement-014 keeps the sum of two integers exact\n\nrequirement-015 keeps the sum of two integers exact\n\nrequirement-016 keeps the sum of two integers exact\n\nrequirement-017 keeps the sum of two integers exact\n\nrequirement-018 keeps the sum of two integers exact\n\nrequirement-019 keeps the sum of two integers exact\n\nrequirement-020 keeps the sum of two integers exact\n\nrequirement-021 keeps the sum of two integers exact\n\nrequirement-022 keeps the sum of two integers exact\n\nrequirement-023 keeps the sum of two integers exact\n\nrequirement-024 keeps the sum of two integers exact\n\nrequirement-025 keeps the sum of two integers exact\n\nrequirement-026 keeps the sum of two integers exact\n\nrequirement-027 keeps the sum of two integers exact\n\nrequirement-028 keeps the sum of two integers exact\n\nrequirement-029 keeps the sum of two integers exact\n\nrequirement-030 keeps the sum of two integers exact\n\nrequirement-031 keeps the sum of two integers exact\n\nrequirement-032 keeps the sum of two integers exact\n\nrequirement-033 keeps the sum of two integers exact\n\nrequirement-034 keeps the sum of two integers exact\n\nrequirement-035 keeps the sum of two integers exact\n\nrequirement-036 keeps the sum of two integers exact",
+     "requirement-037 keeps the sum of two integers exact\n\nrequirement-038 keeps the sum of two integers exact\n\nrequirement-039 keeps the sum of two integers exact\n\nrequirement-040 keeps the sum of two integers exact\n\nrequirement-041 keeps the sum of two integers exact\n\nrequirement-042 keeps the sum of two integers exact\n\nrequirement-043 keeps the sum of two integers exact\n\nrequirement-044 keeps the sum of two integers exact\n\nrequirement-045 keeps the sum of two integers exact\n\nrequirement-046 keeps the sum of two integers exact\n\nrequirement-047 keeps the sum of two integers exact\n\nrequirement-048 keeps the sum of two integers exact\n\nrequirement-049 keeps the sum of two integers exact\n\nrequirement-050 keeps the sum of two integers exact\n\nrequirement-051 keeps the sum of two integers exact\n\nrequirement-052 keeps the sum of two integers exact\n\nrequirement-053 keeps the sum of two integers exact\n\nrequirement-054 keeps the sum of two integers exact\n\nrequirement-055 keeps the sum of two integers exact\n\nrequirement-056 keeps the sum of two integers exact\n\nrequirement-057 keeps the sum of two integers exact\n\nrequirement-058 keeps the sum of two integers exact\n\nrequirement-059 keeps the sum of two integers exact\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor toklong"
+    ],
+    "role": "direct",
+    "step": 7,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokboard fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard\n\n**Files changed:** calc.py",
+    "end": 11619,
+    "indexed": true,
+    "namespace": "board-run:ffba69ec-fd7e-4479-aaf7-74cc17bda974",
+    "produced": [
+     "requirement-037 keeps the sum of two integers exact\n\nrequirement-038 keeps the sum of two integers exact\n\nrequirement-039 keeps the sum of two integers exact\n\nrequirement-040 keeps the sum of two integers exact\n\nrequirement-041 keeps the sum of two integers exact\n\nrequirement-042 keeps the sum of two integers exact\n\nrequirement-043 keeps the sum of two integers exact\n\nrequirement-044 keeps the sum of two integers exact\n\nrequirement-045 keeps the sum of two integers exact\n\nrequirement-046 keeps the sum of two integers exact\n\nrequirement-047 keeps the sum of two integers exact\n\nrequirement-048 keeps the sum of two integers exact\n\nrequirement-049 keeps the sum of two integers exact\n\nrequirement-050 keeps the sum of two integers exact\n\nrequirement-051 keeps the sum of two integers exact\n\nrequirement-052 keeps the sum of two integers exact\n\nrequirement-053 keeps the sum of two integers exact\n\nrequirement-054 keeps the sum of two integers exact\n\nrequirement-055 keeps the sum of two integers exact\n\nrequirement-056 keeps the sum of two integers exact\n\nrequirement-057 keeps the sum of two integers exact\n\nrequirement-058 keeps the sum of two integers exact\n\nrequirement-059 keeps the sum of two integers exact\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor toklong\n\n> created: 2026-11-16T00:19:55+00:00\n> tags: [\"task-result\", \"codex\"]",
+     "**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokboard fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard\n\n**Files changed:** calc.py"
+    ],
+    "role": "scratch",
+    "step": 10,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Board Item Result\n\n**Item:** 97198b8d-caa9-46eb-9655-01b5b1acbbed\n\n**Task:** frozenmemoryanchor tokboard fix add in calc.py\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard",
+    "end": 11909,
+    "indexed": true,
+    "namespace": "shared",
+    "produced": [
+     "**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokboard fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:55+00:00\n> tags: [\"board-result:97198b8d-caa9-46eb-9655-01b5b1acbbed\"]",
+     "**Item:** 97198b8d-caa9-46eb-9655-01b5b1acbbed\n\n**Task:** frozenmemoryanchor tokboard fix add in calc.py\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard"
+    ],
+    "role": "board-result",
+    "step": 10,
+    "tags": [
+     "board-result:97198b8d-caa9-46eb-9655-01b5b1acbbed"
+    ],
+    "title": null
+   },
+   {
+    "body": "## Task Result\n\n**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokkilled fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokkilled",
+    "end": 12751,
+    "indexed": true,
+    "namespace": "board-run:6b034a21-3ec7-4354-a9d3-afc906cafa11",
+    "produced": [
+     "requirement-037 keeps the sum of two integers exact\n\nrequirement-038 keeps the sum of two integers exact\n\nrequirement-039 keeps the sum of two integers exact\n\nrequirement-040 keeps the sum of two integers exact\n\nrequirement-041 keeps the sum of two integers exact\n\nrequirement-042 keeps the sum of two integers exact\n\nrequirement-043 keeps the sum of two integers exact\n\nrequirement-044 keeps the sum of two integers exact\n\nrequirement-045 keeps the sum of two integers exact\n\nrequirement-046 keeps the sum of two integers exact\n\nrequirement-047 keeps the sum of two integers exact\n\nrequirement-048 keeps the sum of two integers exact\n\nrequirement-049 keeps the sum of two integers exact\n\nrequirement-050 keeps the sum of two integers exact\n\nrequirement-051 keeps the sum of two integers exact\n\nrequirement-052 keeps the sum of two integers exact\n\nrequirement-053 keeps the sum of two integers exact\n\nrequirement-054 keeps the sum of two integers exact\n\nrequirement-055 keeps the sum of two integers exact\n\nrequirement-056 keeps the sum of two integers exact\n\nrequirement-057 keeps the sum of two integers exact\n\nrequirement-058 keeps the sum of two integers exact\n\nrequirement-059 keeps the sum of two integers exact\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor toklong\n\n> created: 2026-11-16T00:19:55+00:00\n> tags: [\"task-result\", \"codex\"]",
+     "**Item:** 97198b8d-caa9-46eb-9655-01b5b1acbbed\n\n**Task:** frozenmemoryanchor tokboard fix add in calc.py\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard\n\n> created: 2026-11-16T00:19:59+00:00\n> tags: [\"task-result\", \"codex\"]",
+     "**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokkilled fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokkilled"
+    ],
+    "role": "scratch",
+    "step": 16,
+    "tags": [
+     "task-result",
+     "codex"
+    ],
+    "title": null
+   }
+  ]
+ },
+ "files": {
+  "release-read.json": "48dcde565e4bc2dc49e7da62a11679b1fc491c6354a6a4ab48cf8b977be8e720",
+  "store/board.db": "6328bf7c0a52f1bd432cbdcc0047a1d8a08073dbff4ea0133a8e8694eb4feb26",
+  "store/board.db-shm": "274846067e1e3001713a9ad7aac54f52f7fd7e2a1fd612655cce707d9a9670b2",
+  "store/board.db-wal": "848a991f8890fa2c326c8b4c4041dd6ee269b67b47c87bf95f67c31b19cdadbc",
+  "store/mem/.2026-11-16.md.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "store/mem/2026-11-16.md": "c18aa4f1471c066527841937e6f9a70da67081149b198f8bc145b9927c795b5d",
+  "store/mm.db": "f76e761617680819c8ff5cdf01a8bc64336f41b77a36d153a32b543b8069708a",
+  "store/mm.db-shm": "a2a096d75d4c7b7865a6a1c92cfd1d54c761e27471023ccd3a2222247e1fc046",
+  "store/mm.db-wal": "f9c40826e0a1f7d31bf5e770ed9b5eead16631f232858a72a26e521f637f07ea"
+ },
+ "findings": {
+  "dangling_shared_from": [],
+  "mislabeled_rows": [
+   {
+    "entry_namespaces": [
+     "board-run:ffba69ec-fd7e-4479-aaf7-74cc17bda974",
+     "shared"
+    ],
+    "id": "63faaec4-8987-47bb-b129-ddbd3d15c4f6",
+    "namespace": "shared"
+   },
+   {
+    "entry_namespaces": [
+     "board-run:ffba69ec-fd7e-4479-aaf7-74cc17bda974",
+     "shared"
+    ],
+    "id": "b05704ef-3220-44b1-8d17-ea4827c5a180",
+    "namespace": "board-run:6b034a21-3ec7-4354-a9d3-afc906cafa11"
+   },
+   {
+    "entry_namespaces": [
+     "board-run:6b034a21-3ec7-4354-a9d3-afc906cafa11",
+     "shared"
+    ],
+    "id": "ece9cd65-ba0b-4eb7-97ec-1f616c081bbb",
+    "namespace": "board-run:6b034a21-3ec7-4354-a9d3-afc906cafa11"
+   }
+  ],
+  "unindexed_entries": [],
+  "unverified_shared_from": []
+ },
+ "generating_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp2adumawz",
+ "layout": "mixed",
+ "memtomem": "0.3.10",
+ "release": "0.1.2",
+ "rows": [
+  {
+   "content": "**Prompt:** frozenmemoryanchor tokroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokpipeline\n\n> created: 2026-11-16T00:19:42+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokpipeline fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokpipeline\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:43+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcompete fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcompete\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 2: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"kimi-code\"]",
+   "end_line": 118,
+   "id": "0b566649-1206-4c22-8a55-0e622f707fca",
+   "namespace": "shared",
+   "source": "2026-11-16.md",
+   "start_line": 5,
+   "tags": []
+  },
+  {
+   "content": "**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 3: frozenmemoryanchor tokcouncil\n\n> created: 2026-11-16T00:19:45+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokcouncil fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 4: frozenmemoryanchor tokcouncil\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 2: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:46+00:00\n> tags: [\"task-result\", \"kimi-code\"]",
+   "end_line": 156,
+   "id": "da79aebe-32a0-42e5-b07c-9ba2019dfb00",
+   "namespace": "shared",
+   "source": "2026-11-16.md",
+   "start_line": 119,
+   "tags": []
+  },
+  {
+   "content": "**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** kimi-code\n\n**Output:**\nkimi (fake) call 1: frozenmemoryanchor tokdecompose\n\n> created: 2026-11-16T00:19:47+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokdecompose fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 3: frozenmemoryanchor tokdecompose\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:48+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** frozenmemoryanchor tokunicode say something long\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\nsecond line after CRLF\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라\n\n> created: 2026-11-16T00:19:50+00:00\n> tags: [\"task-result\", \"codex\"]",
+   "end_line": 196,
+   "id": "d62152ec-52a5-4e94-a922-54ad72900b7f",
+   "namespace": "shared",
+   "source": "2026-11-16.md",
+   "start_line": 157,
+   "tags": []
+  },
+  {
+   "content": "**Prompt:** frozenmemoryanchor tokheadings review calc.py\n\n**Agent:** codex\n\n**Output:**\nfrozenmemoryanchor tokheadings summary line\n\n### Findings\n\nfrozenmemoryanchor tokheadings findings. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument.\n\n### Next steps\n\nfrozenmemoryanchor tokheadings steps. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero.\n\n> created: 2026-11-16T00:19:51+00:00\n> tags: [\"task-result\", \"codex\"]",
+   "end_line": 216,
+   "id": "1f69e264-9588-424d-aae8-68ad4a857d0e",
+   "namespace": "shared",
+   "source": "2026-11-16.md",
+   "start_line": 197,
+   "tags": []
+  },
+  {
+   "content": "**Prompt:** frozenmemoryanchor toklong fix add in calc.py.\n\nrequirement-000 keeps the sum of two integers exact\n\nrequirement-001 keeps the sum of two integers exact\n\nrequirement-002 keeps the sum of two integers exact\n\nrequirement-003 keeps the sum of two integers exact\n\nrequirement-004 keeps the sum of two integers exact\n\nrequirement-005 keeps the sum of two integers exact\n\nrequirement-006 keeps the sum of two integers exact\n\nrequirement-007 keeps the sum of two integers exact\n\nrequirement-008 keeps the sum of two integers exact\n\nrequirement-009 keeps the sum of two integers exact\n\nrequirement-010 keeps the sum of two integers exact\n\nrequirement-011 keeps the sum of two integers exact\n\nrequirement-012 keeps the sum of two integers exact\n\nrequirement-013 keeps the sum of two integers exact\n\nrequirement-014 keeps the sum of two integers exact\n\nrequirement-015 keeps the sum of two integers exact\n\nrequirement-016 keeps the sum of two integers exact\n\nrequirement-017 keeps the sum of two integers exact\n\nrequirement-018 keeps the sum of two integers exact\n\nrequirement-019 keeps the sum of two integers exact\n\nrequirement-020 keeps the sum of two integers exact\n\nrequirement-021 keeps the sum of two integers exact\n\nrequirement-022 keeps the sum of two integers exact\n\nrequirement-023 keeps the sum of two integers exact\n\nrequirement-024 keeps the sum of two integers exact\n\nrequirement-025 keeps the sum of two integers exact\n\nrequirement-026 keeps the sum of two integers exact\n\nrequirement-027 keeps the sum of two integers exact\n\nrequirement-028 keeps the sum of two integers exact\n\nrequirement-029 keeps the sum of two integers exact\n\nrequirement-030 keeps the sum of two integers exact\n\nrequirement-031 keeps the sum of two integers exact\n\nrequirement-032 keeps the sum of two integers exact\n\nrequirement-033 keeps the sum of two integers exact\n\nrequirement-034 keeps the sum of two integers exact\n\nrequirement-035 keeps the sum of two integers exact\n\nrequirement-036 keeps the sum of two integers exact",
+   "end_line": 293,
+   "id": "fede8027-f5e6-4c38-93f6-5500d8ff9b68",
+   "namespace": "shared",
+   "source": "2026-11-16.md",
+   "start_line": 217,
+   "tags": []
+  },
+  {
+   "content": "**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokboard fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard\n\n**Files changed:** calc.py\n\n> created: 2026-11-16T00:19:55+00:00\n> tags: [\"board-result:97198b8d-caa9-46eb-9655-01b5b1acbbed\"]",
+   "end_line": 371,
+   "id": "63faaec4-8987-47bb-b129-ddbd3d15c4f6",
+   "namespace": "shared",
+   "source": "2026-11-16.md",
+   "start_line": 349,
+   "tags": []
+  },
+  {
+   "content": "requirement-037 keeps the sum of two integers exact\n\nrequirement-038 keeps the sum of two integers exact\n\nrequirement-039 keeps the sum of two integers exact\n\nrequirement-040 keeps the sum of two integers exact\n\nrequirement-041 keeps the sum of two integers exact\n\nrequirement-042 keeps the sum of two integers exact\n\nrequirement-043 keeps the sum of two integers exact\n\nrequirement-044 keeps the sum of two integers exact\n\nrequirement-045 keeps the sum of two integers exact\n\nrequirement-046 keeps the sum of two integers exact\n\nrequirement-047 keeps the sum of two integers exact\n\nrequirement-048 keeps the sum of two integers exact\n\nrequirement-049 keeps the sum of two integers exact\n\nrequirement-050 keeps the sum of two integers exact\n\nrequirement-051 keeps the sum of two integers exact\n\nrequirement-052 keeps the sum of two integers exact\n\nrequirement-053 keeps the sum of two integers exact\n\nrequirement-054 keeps the sum of two integers exact\n\nrequirement-055 keeps the sum of two integers exact\n\nrequirement-056 keeps the sum of two integers exact\n\nrequirement-057 keeps the sum of two integers exact\n\nrequirement-058 keeps the sum of two integers exact\n\nrequirement-059 keeps the sum of two integers exact\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor toklong\n\n> created: 2026-11-16T00:19:55+00:00\n> tags: [\"task-result\", \"codex\"]",
+   "end_line": 348,
+   "id": "b05704ef-3220-44b1-8d17-ea4827c5a180",
+   "namespace": "board-run:6b034a21-3ec7-4354-a9d3-afc906cafa11",
+   "source": "2026-11-16.md",
+   "start_line": 295,
+   "tags": []
+  },
+  {
+   "content": "**Item:** 97198b8d-caa9-46eb-9655-01b5b1acbbed\n\n**Task:** frozenmemoryanchor tokboard fix add in calc.py\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokboard\n\n> created: 2026-11-16T00:19:59+00:00\n> tags: [\"task-result\", \"codex\"]",
+   "end_line": 383,
+   "id": "ece9cd65-ba0b-4eb7-97ec-1f616c081bbb",
+   "namespace": "board-run:6b034a21-3ec7-4354-a9d3-afc906cafa11",
+   "source": "2026-11-16.md",
+   "start_line": 372,
+   "tags": []
+  },
+  {
+   "content": "**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokkilled fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokkilled",
+   "end_line": 400,
+   "id": "734e4980-7e07-46f5-a311-5d80405a83a6",
+   "namespace": "board-run:6b034a21-3ec7-4354-a9d3-afc906cafa11",
+   "source": "2026-11-16.md",
+   "start_line": 384,
+   "tags": []
+  }
+ ],
+ "scenarios": {
+  "board-done": {
+   "item_id": "97198b8d-caa9-46eb-9655-01b5b1acbbed",
+   "run_id": "ffba69ec-fd7e-4479-aaf7-74cc17bda974",
+   "task": "frozenmemoryanchor tokboard fix add in calc.py",
+   "token": "tokboard"
+  },
+  "board-killed": {
+   "claimed_at": 1794788399.343908,
+   "item_id": "d8f5174c-38fd-45c9-b0a2-447577647a75",
+   "rows_before": [
+    "0b566649-1206-4c22-8a55-0e622f707fca",
+    "1f69e264-9588-424d-aae8-68ad4a857d0e",
+    "63faaec4-8987-47bb-b129-ddbd3d15c4f6",
+    "7b00534e-190a-4185-8c5f-c0a52b3d82dd",
+    "cc3da98d-ba7e-4120-870a-1d73d32a58b7",
+    "d62152ec-52a5-4e94-a922-54ad72900b7f",
+    "da79aebe-32a0-42e5-b07c-9ba2019dfb00",
+    "fede8027-f5e6-4c38-93f6-5500d8ff9b68"
+   ],
+   "run_id": "6b034a21-3ec7-4354-a9d3-afc906cafa11",
+   "task": "frozenmemoryanchor tokkilled fix add in calc.py",
+   "token": "tokkilled"
+  },
+  "compete": {
+   "prompt": "frozenmemoryanchor tokcompete fix add in calc.py",
+   "token": "tokcompete"
+  },
+  "council": {
+   "prompt": "frozenmemoryanchor tokcouncil fix add in calc.py",
+   "token": "tokcouncil"
+  },
+  "decompose": {
+   "prompt": "frozenmemoryanchor tokdecompose fix add in calc.py",
+   "subtasks": [
+    "alpha part of the work frozenmemoryanchor tokdecompose",
+    "beta part of the work frozenmemoryanchor tokdecompose"
+   ],
+   "token": "tokdecompose"
+  },
+  "failed": {
+   "prompt": "frozenmemoryanchor tokfailed fix add in calc.py",
+   "token": "tokfailed"
+  },
+  "headings": {
+   "prompt": "frozenmemoryanchor tokheadings review calc.py",
+   "reply": "frozenmemoryanchor tokheadings summary line\n\n### Findings\n\nfrozenmemoryanchor tokheadings findings. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument. The add function subtracted its second argument.\n\n### Next steps\n\nfrozenmemoryanchor tokheadings steps. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero. Add a test for negative numbers and for zero.",
+   "token": "tokheadings"
+  },
+  "longprompt": {
+   "prompt": "frozenmemoryanchor toklong fix add in calc.py.\n\nrequirement-000 keeps the sum of two integers exact\n\nrequirement-001 keeps the sum of two integers exact\n\nrequirement-002 keeps the sum of two integers exact\n\nrequirement-003 keeps the sum of two integers exact\n\nrequirement-004 keeps the sum of two integers exact\n\nrequirement-005 keeps the sum of two integers exact\n\nrequirement-006 keeps the sum of two integers exact\n\nrequirement-007 keeps the sum of two integers exact\n\nrequirement-008 keeps the sum of two integers exact\n\nrequirement-009 keeps the sum of two integers exact\n\nrequirement-010 keeps the sum of two integers exact\n\nrequirement-011 keeps the sum of two integers exact\n\nrequirement-012 keeps the sum of two integers exact\n\nrequirement-013 keeps the sum of two integers exact\n\nrequirement-014 keeps the sum of two integers exact\n\nrequirement-015 keeps the sum of two integers exact\n\nrequirement-016 keeps the sum of two integers exact\n\nrequirement-017 keeps the sum of two integers exact\n\nrequirement-018 keeps the sum of two integers exact\n\nrequirement-019 keeps the sum of two integers exact\n\nrequirement-020 keeps the sum of two integers exact\n\nrequirement-021 keeps the sum of two integers exact\n\nrequirement-022 keeps the sum of two integers exact\n\nrequirement-023 keeps the sum of two integers exact\n\nrequirement-024 keeps the sum of two integers exact\n\nrequirement-025 keeps the sum of two integers exact\n\nrequirement-026 keeps the sum of two integers exact\n\nrequirement-027 keeps the sum of two integers exact\n\nrequirement-028 keeps the sum of two integers exact\n\nrequirement-029 keeps the sum of two integers exact\n\nrequirement-030 keeps the sum of two integers exact\n\nrequirement-031 keeps the sum of two integers exact\n\nrequirement-032 keeps the sum of two integers exact\n\nrequirement-033 keeps the sum of two integers exact\n\nrequirement-034 keeps the sum of two integers exact\n\nrequirement-035 keeps the sum of two integers exact\n\nrequirement-036 keeps the sum of two integers exact\n\nrequirement-037 keeps the sum of two integers exact\n\nrequirement-038 keeps the sum of two integers exact\n\nrequirement-039 keeps the sum of two integers exact\n\nrequirement-040 keeps the sum of two integers exact\n\nrequirement-041 keeps the sum of two integers exact\n\nrequirement-042 keeps the sum of two integers exact\n\nrequirement-043 keeps the sum of two integers exact\n\nrequirement-044 keeps the sum of two integers exact\n\nrequirement-045 keeps the sum of two integers exact\n\nrequirement-046 keeps the sum of two integers exact\n\nrequirement-047 keeps the sum of two integers exact\n\nrequirement-048 keeps the sum of two integers exact\n\nrequirement-049 keeps the sum of two integers exact\n\nrequirement-050 keeps the sum of two integers exact\n\nrequirement-051 keeps the sum of two integers exact\n\nrequirement-052 keeps the sum of two integers exact\n\nrequirement-053 keeps the sum of two integers exact\n\nrequirement-054 keeps the sum of two integers exact\n\nrequirement-055 keeps the sum of two integers exact\n\nrequirement-056 keeps the sum of two integers exact\n\nrequirement-057 keeps the sum of two integers exact\n\nrequirement-058 keeps the sum of two integers exact\n\nrequirement-059 keeps the sum of two integers exact",
+   "token": "toklong"
+  },
+  "pipeline": {
+   "prompt": "frozenmemoryanchor tokpipeline fix add in calc.py",
+   "token": "tokpipeline"
+  },
+  "room-apply": {
+   "prompt": "frozenmemoryanchor tokroom fix add in calc.py",
+   "room_id": "56e0a942-e1b2-4fca-be22-725e878f6f14",
+   "token": "tokroom"
+  },
+  "route": {
+   "prompt": "frozenmemoryanchor tokroute fix add in calc.py",
+   "token": "tokroute"
+  },
+  "unicode": {
+   "prompt": "frozenmemoryanchor tokunicode say something long",
+   "reply": "  frozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\r\nsecond line after CRLF\r\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 tail-after-the-cut  ",
+   "token": "tokunicode"
+  }
+ },
+ "steps": [
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "route"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "pipeline"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "compete"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "council"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "decompose"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "unicode"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "headings"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "longprompt"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "failed"
+  },
+  {
+   "degraded": [],
+   "label": "add",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "board-done"
+  },
+  {
+   "degraded": [],
+   "label": "run",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "board-done"
+  },
+  {
+   "degraded": [],
+   "label": "create",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "room-apply"
+  },
+  {
+   "degraded": [],
+   "label": "round",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "room-apply"
+  },
+  {
+   "degraded": [],
+   "label": "select",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "room-apply"
+  },
+  {
+   "degraded": [],
+   "label": "apply",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "room-apply"
+  },
+  {
+   "degraded": [],
+   "label": "add",
+   "purged": [],
+   "purged_namespaces": [],
+   "scenario": "board-killed"
+  },
+  {
+   "degraded": [],
+   "label": "run (killed)",
+   "purged": [],
+   "purged_namespaces": [
+    "board-run:ffba69ec-fd7e-4479-aaf7-74cc17bda974"
+   ],
+   "scenario": "board-killed"
+  }
+ ],
+ "store": {
+  "board": "store/board.db",
+  "db": "store/mm.db",
+  "mem": "store/mem",
+  "root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp2adumawz/state/store"
+ }
+}
