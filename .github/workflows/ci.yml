@@ -127,3 +127,36 @@ jobs:
       # Temporary stores and copies of release-written ones, real
       # writer/watcher/locks; no provider calls.
       - run: SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py tests/test_frozen_memory_real.py tests/test_frozen_memory_schema1_real.py
+
+  # Mem0 and LangGraph stores written by released syncmill, read by HEAD's
+  # adapters with the real SDKs. The stores were embedded with exact FastEmbed
+  # model files: they are fetched once per models.json content, checked file by
+  # file, and read offline. The tests check the cache against models.json again
+  # before reading any store.
+  memory-backends-real:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --group dev --extra mem0 --extra langgraph --managed-python
+      - id: models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/fastembed
+          key: fastembed-${{ hashFiles('tests/fixtures/persisted/memory/backends/v*/models.json') }}
+      - if: steps.models.outputs.cache-hit != 'true'
+        run: uv run python tests/fixtures/persisted/memory/backends/fetch_models.py "${{ runner.temp }}/fastembed"
+      - run: uv run pytest -q tests/test_frozen_memory_backends_real.py -rxX
+        env:
+          SYNCMILL_TEST_MEMORY_BACKENDS_REAL: "1"
+          FASTEMBED_CACHE_PATH: ${{ runner.temp }}/fastembed
+          HF_HUB_OFFLINE: "1"
