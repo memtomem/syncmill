@@ -107,6 +107,42 @@ def tree_files(root: Path) -> dict[str, str]:
             for p in sorted(root.rglob("*")) if p.is_file() and not p.is_symlink()}
 
 
+def rebind_memtomem_db(db: Path, old_root: str, new_root: Path) -> int:
+    """Move a memtomem store's ``chunks.source_file`` from ``old_root`` to
+    ``new_root`` (and its FTS mirror), with the two statements memtomem itself
+    uses when a source moves. Every row must have been under ``old_root``, every
+    row ends under ``new_root``, and the mirror agrees with ``chunks``; returns
+    how many rows moved."""
+    from memtomem.storage.sqlite_helpers import norm_path
+
+    old = old_root.rstrip("/") + "/"
+    new = norm_path(new_root).rstrip("/") + "/"
+    conn = sqlite3.connect(db)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        moved = conn.execute(
+            "UPDATE chunks SET source_file = ? || substr(source_file, ?) "
+            "WHERE substr(source_file, 1, ?) = ?",
+            (new, len(old) + 1, len(old), old),
+        ).rowcount
+        conn.execute(
+            "UPDATE chunks_fts SET source_file = "
+            "(SELECT source_file FROM chunks WHERE chunks.rowid = chunks_fts.rowid)")
+        conn.commit()
+        outside = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE substr(source_file, 1, ?) != ?",
+            (len(new), new)).fetchone()[0]
+        mirror = conn.execute(
+            "SELECT COUNT(*) FROM chunks_fts JOIN chunks ON chunks.rowid = chunks_fts.rowid "
+            "WHERE chunks_fts.source_file != chunks.source_file").fetchone()[0]
+        mirrored = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+    finally:
+        conn.close()
+    assert total > 0 and moved == total, (db, moved, total)
+    assert outside == 0 and mirror == 0 and mirrored == total, (db, outside, mirror, mirrored)
+    return moved
+
+
 class MigrationFrozen:
     def __init__(self, release: str):
         self.release = release
@@ -207,31 +243,9 @@ class MigrationCopy:
         return env
 
     def rebind_memtomem(self, store: Path) -> int:
-        """Swap the generating box for the copy in a memtomem store's
-        ``chunks.source_file`` (and its FTS mirror), the two statements memtomem
-        itself uses when a source moves; return how many rows moved."""
-        from memtomem.storage.sqlite_helpers import norm_path
-
-        old = self.frozen.generating_root.rstrip("/") + "/"
-        new = norm_path(self.root).rstrip("/") + "/"
-        conn = sqlite3.connect(store / "mm.db")
-        try:
-            moved = conn.execute(
-                "UPDATE chunks SET source_file = ? || substr(source_file, ?) "
-                "WHERE substr(source_file, 1, ?) = ?",
-                (new, len(old) + 1, len(old), old),
-            ).rowcount
-            conn.execute(
-                "UPDATE chunks_fts SET source_file = "
-                "(SELECT source_file FROM chunks WHERE chunks.rowid = chunks_fts.rowid)")
-            conn.commit()
-            left = conn.execute(
-                "SELECT COUNT(*) FROM chunks WHERE substr(source_file, 1, ?) = ?",
-                (len(old), old)).fetchone()[0]
-        finally:
-            conn.close()
-        assert left == 0
-        return moved
+        """Swap the generating box for the copy in a memtomem store (see
+        ``rebind_memtomem_db``); every row the release wrote lives under it."""
+        return rebind_memtomem_db(store / "mm.db", self.frozen.generating_root, self.root)
 
     def rebind_artifact(self, label: str) -> None:
         """Bind a copied artifact to the copy's destination: the released

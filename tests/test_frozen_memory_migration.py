@@ -161,60 +161,62 @@ def _dest_row(frozen, label, record, target_id):
     return rows.get(target_id)
 
 
+def _check_target(release, frozen, entry, record, target_id, row, *, changed=False):
+    """A destination row the release wrote for ``record``, recorded or not:
+    the record's namespace, tags and content (``changed``: plus the in-place
+    suffix), the deterministic id where the backend takes one, the timestamp as
+    that destination stores it, and the migration metadata or the materialized
+    source file."""
+    target, lineage = entry["target"], record["lineage_key"]
+    want = record["content"] + (FREEZE.CHANGED_SUFFIX if changed else "")
+    assert (row["namespace"], row["tags"], row["content"]) == (
+        record["namespace"], record["tags"], want), (entry["migration_id"], lineage)
+    if target in ("memtomem", "langgraph"):
+        assert target_id == _target_id(lineage)
+    if target == "memtomem":
+        assert row["created_at"] == memtomem_created_at(
+            record["created_at"], release_memtomem(release))
+        source_file = Path(row["raw"]["source_file"])
+        if release == "v0.1.2":
+            # A relative path, resolved by memtomem against the apply cwd and
+            # never written (v0.1.3 began writing the file).
+            assert source_file == Path(frozen.bindings["cwd"]) / ".syncmill-migration" / (
+                entry["migration_id"]) / f"{lineage}.md"
+            assert not (frozen.root / "mig" / entry["migration_id"] / "sources").exists()
+            return
+        relative = source_file.relative_to(frozen.original("mig"))
+        assert relative == Path(entry["migration_id"]) / "sources" / (
+            hashlib.sha256(lineage.encode()).hexdigest()[:32] + ".md")
+        # Bytes, not read_text: that would turn the CRLF pair into LF. The
+        # file keeps what was migrated, also after an in-place rewrite.
+        assert (frozen.root / "mig" / relative).read_bytes() == record["content"].encode("utf-8")
+        return
+    stored = row["raw"]["payload"] if target == "mem0" else row["raw"]["value"]
+    assert (stored.get("syncmill_migration_id"), stored.get("syncmill_migration_lineage"),
+            stored.get("syncmill_migration_digest")) == (entry["migration_id"], lineage,
+                                                         record["digest"])
+    if target == "mem0":
+        assert row["created_at"] == record["created_at"]
+    else:
+        # LangGraph's put never passes the record's timestamp.
+        assert row["created_at"] != record["created_at"]
+
+
 @release_param
 def test_every_recorded_target_is_its_record_in_the_destination(release):
     frozen = MigrationFrozen(release)
     for label in frozen.labels:
         entry = frozen.entry(label)
-        target = entry["target"]
         doc = frozen.doc(label)
         by_lineage = {r["lineage_key"]: r for r in doc["snapshot"]["records"]}
         for lineage, target_id in doc["state"]["targets"].items():
-            record = by_lineage[lineage]
-            row = _dest_row(frozen, label, record, target_id)
+            row = _dest_row(frozen, label, by_lineage[lineage], target_id)
             if entry["state"] == "verification_failed" and target_id == entry["tampered"]:
                 # Deleted by the release before its verify (the state test).
                 assert row is None
                 continue
-            if entry["state"] == "rollback_partial":
-                # The one target left is the row the release changed in place.
-                assert row["content"] == record["content"] + FREEZE.CHANGED_SUFFIX
-            else:
-                assert row["content"] == record["content"], (label, lineage)
-            assert (row["namespace"], row["tags"]) == (record["namespace"], record["tags"])
-            if target in ("memtomem", "langgraph"):
-                assert target_id == _target_id(lineage), label
-            if target == "memtomem":
-                assert row["created_at"] == memtomem_created_at(
-                    record["created_at"], release_memtomem(release)), label
-                source_file = Path(row["raw"]["source_file"])
-                if release == "v0.1.2":
-                    # A relative path, resolved by memtomem against the apply
-                    # cwd and never written (v0.1.3 began writing the file).
-                    assert source_file == Path(frozen.bindings["cwd"]) / ".syncmill-migration" / (
-                        entry["migration_id"]) / f"{lineage}.md"
-                    assert not (frozen.root / "mig" / entry["migration_id"] / "sources").exists()
-                    continue
-                relative = source_file.relative_to(frozen.original("mig"))
-                assert relative == Path(entry["migration_id"]) / "sources" / (
-                    hashlib.sha256(lineage.encode()).hexdigest()[:32] + ".md")
-                materialized = frozen.root / "mig" / relative
-                if entry["state"] != "rollback_partial":
-                    # Bytes, not read_text: that would turn the CRLF pair into LF.
-                    assert materialized.read_bytes() == record["content"].encode("utf-8")
-            elif target == "mem0":
-                payload = row["raw"]["payload"]
-                assert row["created_at"] == record["created_at"], label
-                assert (payload["syncmill_migration_id"], payload["syncmill_migration_lineage"],
-                        payload["syncmill_migration_digest"]) == (
-                    entry["migration_id"], lineage, record["digest"])
-            else:
-                value = row["raw"]["value"]
-                assert (value["syncmill_migration_id"], value["syncmill_migration_lineage"],
-                        value["syncmill_migration_digest"]) == (
-                    entry["migration_id"], lineage, record["digest"])
-                # LangGraph's put never passes the record's timestamp.
-                assert row["created_at"] != record["created_at"]
+            _check_target(release, frozen, entry, by_lineage[lineage], target_id, row,
+                          changed=entry["state"] == "rollback_partial")
 
 
 def _rows_of(frozen, label):
@@ -261,12 +263,15 @@ def test_each_state_is_what_its_release_left(release):
             assert state == {"status": "applying", "targets": {}, "errors": []}
             assert exits == [0, FREEZE.CRASH_EXIT]
             assert contents == [records[0]["content"]]
-            _unrecorded(frozen, label, lineages[0])
+            row_id = _unrecorded(frozen, label, lineages[0])
+            _check_target(release, frozen, entry, records[0], row_id, rows[row_id])
         elif name == "crashed":
             assert state["status"] == "applying" and list(state["targets"]) == [lineages[0]]
             assert exits == [0, FREEZE.CRASH_EXIT] and not state["errors"]
             assert contents == sorted([records[0]["content"], records[1]["content"]])
-            assert _unrecorded(frozen, label, lineages[1]) not in state["targets"].values()
+            row_id = _unrecorded(frozen, label, lineages[1])
+            assert row_id not in state["targets"].values()
+            _check_target(release, frozen, entry, records[1], row_id, rows[row_id])
         elif name == "partial":
             assert state["status"] == "partial" and list(state["targets"]) == [lineages[0]]
             assert [e["lineage"] for e in state["errors"]] == [lineages[1]]

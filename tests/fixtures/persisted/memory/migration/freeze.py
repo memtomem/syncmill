@@ -649,6 +649,11 @@ def _expected(state: str, records: list[dict], st: dict, doc: dict, tampered: st
     """What is wrong with a state's end, or None."""
     n = len(records)
     contents = sorted(r["content"] for r in mine.values())
+    # Namespace, tags and content of every row this state left, as a set.
+    cells = sorted((r["namespace"], json.dumps(r["tags"]), r["content"]) for r in mine.values())
+
+    def cells_of(*picked):
+        return sorted((r["namespace"], json.dumps(r["tags"]), r["content"]) for r in picked)
     want_status = {"planned": "planned", "crashed-first": "applying", "crashed": "applying",
                    "partial": "partial", "verified": "verified",
                    "verification_failed": "verification_failed", "rolled_back": "rolled_back",
@@ -661,10 +666,10 @@ def _expected(state: str, records: list[dict], st: dict, doc: dict, tampered: st
     if state == "planned":
         ok = not ledger and not mine and not st["errors"]
     elif state == "crashed-first":
-        ok = not ledger and contents == [first["content"]]
+        ok = not ledger and cells == cells_of(first)
     elif state == "crashed":
         ok = (list(ledger) == [first["lineage_key"]]
-              and contents == sorted([first["content"], second["content"]]))
+              and cells == cells_of(first, second))
     elif state == "partial":
         ok = (list(ledger) == [first["lineage_key"]] and contents == [first["content"]]
               and len(st["errors"]) == 1 and st["errors"][0]["lineage"] == second["lineage_key"]

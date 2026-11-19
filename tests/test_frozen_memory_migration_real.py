@@ -17,6 +17,7 @@ source files' bytes).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -38,6 +39,7 @@ from frozen_memory_migration_support import (
     MigrationFrozen,
     memory_settings,
     memtomem_created_at,
+    rebind_memtomem_db,
     release_memtomem,
     selected_by_default,
     tree_files,
@@ -196,17 +198,43 @@ class Box:
             row = rows[target_id]
             assert (row["namespace"], row["tags"], row["content"]) == (
                 record["namespace"], record["tags"], record["content"])
+            released = target_id in self._released_ids
             if target in ("memtomem", "langgraph"):
                 assert target_id == _target_id(record["lineage_key"])
             if target == "memtomem":
                 # The instant the writing memtomem stored: the release's 0.3.x
                 # cut the fraction, HEAD keeps it.
-                writer = (release_memtomem(self.release) if target_id in self._released_ids
-                          else "0.6")
+                writer = release_memtomem(self.release) if released else "0.6"
                 assert row["created_at"] == memtomem_created_at(
                     memtomem_created_at(record["created_at"], writer), "0.6")
-            elif target == "mem0":
-                assert row["created_at"] == record["created_at"]
+                self._assert_source_file(row, record, released)
+            else:
+                if target == "mem0":
+                    assert row["created_at"] == record["created_at"]
+                    stored = row["raw"]["payload"]
+                else:
+                    stored = row["raw"]["value"]
+                # The metadata HEAD's own reconciliation reads (Mem0 finds a
+                # crashed write by its lineage), on every row, HEAD's too.
+                assert (stored.get("syncmill_migration_id"),
+                        stored.get("syncmill_migration_lineage"),
+                        stored.get("syncmill_migration_digest")) == (
+                    self.migration_id, record["lineage_key"], record["digest"])
+
+    def _assert_source_file(self, row: dict, record: dict, released: bool) -> None:
+        """A migrated memtomem chunk's ``source_file``: the file beside the
+        artifact holding exactly the record's bytes, except v0.1.2's own rows,
+        whose path (relative to the apply cwd, rebound with the box) was never
+        written."""
+        path = Path(row["raw"]["source_file"])
+        if released and self.release == "v0.1.2":
+            assert path == self.copy.root / "repo" / ".syncmill-migration" / (
+                self.migration_id) / f"{record['lineage_key']}.md"
+            assert not path.exists()
+            return
+        digest = hashlib.sha256(record["lineage_key"].encode()).hexdigest()[:32]
+        assert path == self.copy.artifact_dir(self.label) / "sources" / f"{digest}.md"
+        assert path.read_bytes() == record["content"].encode("utf-8")
 
 
 @pytest.mark.parametrize(("release", "label"), _cases("planned"))
@@ -403,6 +431,7 @@ def test_head_migrates_a_released_memtomem_store(family, release, tmp_path):
     frozen = Frozen(release) if family == "memtomem" else Schema1Frozen(release)
     store = frozen.copy(tmp_path / "copy") if family == "schema1" else frozen.copy(
         "store", tmp_path / "copy")
+    rebind_memtomem_db(store.db, store.generating_mem, store.mem)
     read = frozen.read["store"]["get"]
     conn = sqlite3.connect(store.db)
     try:
