@@ -1,0 +1,65 @@
+{
+ "artifacts": {
+  "applied": {
+   "files": {
+    "manifest.json": "146f70df6b6e30194368c032704d094f1d1acaf9475befdb226f1e2aa011432b",
+    "receipt.json": "e0ded6595b87ac6531765db32faa1d2f639ed1167fb31eca1de580230d742a95",
+    "snapshot.json": "c95f9bb48040c5d3114ae4a69d3e58d274266b63867ae625a720cbae498a0df8",
+    "state.json": "2964acfde6a7b71c14c4330be06900d2235f4301ed9f54999948403afa25d7cd"
+   },
+   "migration_id": "20261119133409-adfdbf8e",
+   "state": "applied",
+   "steps": [
+    [
+     "memory",
+     "migration",
+     "plan",
+     "--from",
+     "langgraph",
+     "--to",
+     "mem0",
+     "--namespace",
+     "frozen-mig-applied"
+    ],
+    [
+     "memory",
+     "migration",
+     "apply",
+     "20261119133409-adfdbf8e"
+    ]
+   ]
+  },
+  "planned": {
+   "files": {
+    "manifest.json": "7577ac836b4044f664dbd3e1edda7be48e6b780067b6be6d2868465df8204c28",
+    "snapshot.json": "dbfbed6e0e3c60c56026e5b4cbc76fd62314e5739d1acf8323731447eccf7cdf",
+    "state.json": "92b2e78af934b70853097599add6d8caa89484a6ee1598c713d795609a1da94b"
+   },
+   "migration_id": "20261119133406-6dce8c94",
+   "state": "planned",
+   "steps": [
+    [
+     "memory",
+     "migration",
+     "plan",
+     "--from",
+     "langgraph",
+     "--to",
+     "mem0",
+     "--namespace",
+     "frozen-mig-planned"
+    ]
+   ]
+  }
+ },
+ "files": {
+  "mig/20261119133406-6dce8c94/manifest.json": "7577ac836b4044f664dbd3e1edda7be48e6b780067b6be6d2868465df8204c28",
+  "mig/20261119133406-6dce8c94/snapshot.json": "dbfbed6e0e3c60c56026e5b4cbc76fd62314e5739d1acf8323731447eccf7cdf",
+  "mig/20261119133406-6dce8c94/state.json": "92b2e78af934b70853097599add6d8caa89484a6ee1598c713d795609a1da94b",
+  "mig/20261119133409-adfdbf8e/manifest.json": "146f70df6b6e30194368c032704d094f1d1acaf9475befdb226f1e2aa011432b",
+  "mig/20261119133409-adfdbf8e/receipt.json": "e0ded6595b87ac6531765db32faa1d2f639ed1167fb31eca1de580230d742a95",
+  "mig/20261119133409-adfdbf8e/snapshot.json": "c95f9bb48040c5d3114ae4a69d3e58d274266b63867ae625a720cbae498a0df8",
+  "mig/20261119133409-adfdbf8e/state.json": "2964acfde6a7b71c14c4330be06900d2235f4301ed9f54999948403afa25d7cd"
+ },
+ "release": "0.1.1"
+}

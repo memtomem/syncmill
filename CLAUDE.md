@@ -79,7 +79,7 @@ uv run syncmill memory migration plan --from memtomem --to mem0   # source-retai
 SYNCMILL_TEST_MEMORY_MIGRATION_REAL=1 uv run pytest -q tests/test_memory_migration_integration.py  # required before changing migration adapters
 SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_frozen_memory_real.py tests/test_frozen_memory_schema1_real.py # required before changing MemtomemBackend's replicated add flow or the memtomem pin (the last two read release-written stores)
 SYNCMILL_TEST_LANGGRAPH_REAL=1 uv run pytest -q tests/test_memory_backend_langgraph_integration.py # required before changing LangGraph SDK pins/API calls
-SYNCMILL_TEST_MEMORY_BACKENDS_REAL=1 FASTEMBED_CACHE_PATH=<cache> uv run --extra mem0 --extra langgraph pytest -q tests/test_frozen_memory_backends_real.py # release-written Mem0/LangGraph stores; required before changing either adapter, the mem0/LangGraph/FastEmbed pins, or SyncmillMemory's read paths (fill <cache> with tests/fixtures/persisted/memory/backends/fetch_models.py)
+SYNCMILL_TEST_MEMORY_BACKENDS_REAL=1 FASTEMBED_CACHE_PATH=<cache> uv run --extra mem0 --extra langgraph pytest -q tests/test_frozen_memory_backends_real.py tests/test_frozen_memory_migration_real.py # release-written Mem0/LangGraph stores and `memory migration` artifacts; required before changing either adapter, `memory_migration.py`, the mem0/LangGraph/FastEmbed pins, or SyncmillMemory's read paths (fill <cache> with tests/fixtures/persisted/memory/backends/fetch_models.py)
 uv add <pkg>                         # add a dependency (edits pyproject.toml + uv.lock)
 uv sync --group dev                  # install dev deps (pytest)
 uv run pytest -q                     # run the hermetic test suite (tests/)

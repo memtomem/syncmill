@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "migration_id": "20261119132657-b6bf3637",
+  "source": "memtomem",
+  "target": "mem0",
+  "storage_binding_version": 1,
+  "target_storage_digest": "sha256:e95415aaedda13f961ab486be7344d2d606a50f762f68f83af46fcd08689c48c",
+  "namespaces": [
+    "frozen-mig-verification_failed"
+  ],
+  "record_count": 3,
+  "source_digest": "51c834c0a1f0a2162c61d25455d66654cee0c4f88a29a067c3804dbc943ecf0b",
+  "created_at": "2026-11-19T13:26:57.786510+00:00"
+}

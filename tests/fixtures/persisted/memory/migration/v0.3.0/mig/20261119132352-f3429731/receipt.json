@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "migration_id": "20261119132352-f3429731",
+  "status": "verification_failed",
+  "source": "mem0",
+  "target": "memtomem",
+  "record_count": 3,
+  "verified_count": 2,
+  "missing_target_count": 0,
+  "source_digest": "1323786389916970b1b44f63c1389237eee8aeb5d88ad95f6c53ee14bd9a4332",
+  "failure_lineages": [
+    "7cfc6253ded16f2e7458385f4bef7e4db27ceeadd5dd17d209145954e7edc694"
+  ],
+  "verified_at": "2026-11-19T13:23:54.827450+00:00"
+}

@@ -1,0 +1,16 @@
+{
+ "cwd": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/repo",
+ "generating_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp",
+ "migrations_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/mig",
+ "stores": {
+  "destinations/langgraph-to-mem0": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/destinations/langgraph-to-mem0/mem0",
+  "destinations/langgraph-to-memtomem": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/destinations/langgraph-to-memtomem",
+  "destinations/mem0-to-langgraph": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/destinations/mem0-to-langgraph/langgraph.db",
+  "destinations/mem0-to-memtomem": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/destinations/mem0-to-memtomem",
+  "destinations/memtomem-to-langgraph": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/destinations/memtomem-to-langgraph/langgraph.db",
+  "destinations/memtomem-to-mem0": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/destinations/memtomem-to-mem0/mem0",
+  "sources/langgraph": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/sources/langgraph/langgraph.db",
+  "sources/mem0": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/sources/mem0/mem0",
+  "sources/memtomem": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp109zvfcp/sources/memtomem"
+ }
+}

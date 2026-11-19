@@ -1,0 +1,8 @@
+{
+  "migration_id": "20261119132630-7a53ee72",
+  "status": "rollback_partial",
+  "deleted": 2,
+  "refused": [
+    "18a651e66b48562428fcd62dc92d8d54a329e4341c4c59dfd6f2af380ca59538"
+  ]
+}

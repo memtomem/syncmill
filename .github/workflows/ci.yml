@@ -155,7 +155,7 @@ jobs:
           key: fastembed-${{ hashFiles('tests/fixtures/persisted/memory/backends/v*/models.json') }}
       - if: steps.models.outputs.cache-hit != 'true'
         run: uv run python tests/fixtures/persisted/memory/backends/fetch_models.py "${{ runner.temp }}/fastembed"
-      - run: uv run pytest -q tests/test_frozen_memory_backends_real.py -rxX
+      - run: uv run pytest -q tests/test_frozen_memory_backends_real.py tests/test_frozen_memory_migration_real.py -rxX
         env:
           SYNCMILL_TEST_MEMORY_BACKENDS_REAL: "1"
           FASTEMBED_CACHE_PATH: ${{ runner.temp }}/fastembed

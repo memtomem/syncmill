@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "records": [
+    {
+      "source_id": "37cdab69-ca76-4fb0-9c8d-503ca98ade25",
+      "namespace": "frozen-mig-crashed",
+      "content": "**Item:** 0a1a6517-9451-4941-9bae-c9981703c454\n\n**Task:** frozenmemoryanchor tokmigboard fix add in calc.py\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokmigboard\n\n> created: 2026-11-19T13:20:59+00:00\n> tags: [\"migration-row\", \"tokmig-crashed-1\"]",
+      "tags": [],
+      "created_at": "2026-11-19T13:20:59+00:00",
+      "lineage_key": "e38055caef0de288c69ec1e8b3416bf8cf8b04796183a7823e7ad8406d3cafba",
+      "digest": "b132dffe2708ea0f4d332592affcc9279e263e103b2bb9bcc6787c6ef13645be"
+    },
+    {
+      "source_id": "5c9da9d1-f230-450b-90e6-1ba215dd4f48",
+      "namespace": "frozen-mig-crashed",
+      "content": "frozenmemoryanchor tokmig-crashed-1 frozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\nsecond line after CRLF\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라\n\nfrozenmemoryanchor tokmig-crashed-1 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 19 keeps this row whole.\n\n> created: 2026-11-19T13:20:59+00:00\n> tags: [\"migration-row\", \"tokmig-crashed-2\"]",
+      "tags": [],
+      "created_at": "2026-11-19T13:20:59+00:00",
+      "lineage_key": "88c2108c9d1f20da5f1f3883b425910909db9b5db2264e80c32ab24d49c80397",
+      "digest": "6f8ad072440384fc957add560eb33419bab360324af1297f78ad1b242bbad06a"
+    },
+    {
+      "source_id": "f15a42e9-64ef-4903-b5ae-bf500181399a",
+      "namespace": "frozen-mig-crashed",
+      "content": "frozenmemoryanchor tokmig-crashed-2\n\n- a list item\n- another\n\nfrozenmemoryanchor tokmig-crashed-2 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 19 keeps this row whole.\n\n> created: 2026-11-19T13:20:59+00:00\n> tags: [\"migration-row\", \"tokmig-crashed-3\"]",
+      "tags": [],
+      "created_at": "2026-11-19T13:20:59+00:00",
+      "lineage_key": "95be11e3b845e9748c473f228563fd23f91e6efb6fe07d61b38aac274eec2828",
+      "digest": "02001ecc50ec0fd79a08bbb221f6fefc8cc44141bd3b4df22c175adb3a53b212"
+    }
+  ]
+}

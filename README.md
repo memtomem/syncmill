@@ -835,11 +835,12 @@ SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q \
   tests/test_memory_gc_process.py \
   tests/test_frozen_memory_real.py \
   tests/test_frozen_memory_schema1_real.py
-# release-written Mem0/LangGraph stores (fetch the FastEmbed models first)
+# release-written Mem0/LangGraph stores and migration artifacts (fetch the FastEmbed models first)
 uv run --extra mem0 --extra langgraph python \
   tests/fixtures/persisted/memory/backends/fetch_models.py ~/.cache/syncmill-fastembed
 SYNCMILL_TEST_MEMORY_BACKENDS_REAL=1 FASTEMBED_CACHE_PATH=~/.cache/syncmill-fastembed \
-  uv run --extra mem0 --extra langgraph pytest -q tests/test_frozen_memory_backends_real.py
+  uv run --extra mem0 --extra langgraph pytest -q tests/test_frozen_memory_backends_real.py \
+  tests/test_frozen_memory_migration_real.py
 ```
 
 ## Contributing

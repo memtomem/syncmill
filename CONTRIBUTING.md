@@ -42,7 +42,8 @@ uv run --extra mem0 --extra langgraph python \
   tests/fixtures/persisted/memory/backends/fetch_models.py ~/.cache/syncmill-fastembed
 SYNCMILL_TEST_MEMORY_BACKENDS_REAL=1 FASTEMBED_CACHE_PATH=~/.cache/syncmill-fastembed \
   uv run --extra mem0 --extra langgraph pytest -q \
-  tests/test_frozen_memory_backends_real.py           # the Mem0 or LangGraph adapters
+  tests/test_frozen_memory_backends_real.py \
+  tests/test_frozen_memory_migration_real.py          # the Mem0 or LangGraph adapters, migration
 ```
 
 Running the agents for real needs the `claude`, `codex`, and `kimi` CLIs
