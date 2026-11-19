@@ -74,6 +74,9 @@ pytestmark = [
 LEASE = 1800
 #: Larger than any frozen store: a search with it is not cut by ``top_k``.
 ALL = 1000
+#: Mem0's keyword-search pool for the ``top_k=3`` searches these tests make
+#: (``AsyncMemory.search``: ``max(limit * 4, 60)``).
+MEM0_KEYWORD_POOL = 60
 #: How ``search_context`` joins the rows it returns.
 CONTEXT_SEPARATOR = "\n---\n"
 LATER_PHASE_FILTERS = {
@@ -283,7 +286,16 @@ def test_each_row_is_found_first_by_its_own_content(release, backend, tmp_path):
                 assert len(found) == min(3, sum(
                     1 for r in _owned(rows).values() if r["namespace"] == row["namespace"]
                 ) + (1 if row["namespace"] == "shared" and name.endswith("/store") else 0))
-                # The release's ranking, where its scores make it one.
+                # The release's ranking, where its scores make it one. Mem0
+                # adds a row's BM25 score only when the keyword search ranks
+                # it among its first max(4 * top_k, 60) hits; the bulk rows tie
+                # there, so which of them get it depends on the store's order
+                # of ties, and past the first hit their ranking differed
+                # between macOS and Linux. Such a namespace pins the first hit
+                # only.
+                in_ns = sum(1 for r in rows.values() if r["namespace"] == row["namespace"])
+                if backend == "mem0" and in_ns > MEM0_KEYWORD_POOL:
+                    continue
                 prefix = ordered_prefix(release_hits)
                 assert [r["id"] for r in found][: len(prefix)] == prefix, (name, row_id)
             engine.healthy()
