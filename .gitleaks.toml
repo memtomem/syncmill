@@ -1,0 +1,23 @@
+# gitleaks configuration: the default rules, plus one narrow allowlist.
+#
+# `memory migration` snapshots record each row's `lineage_key`, a sha256 of
+# the row's source, id and digest (src/syncmill/memory_migration.py `_record`).
+# The generic-api-key rule reads the `_key` name and the 64 hex digits as a
+# token. The snapshots under tests/fixtures/persisted/memory/migration are the
+# bytes a released syncmill wrote (#271) and cannot be reshaped, so the rule is
+# told to skip exactly that line in exactly those files.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "lineage_key digests in frozen memory migration snapshots (#271)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''^tests/fixtures/persisted/memory/migration/(legacy/)?v[0-9]+\.[0-9]+\.[0-9]+/mig/[0-9]{14}-[0-9a-f]{8}/snapshot\.json$''',
+]
+regexTarget = "line"
+regexes = [
+  '''^\s*"lineage_key": "[0-9a-f]{64}",?\s*$''',
+]
