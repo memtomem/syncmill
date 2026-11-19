@@ -169,7 +169,7 @@ def test_langgraph_items_are_indexed_and_mapped_by_head(release, tmp_path):
             assert mapped["tags"] == (expected["tags"] or []), key
             assert mapped["source"] == "langgraph"
             # One content embedding per item (index=["content"]).
-            assert item["vectors"] == 1, key
+            assert [field for field, _ in item["vectors"]] == ["content"], key
 
 
 def test_no_store_holds_the_directory_it_was_written_in(release):

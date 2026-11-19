@@ -189,11 +189,17 @@ def qdrant_points(data_dir: Path) -> dict[str, dict]:
     for _, blob in _copy_query(db, "SELECT id, point FROM points"):
         fields = _fields(_QdrantUnpickler(io.BytesIO(blob)).load())
         vectors = fields["vector"]
-        sparse = vectors.get("bm25")
+        sparse = _fields(vectors["bm25"]) if vectors.get("bm25") is not None else None
+        dense = vectors.get("", [])
         points[str(fields["id"])] = {
             "payload": fields["payload"],
-            "dense_dims": len(vectors.get("", [])),
-            "bm25_terms": len(_fields(sparse)["indices"]) if sparse is not None else None,
+            "dense_dims": len(dense),
+            "bm25_terms": len(sparse["indices"]) if sparse is not None else None,
+            # The vectors themselves, so a reader that re-embeds a stored row
+            # is a changed row.
+            "vectors_sha256": hashlib.sha256(json.dumps(
+                [list(dense), sparse and [list(sparse["indices"]), list(sparse["values"])]]
+            ).encode()).hexdigest(),
         }
     return points
 
@@ -203,14 +209,15 @@ def langgraph_items(db: Path) -> dict[str, dict]:
     updated_at, vectors}."""
     if not db.exists():
         return {}
-    vectors = {
-        key: count for key, count in _copy_query(
-            db, f"SELECT key, COUNT(*) FROM store_vectors WHERE prefix = '{LANGGRAPH_PREFIX}' "
-                "GROUP BY key")
-    }
+    vectors: dict[str, list] = {}
+    for key, field, embedding in _copy_query(
+            db, f"SELECT key, field_name, embedding FROM store_vectors "
+                f"WHERE prefix = '{LANGGRAPH_PREFIX}' ORDER BY key, field_name"):
+        vectors.setdefault(key, []).append((field, hashlib.sha256(embedding or b"").hexdigest()))
     return {
+        # `vectors`: each embedded field and the sha256 of its stored bytes.
         key: {"value": json.loads(value), "created_at": created, "updated_at": updated,
-              "vectors": vectors.get(key, 0)}
+              "vectors": vectors.get(key, [])}
         for key, value, created, updated in _copy_query(
             db, f"SELECT key, value, created_at, updated_at FROM store "
                 f"WHERE prefix = '{LANGGRAPH_PREFIX}'")
@@ -845,6 +852,11 @@ def _generate(box: Path, out: Path, python: Path, syncmill: Path, version: str,
             len(rows) != 1
             or not (rows[0]["namespace"] or "").startswith("board-run:")
             or _normal_tags(rows[0]["tags"]) != scratch_tags(profile, "pipeline-stage")
+            # The prompt is the rendered board item, the release's own text:
+            # its frame and the task in it are checked.
+            or not rows[0]["content"].startswith(
+                _title(profile, "Task Result") + "\n\n**Prompt:** ")
+            or task_text not in rows[0]["content"]
             or not rows[0]["content"].endswith(f"**Agent:** codex\n\n**Output:**\n{reply}")
         ):
             sys.exit(f"{main_store.name} board-killed: unexpected rows "

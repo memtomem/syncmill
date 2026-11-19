@@ -85,23 +85,35 @@ LATER_PHASE_FILTERS = {
 }
 
 
+#: The FastEmbed model files every frozen store was embedded with (each
+#: release's ``models.json``; ``fetch_models.py`` refuses releases that differ).
+MODELS = BackendsFrozen(BACKEND_RELEASES[0]).models
+
+
 @pytest.fixture(scope="module", autouse=True)
-def models_are_the_frozen_ones():
-    """The stores were embedded with exact model files; reading them with any
-    other bytes would compare other vectors. The cache is checked file by file
-    against ``models.json`` before any test reads a store."""
-    cache = os.environ.get("FASTEMBED_CACHE_PATH")
-    assert cache, "FASTEMBED_CACHE_PATH must point at the frozen FastEmbed models"
+def fixtures_stay_as_frozen():
+    assert os.environ.get("FASTEMBED_CACHE_PATH"), (
+        "FASTEMBED_CACHE_PATH must point at the frozen FastEmbed models")
     for release in BACKEND_RELEASES:
-        for model, spec in BackendsFrozen(release).models.items():
-            snapshot = Path(cache) / model / "snapshots" / spec["revision"]
-            for entry in spec["files"]:
-                name, digest = entry["name"], entry["sha256"]
-                data = (snapshot / name).read_bytes()
-                assert hashlib.sha256(data).hexdigest() == digest, (model, name)
+        assert BackendsFrozen(release).models == MODELS, release
     yield
     for release in BACKEND_RELEASES:
         BackendsFrozen(release).verify_pins()
+
+
+def assert_frozen_model(model_dir: str | Path) -> None:
+    """A model FastEmbed LOADED is the frozen one: its directory is the
+    recorded revision's snapshot and every recorded file there has the
+    recorded bytes. Asked of the loaded model rather than derived from the
+    cache layout, so a fallback to another directory cannot pass."""
+    path = Path(model_dir)
+    model = next((part for part in path.parts if part.startswith("models--")), None)
+    assert model in MODELS, path
+    spec = MODELS[model]
+    assert path.parent.name == "snapshots" and path.name == spec["revision"], path
+    for entry in spec["files"]:
+        name, digest = entry["name"], entry["sha256"]
+        assert hashlib.sha256((path / name).read_bytes()).hexdigest() == digest, (model, name)
 
 
 @pytest.fixture(autouse=True)
@@ -130,8 +142,26 @@ class _Engine:
         run_async(self.backend.ensure_ready())
         return self
 
+    def loaded_models(self) -> list[str]:
+        """The directories of the FastEmbed models this engine has loaded."""
+        if self.store.backend == "mem0":
+            dirs = [self.backend._store.embedding_model.dense_model.model._model_dir]
+            bm25 = self.backend._store.vector_store._bm25_encoder
+            if bm25 is not None:  # loaded by the first keyword search
+                dirs.append(bm25.model._model_dir)
+            return [str(d) for d in dirs]
+        store = self.backend._store
+        return [] if store is None else [str(store.embeddings.model.model._model_dir)]
+
     def __exit__(self, *exc) -> None:
-        run_async(self.memory.close())
+        try:
+            if exc[0] is None:
+                loaded = self.loaded_models()
+                assert loaded, "no FastEmbed model was loaded"
+                for model_dir in loaded:
+                    assert_frozen_model(model_dir)
+        finally:
+            run_async(self.memory.close())
 
     def healthy(self) -> None:
         assert not self.memory.degraded and self.memory.last_error is None
@@ -306,6 +336,7 @@ def test_mem0_finds_a_scenario_by_its_token_through_bm25(release, backend, tmp_p
                     set(h["id"] for h in release_hits[: len(lead)]) == set(lead)
                 ), (ns, token)
         assert vector_store._bm25_encoder is not None
+        assert len(engine.loaded_models()) == 2  # dense and BM25, checked on exit
         assert checked == pairs >= 9
         engine.healthy()
 
@@ -379,6 +410,9 @@ def test_search_multi_merges_dedupes_and_cuts(release, backend, tmp_path):
             two = run_async(engine.backend.search_multi(
                 token, namespaces=["shared", "agent-runtime:codex"], top_k=3))
             assert sorted(r["id"] for r in two) == sorted(expected), token
+            # Best first, where the release's scores make an order.
+            prefix = ordered_prefix([{"id": i, "score": merged[i]} for i in expected])
+            assert [r["id"] for r in two][: len(prefix)] == prefix, token
             if multi is not None:
                 assert sorted(expected) == sorted(h["id"] for h in multi["two"]), token
             repeated = run_async(engine.backend.search_multi(
@@ -715,7 +749,9 @@ def test_a_head_room_round_hands_its_member_the_released_result(
         engine.healthy()
     prompt = agents[0].calls[-1]["prompt"]
     assert prompt.startswith("Context from previous work:\n")
-    assert released in prompt.split("Context from previous work:\n", 1)[1]
+    # The round prompt is the released text itself, so the recall must be an
+    # earlier occurrence than the task's.
+    assert released in prompt[: prompt.rindex(released)]
 
 
 # ── the board's scratch collection ───────────────────────────────────────────
