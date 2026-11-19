@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "records": [
+    {
+      "source_id": "30fa0e15-c0ac-4b10-8838-feb5679d45cb",
+      "namespace": "shared",
+      "content": "## Board Item Result\n\n**Item:** 3490ce95-1b89-468f-b7e7-eed63020b589\n\n**Task:** frozenmemoryanchor tokmigboard fix add in calc.py\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokmigboard",
+      "tags": [
+        "board-result:3490ce95-1b89-468f-b7e7-eed63020b589"
+      ],
+      "created_at": "2026-11-19T13:21:08",
+      "lineage_key": "00c1014ee1e37cd74358f8613b9a0f388a0c9f877391aa9db9aaacb42a7913c2",
+      "digest": "73d2cd5291ba04ed4911340499300855e1ecb94a709a051497705f9261bb88ec"
+    },
+    {
+      "source_id": "7f809ed8-1506-4f40-8d91-19b6c7355293",
+      "namespace": "shared",
+      "content": "## Task Result\n\n**Prompt:** frozenmemoryanchor tokmigroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokmigroute\n\n**Files changed:** calc.py",
+      "tags": [
+        "task-result",
+        "codex"
+      ],
+      "created_at": "2026-11-19T13:21:06",
+      "lineage_key": "7a94a8cb0abdb13c0e51fc95814534d10a9998fd83fb1aa88c976df013778058",
+      "digest": "b7bd5cf1073368436ea2961c970c4b9fd3b79dccf3ec93887c4022e8aef48dc1"
+    }
+  ]
+}

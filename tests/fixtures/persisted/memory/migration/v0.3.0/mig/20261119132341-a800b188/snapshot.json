@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "records": [
+    {
+      "source_id": "54883914-c8aa-4653-bcd5-571c94699b0b",
+      "namespace": "frozen-mig-crashed-first",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-crashed-first-3\n\nfrozenmemoryanchor tokmig-crashed-first-3 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-3 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-crashed-first-3"
+      ],
+      "created_at": "2026-11-19T13:23:34.161009+00:00",
+      "lineage_key": "c2aff309bceb23acdee28f5f583840df119d42f0caf599342b95e7555cefdecd",
+      "digest": "7fe46305d0b28b6a1afd967f079569d90a80a7ab797c58d96a379500d5d6f666"
+    },
+    {
+      "source_id": "aa2c20df-0e5c-4e72-8486-671b89c7d9cc",
+      "namespace": "frozen-mig-crashed-first",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-crashed-first-1 frozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\r\nsecond line after CRLF\r\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라\n\nfrozenmemoryanchor tokmig-crashed-first-1 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-1 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-crashed-first-1"
+      ],
+      "created_at": "2026-11-19T13:23:34.145434+00:00",
+      "lineage_key": "f0ee86a94ba15c3f97e4415ef8e8ec9ebe41fa3be30764921eb9b04a17c88938",
+      "digest": "9cd34bfdf2e5d2d3de249a2ae03c9da94113a6561ded54b09c4fd897e28f3cb7"
+    },
+    {
+      "source_id": "be171803-b532-4718-b0cc-e0ce2318236c",
+      "namespace": "frozen-mig-crashed-first",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-crashed-first-2\n\n- a list item\n- another\n\nfrozenmemoryanchor tokmig-crashed-first-2 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-first-2 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-crashed-first-2"
+      ],
+      "created_at": "2026-11-19T13:23:34.153026+00:00",
+      "lineage_key": "2bdf01f1658d522ff848c728a5a93a1696759272287c8f80e5a1ee30ea3539c5",
+      "digest": "1c96345ddfef7426727b74821679b3af866fa56e82e704c57ec75d7eb9878689"
+    }
+  ]
+}

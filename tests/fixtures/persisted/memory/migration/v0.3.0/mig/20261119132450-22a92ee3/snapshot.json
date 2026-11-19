@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "records": [
+    {
+      "source_id": "2ad633af-e6b9-4637-9b95-fcb4ae29ef5d",
+      "namespace": "frozen-mig-rollback_partial",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-rollback_partial-1 frozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\nsecond line after CRLF\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라\n\nfrozenmemoryanchor tokmig-rollback_partial-1 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-1 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-rollback_partial-1"
+      ],
+      "created_at": "2026-11-19T13:23:27.739115+00:00",
+      "lineage_key": "13eba9cb04fe6901b5fdac54a0a351f5f299cacc45bba576ad2c1a3081193a15",
+      "digest": "12a3e6383047609d69267aced13ed5fa8bb708299867c25b007d331a967c9257"
+    },
+    {
+      "source_id": "b89cf04c-9fe3-4f04-b660-c7dc41f6f9ea",
+      "namespace": "frozen-mig-rollback_partial",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-rollback_partial-2\n\n- a list item\n- another\n\nfrozenmemoryanchor tokmig-rollback_partial-2 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-2 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-rollback_partial-2"
+      ],
+      "created_at": "2026-11-19T13:23:27.741427+00:00",
+      "lineage_key": "5b8b638fc53d25c2004e321de26145ce2604531b5c01d503eca8180c878d69bc",
+      "digest": "39b5d1ac4972303966634b818c9d3ae24729149bba92a61997f6272aa967c8d8"
+    },
+    {
+      "source_id": "d54ebb14-f6e6-4b11-984f-d31bc6a0cf7d",
+      "namespace": "frozen-mig-rollback_partial",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-rollback_partial-3\n\nfrozenmemoryanchor tokmig-rollback_partial-3 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-rollback_partial-3 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-rollback_partial-3"
+      ],
+      "created_at": "2026-11-19T13:23:27.743841+00:00",
+      "lineage_key": "80c26dac1b32dac1b377bd1f7f2fdf9d8aec591d310b071bdce42b95b883c759",
+      "digest": "843d9da044d096c6bca532858d3c50b4a49ed53cec891e1195fe88b291046e42"
+    }
+  ]
+}

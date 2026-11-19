@@ -1,0 +1,7 @@
+{
+  "status": "rollback_partial",
+  "targets": {
+    "93822c702dbea8c3f8de65f5b0f631bf4ec9435fde3ed51e7f3403f299ba726c": "84092412-ad19-5059-8b5f-4b35a56d8e1a"
+  },
+  "errors": []
+}

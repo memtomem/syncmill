@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "migration_id": "20261119132811-449331bb",
+  "source": "mem0",
+  "target": "langgraph",
+  "storage_binding_version": 1,
+  "target_storage_digest": "sha256:2cef1dbcb4db07c887083ce625b8f52e5b145346957b3dfdee3c3397e25eda61",
+  "namespaces": [],
+  "record_count": 3,
+  "source_digest": "28f165941f439fe3f57066171effafee263cbd512f2339f92223fa7b989dbe5c",
+  "created_at": "2026-11-19T13:28:11.052463+00:00"
+}

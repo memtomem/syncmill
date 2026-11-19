@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "records": [
+    {
+      "source_id": "8f73ca0e-699e-4d96-8722-cfbd4280c2e1",
+      "namespace": "frozen-mig-crashed",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-crashed-3\n\nfrozenmemoryanchor tokmig-crashed-3 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-3 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-crashed-3"
+      ],
+      "created_at": "2026-11-19T13:23:34.137526+00:00",
+      "lineage_key": "6dd098de09bdc6eb317b4b7a9744ac9dc99bdeb62a8231bf8ef69ff4683d0d30",
+      "digest": "7667040efdd3193bcf7e04d2f911c6a941cf83440e32f83176a6808e8cfa089f"
+    },
+    {
+      "source_id": "c1d0fbc5-24cb-4a49-a978-1fdbbe4d3d2c",
+      "namespace": "frozen-mig-crashed",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-crashed-1 frozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\r\nsecond line after CRLF\r\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라\n\nfrozenmemoryanchor tokmig-crashed-1 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-1 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-crashed-1"
+      ],
+      "created_at": "2026-11-19T13:23:34.049252+00:00",
+      "lineage_key": "3d8d73efacf543354e7fa81f3e1d8353dc32172565adc8b829d855421ef57945",
+      "digest": "e3bf226546e538ff7074c224564f20e846535faff8db597b8334a9660a0b3211"
+    },
+    {
+      "source_id": "c38e436f-3c25-4adb-983d-17070112b4d0",
+      "namespace": "frozen-mig-crashed",
+      "content": "**Migration Row**\n\nfrozenmemoryanchor tokmig-crashed-2\n\n- a list item\n- another\n\nfrozenmemoryanchor tokmig-crashed-2 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-crashed-2 sentence 19 keeps this row whole.",
+      "tags": [
+        "migration-row",
+        "tokmig-crashed-2"
+      ],
+      "created_at": "2026-11-19T13:23:34.129052+00:00",
+      "lineage_key": "e84294a382807f249a97ec6f4ea1782d1aebb13a735223c8e94291ff73bacfb0",
+      "digest": "b0a3bc1152b93b39a061cf81ce7afbf014134e298cb9fc2d8a707c6791f422de"
+    }
+  ]
+}

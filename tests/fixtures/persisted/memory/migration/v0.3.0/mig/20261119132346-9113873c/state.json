@@ -1,0 +1,12 @@
+{
+  "status": "partial",
+  "targets": {
+    "828a65fa121bc436bdf69633bb4fd57b4ad6974614db0535f9ae7c9b9bd0f72f": "8e9a746d-c807-5909-af99-1e37f55a2992"
+  },
+  "errors": [
+    {
+      "lineage": "2fe566152632fd3bb6a971127e893995315733f21bb56ec5b7e54b012899ceb8",
+      "error": "RuntimeError: frozen: destination write refused"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "records": [
+    {
+      "source_id": "6d80557b-4fdb-4514-84b7-fdf5df623c39",
+      "namespace": "shared",
+      "content": "**Prompt:** frozenmemoryanchor tokmigroute fix add in calc.py\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokmigroute\n\n**Files changed:** calc.py\n\n> created: 2026-11-19T13:20:58+00:00\n> tags: [\"task-result\", \"codex\"]\n\n**Prompt:** You are working on a tracked work-board item.\nGoal: frozen\n\nTask: frozenmemoryanchor tokmigboard fix add in calc.py\n\nWhen you finish, you MAY append ONE fenced block reporting the board update (every field optional):\n```syncmill-board\n{\"state\": \"review\", \"handoff\": \"<note for whoever picks this up next>\", \"outputs\": [\"<artifact or file you produced>\"], \"human_required\": false}\n```\nUse \"state\": \"blocked\" with a \"blocked_reason\" if you cannot proceed, or \"human_required\": true if a human must step in. Requesting \"done\" only takes effect if the work is independently verified (a passing quality gate or a human sign-off); otherwise it is recorded as \"review\".\n\n**Agent:** codex\n\n**Output:**\ncodex (fake) call 1: frozenmemoryanchor tokmigboard\n\n**Files changed:** calc.py\n\n> created: 2026-11-19T13:20:58+00:00\n> tags: [\"board-result:0a1a6517-9451-4941-9bae-c9981703c454\"]",
+      "tags": [],
+      "created_at": "2026-11-19T13:20:58+00:00",
+      "lineage_key": "01a752773840251a997f57adf62538e83bfe4fa457c23cc4e336a417be528c69",
+      "digest": "bb18daa4dfd0aeabfbab6ba32602101173486c4cd43559c434a806ad221d8628"
+    }
+  ]
+}

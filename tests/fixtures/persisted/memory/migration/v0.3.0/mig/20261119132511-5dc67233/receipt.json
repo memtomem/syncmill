@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "migration_id": "20261119132511-5dc67233",
+  "status": "verified",
+  "source": "langgraph",
+  "target": "mem0",
+  "record_count": 3,
+  "verified_count": 3,
+  "missing_target_count": 0,
+  "source_digest": "234e3afaa0ce060abe274b101584841d920c753d31a94eab518038020f3909a6",
+  "failure_lineages": [],
+  "verified_at": "2026-11-19T13:25:13.636766+00:00"
+}

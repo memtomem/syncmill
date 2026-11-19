@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "records": [
+    {
+      "source_id": "0f5ef286-5eb8-4e2e-9c40-cf3e7f586ce0",
+      "namespace": "frozen-mig-rolled_back",
+      "content": "frozenmemoryanchor tokmig-rolled_back-1 frozenmemoryanchor tokunicode 한글 본문 と日本語 🙂\nsecond line after CRLF\n가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라마바사 가나다라\n\nfrozenmemoryanchor tokmig-rolled_back-1 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-1 sentence 19 keeps this row whole.\n\n> created: 2026-11-19T13:25:44+00:00\n> tags: [\"migration-row\", \"tokmig-rolled_back-2\"]",
+      "tags": [],
+      "created_at": "2026-11-19T13:25:44+00:00",
+      "lineage_key": "c2da051f8e9af3b8e02870ee31b6b7b4d34835aefb3cc604d0db14e652cf47fa",
+      "digest": "8b08feacf9330b8dd17bc3ab54bdc3f076b0d4f68ddc38e01012b429b4737a9a"
+    },
+    {
+      "source_id": "ace6e8b7-57c2-4f72-a035-9e4978597bb2",
+      "namespace": "frozen-mig-rolled_back",
+      "content": "frozenmemoryanchor tokmig-rolled_back-3\n\nfrozenmemoryanchor tokmig-rolled_back-3 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-3 sentence 19 keeps this row whole.",
+      "tags": [],
+      "created_at": "2026-11-19T13:25:44+00:00",
+      "lineage_key": "8bf59779aff4f7be065714fc4c81588597868b0936ec1de8585eb65bee57b916",
+      "digest": "da2206a8cae6c9d3b188855a6b87130ddeb01ffb82f1f1ab95dd87c326e37caf"
+    },
+    {
+      "source_id": "d16fa093-b921-479c-a803-a08c756aac24",
+      "namespace": "frozen-mig-rolled_back",
+      "content": "frozenmemoryanchor tokmig-rolled_back-2\n\n- a list item\n- another\n\nfrozenmemoryanchor tokmig-rolled_back-2 sentence 0 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 1 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 2 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 3 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 4 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 5 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 6 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 7 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 8 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 9 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 10 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 11 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 12 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 13 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 14 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 15 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 16 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 17 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 18 keeps this row whole. frozenmemoryanchor tokmig-rolled_back-2 sentence 19 keeps this row whole.\n\n> created: 2026-11-19T13:25:44+00:00\n> tags: [\"migration-row\", \"tokmig-rolled_back-3\"]",
+      "tags": [],
+      "created_at": "2026-11-19T13:25:44+00:00",
+      "lineage_key": "7b4fdf8d3849242385e2a8f97664094eb6798ab381ef713f913d20fd0fe59463",
+      "digest": "2b17607ff841eaf0390133c1e7b00cb7160d0ce8fe49032c1e3a0409d4d46b5d"
+    }
+  ]
+}
