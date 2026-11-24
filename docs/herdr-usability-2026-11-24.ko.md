@@ -11,14 +11,16 @@
   C1–C6 작업 흐름)였고, 그중 장치가 단순하고 결론이 큰 것부터 쟀다. 잰 것은 A2, A4, A5, A6,
   B1, B2, B4(A5와 한 실험), B5의 일부, B6, C1, C2다. 나머지와, 잰 항목 안에서 못 잰 부분은
   마지막 절에 ID와 함께 [미실측]으로 적었다.
-- 표기: [실측]은 이 날 직접 실행해 값을 확인한 것, [읽기]는 코드나 설정을 읽은 것,
-  [미실측]은 재지 않은 것이다.
+- 표기: [실측]은 이 날 직접 실행해 값을 확인한 것, [수동]은 사용자가 실제 키보드로 눌러 보고
+  알려 준 것, [읽기]는 코드나 설정을 읽은 것, [미실측]은 재지 않은 것이다.
 
 ### 측정 방법과 그 한계
 
 - herdr 워크스페이스에 평가용 탭 하나를 만들고 그 안의 pane에서만 실행했다. 조작은
   `herdr pane run`·`send-keys`·`read`로 했다. 이 방식은 키를 pane의 PTY에 직접 쓰므로
   **herdr 클라이언트의 키 처리(prefix 가로채기, `alt+숫자`, 마우스, 입력기)는 거치지 않는다.**
+  예외는 A4의 detach 키 하나다. 이것은 사용자가 실제 키보드로 눌러 보고 알려 준 결과이고
+  [수동]으로 표시했다.
   아래의 "동작한다"는 판정은 모두 이 경로에 한한다.
 - SyncMill 상태 경로는 임시 디렉터리로 돌렸다. `workspace.root`, `runs.root`, `tui.state_dir`,
   `memory.db_path`, `memory.memory_dir`, `board.db_path`, `breaker.state_path`,
@@ -55,7 +57,10 @@ API로 조작한 범위에서 TUI, `--monitor`, `session`은 herdr pane 안에�
    2초·10초 뒤에도 살아 있었다. 실제 provider에서는 재지 않았다.
 3. `syncmill session` 안의 Claude를 herdr는 에이전트로 표시하지 않았다(1건).
 
-실제 키보드 조작(특히 `ctrl+b` 충돌)과 herdr의 세션 복원 결과는 재지 않았다.
+4. monitor가 안내하는 `Ctrl-b d`는 실제 키보드에서 동작하지 않았다. herdr가 `ctrl+b`를 먼저
+   받는다. `ctrl+b`를 두 번 누른 뒤 `d`를 누르면 detach됐다 [수동].
+
+detach 키 외의 실제 키보드 조작과 herdr의 세션 복원 결과는 재지 않았다.
 
 ## 판정 요약
 
@@ -75,7 +80,7 @@ API로 조작한 범위에서 TUI, `--monitor`, `session`은 herdr pane 안에�
 | B5 | `session`에 붙은 pane 닫기 | 문제없음 | [실측] 1건 |
 | A5 | `session start` 안의 에이전트 인식 | 마찰 — herdr가 에이전트로 표시하지 않음 | [실측] claude 1건 |
 | A2 | `tui` 렌더링·탭 전환·폭 변경·종료 | 전환·폭 변경·종료는 문제없음. 에이전트 열이 `kimi-cod`로 잘림 (Board·Rooms는 꺼진 상태) | [실측] API 조작. pane 크기와 종료 뒤 화면은 파일로 남기지 않음 |
-| A4 | `run --monitor` 중첩 tmux, 완료 후 detach | 문제없음 | [실측] API 조작. 실제 키 입력은 [미실측] |
+| A4 | `run --monitor` 중첩 tmux, 완료 후 detach | 마찰 — 안내된 `Ctrl-b d`가 동작하지 않음. `ctrl+b`를 두 번 누르면 됨 | 화면·종료는 [실측] API 조작, detach 키는 [수동] 1건 |
 | A6 | TTY 게이트의 안내문과 종료 코드 | 문제없음 | [실측] |
 | C1 | 끝에 알림 명령 붙이기 | 종료 코드가 `rc`에 저장됨, 알림 API는 `shown: true` | [실측]. 실제 표시와 본문, 자동 알림 유무는 [미실측] |
 | C2 | `pane wait-output`으로 완료 대기 | 마찰 — 실행마다 고유 표식이 필요함 | [실측] |
@@ -222,7 +227,11 @@ hook과 같은 형태의 보고를 `herdr pane report-agent-session`으로 평�
 - 실행이 끝난 뒤 `ctrl+b d`를 pane에 직접 써서 detach하니 OUTER가 결과를 출력하고 exit 0으로
   끝났다. 직후 조회에서 평가용 tmux 서버는 없었다(실행 당시 출력으로만 확인).
 - 완료 후 control pane의 제목은 `run complete · detach: Ctrl-b d`다. herdr의 prefix도
-  `ctrl+b`다. 실제 키보드에서 이 키를 누가 받는지는 [미실측]이다.
+  `ctrl+b`다.
+- 실제 키보드 [수동]: 같은 화면을 다시 띄워 사용자가 직접 눌렀다. `ctrl+b` 다음 `d`는 아무
+  일도 일어나지 않았다. `ctrl+b`를 두 번 누른 뒤 `d`를 누르자 detach됐고, 그 뒤 pane에는
+  `[detached (from session …)]`, 결과 출력, exit 0이 찍혀 있었으며 평가용 tmux 서버는 없었다
+  (뒤의 세 가지는 [실측]). herdr 기본 키맵에 `prefix+d`는 없다 [읽기].
 - 부수 관측: 이 실행에서 `[syncmill] run:`과 `[syncmill] artifact:` 줄은 INNER 화면에만 있었고
   OUTER의 출력에는 없었다.
 - 실행 중 detach와 attach 실패 경우는 [미실측]이다. 코드상으로는 실행 중에 detach하면
@@ -322,8 +331,11 @@ herdr pane wait-output "$pane" --regex "^DONE_${id}_RC=[0-9]+\$" \
 - **긴 `run`의 끝을 기다리거나 알림받고 싶으면 실행별 표식과 알림 명령을 붙인다**(C1, C2).
   표식과 알림은 셸에서 그 명령이 돌아왔다는 뜻이다. `--monitor`에서 일찍 detach하면 작업이
   진행 중이어도 나간다. 그 경우에는 monitor 화면이나 아티팩트의 최종 결과를 확인한다.
-- `tui`와 `--monitor`는 herdr pane 안에서 그려지고 API로 조작됐다. 실제 키 조작, 특히
-  monitor의 `ctrl+b d`는 확인이 남아 있다.
+- **`--monitor` 화면에서 빠져나올 때는 `ctrl+b`를 두 번 누른 뒤 `d`를 누른다**(A4, [수동]
+  1건). 화면에 안내된 `Ctrl-b d`는 herdr 안에서 동작하지 않았다. 다른 pane에서
+  `herdr pane send-keys "$pane" ctrl+b d`를 실행해도 detach된다(A4, [실측]). `session attach`
+  화면도 같은 tmux detach 키를 쓰지만 실제 키보드로는 확인하지 않았다.
+- `tui`는 herdr pane 안에서 그려지고 API로 조작됐다. 실제 키 조작은 확인이 남아 있다.
 
 ## 조치 후보
 
@@ -340,7 +352,9 @@ herdr pane wait-output "$pane" --regex "^DONE_${id}_RC=[0-9]+\$" \
 - 일반 `run`이 pane이 닫힐 때 어떤 신호로 끝나는지 확인하고, 그때 에이전트 프로세스 그룹과
   manifest를 정리하기. monitor의 INNER에는 이미 SIGHUP·SIGTERM 핸들러가 있고, 예외 시
   manifest를 복구 상태로 표시하는 경로도 있다 [읽기]. 기존 이슈가 있는지는 확인하지 않았다.
-- monitor의 `detach: Ctrl-b d` 안내는 바깥 멀티플렉서나 바뀐 prefix를 반영하지 않는다.
+- monitor의 `detach: Ctrl-b d` 안내가 herdr 안에서는 그대로 동작하지 않았다(A4, [수동] 1건).
+  `session`의 안내와 문서도 같은 키를 전제로 한다 [읽기]. 바깥 멀티플렉서나 바뀐 prefix를
+  안내에 반영할지 정한다.
 - monitor를 거친 실행의 OUTER 출력에 `run:`/`artifact:` 줄이 없었다(1건 관측).
 
 **herdr 쪽**
@@ -375,7 +389,7 @@ herdr pane wait-output "$pane" --regex "^DONE_${id}_RC=[0-9]+\$" \
 | ID | 항목 | 이유 |
 | --- | --- | --- |
 | B2 | herdr 서버 재시작 뒤의 세션 복원 결과 | 진행 중인 다른 작업이 끊겨 재시작을 생략했다 |
-| A2·A4·A5 | 실제 키보드의 `ctrl+b d`(herdr와 tmux 중 누가 받는지), `alt+숫자`, 마우스, 한글 입력, `prefix+z`·`prefix+e` | API로 보낸 키는 herdr 클라이언트를 거치지 않는다. 사람이 직접 눌러야 한다 |
+| A2·A5 | 실제 키보드의 `alt+숫자`, 마우스, 한글 입력, `prefix+z`·`prefix+e`, `session attach` 화면의 detach 키 | API로 보낸 키는 herdr 클라이언트를 거치지 않는다. 사람이 직접 눌러야 한다 |
 | B1 | kimi-code에서 기록이 생기지 않은 원인 | 표본 관측만 했다 |
 | B2 | 대화형 Claude pane에서의 headless codex | 에이전트 없는 pane의 대조(순서 7)만 있다 |
 | B2 | `!` 셸 모드 안에서의 `continue`, 대화형 Claude가 있는 pane에서 변수를 뺀 `continue` | 실 호출을 더 쓰지 않았다 |
